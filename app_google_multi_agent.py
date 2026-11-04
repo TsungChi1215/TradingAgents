@@ -40,13 +40,13 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS (包含頂部 Header 與圖表防白塊修正)
+# 全局 100% 覆蓋式深色 CSS (徹底消除任何白色突兀區塊並提高文字對比)
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
     html, body, .stApp, .stApp > header {
         background-color: #0E1015 !important;
-        color: #E0E6ED !important;
+        color: #FFFFFF !important;
     }
     header[data-testid="stHeader"] {
         background-color: #0E1015 !important;
@@ -59,12 +59,17 @@ st.markdown("""
         border-right: 1px solid #232836 !important;
     }
     section[data-testid="stSidebar"] * {
-        color: #C5CEE0 !important;
+        color: #FFFFFF !important;
     }
     .block-container {
         padding-top: 1.0rem !important;
         padding-bottom: 2rem !important;
         max-width: 98% !important;
+    }
+    /* 提高所有說明文字與標籤的能見度 */
+    label, p, span, .stMarkdown, .stRadio, .stSelectbox {
+        color: #FFFFFF !important;
+        font-weight: 500 !important;
     }
     div[data-baseweb="select"] > div, input, textarea {
         background-color: #1A1E29 !important;
@@ -75,6 +80,12 @@ st.markdown("""
     div[data-baseweb="popover"] div {
         background-color: #1A1E29 !important;
         color: #FFFFFF !important;
+    }
+    /* 覆蓋 Streamlit 預設的白色 Info / Warning 訊息方塊為深色 */
+    .stAlert {
+        background-color: #161A24 !important;
+        color: #00E676 !important;
+        border: 1px solid #2C3245 !important;
     }
     .stButton>button {
         background: linear-gradient(135deg, #00C853 0%, #009688 100%) !important;
@@ -97,12 +108,13 @@ st.markdown("""
         margin-bottom: 12px !important;
     }
     .fin-top-title {
-        font-size: 0.85rem !important;
-        color: #8F9BB3 !important;
-        margin-bottom: 4px !important;
+        font-size: 0.9rem !important;
+        color: #B0C4DE !important;
+        margin-bottom: 6px !important;
+        font-weight: bold !important;
     }
     .fin-top-val {
-        font-size: 1.2rem !important;
+        font-size: 1.25rem !important;
         font-weight: bold !important;
     }
     .agent-card {
@@ -114,7 +126,7 @@ st.markdown("""
         box-shadow: 0 4px 12px rgba(0,0,0,0.3) !important;
     }
     .agent-card-header {
-        font-size: 1.05rem !important;
+        font-size: 1.1rem !important;
         font-weight: 700 !important;
         margin-bottom: 10px !important;
         display: flex !important;
@@ -127,9 +139,9 @@ st.markdown("""
     .header-red { color: #FF5252 !important; }
     .header-green { color: #00E676 !important; }
     .agent-card-body {
-        font-size: 0.95rem !important;
+        font-size: 1rem !important;
         line-height: 1.65 !important;
-        color: #D1D5DB !important;
+        color: #E0E6ED !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -159,7 +171,7 @@ STRATEGY_CONDITIONS = {
 }
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (加權指數、櫃買指數、台指期、台積電)
+# 即時市場數據抓取 (加權指數、櫃買指數、台指近月、台積電)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_realtime_market_indices():
@@ -170,18 +182,6 @@ def fetch_realtime_market_indices():
         "tsmc": {"val": 1040.00, "change": "+15.0", "up": True}
     }
     try:
-        # 抓取上市指數
-        url_taiex = "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX"
-        resp = requests.get(url_taiex, timeout=5)
-        if resp.status_code == 200:
-            for item in resp.json():
-                if item.get("Title") == "發行權證類指數點數" or "發行量加權股價指數" in str(item.get("Indices", "")):
-                    pass
-    except Exception:
-        pass
-    
-    try:
-        # 透過 Yahoo Finance 取得最新報價
         import yfinance as yf
         t_taiex = yf.Ticker("^TWII").fast_info
         if hasattr(t_taiex, 'last_price') and t_taiex.last_price:
@@ -212,7 +212,6 @@ def fetch_realtime_market_indices():
             data["futures"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
     except Exception:
         pass
-
     return data
 
 # -----------------------------------------------------------------------------
@@ -573,7 +572,7 @@ def apply_dark_theme(fig, height=450):
         height=height,
         margin=dict(l=20, r=20, t=40, b=20),
         hovermode="x unified",
-        font=dict(color="#E0E6ED", size=12),
+        font=dict(color="#FFFFFF", size=12),
         legend=dict(
             bgcolor="rgba(18, 21, 30, 0.9)",
             bordercolor="#2C3245",
@@ -581,8 +580,8 @@ def apply_dark_theme(fig, height=450):
             font=dict(color="#FFFFFF", size=11)
         )
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category', tickfont=dict(color="#E0E6ED", size=10))
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#E0E6ED", size=11))
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category', tickfont=dict(color="#FFFFFF", size=10))
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF", size=11))
     return fig
 
 def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
@@ -662,7 +661,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=340)
 
 # -----------------------------------------------------------------------------
-# 5. Streamlit 主 UI
+# 5. Streamlit 主 UI 與狀態保持機制
 # -----------------------------------------------------------------------------
 default_gemini_key = os.getenv("GEMINI_API_KEY", "")
 default_finmind_token = os.getenv("FINMIND_TOKEN", "")
@@ -670,6 +669,7 @@ default_finmind_token = os.getenv("FINMIND_TOKEN", "")
 if "gemini_key" not in st.session_state: st.session_state["gemini_key"] = default_gemini_key
 if "finmind_token" not in st.session_state: st.session_state["finmind_token"] = default_finmind_token
 if "selected_stock_code" not in st.session_state: st.session_state["selected_stock_code"] = "2356"
+if "screener_executed" not in st.session_state: st.session_state["screener_executed"] = False
 
 with st.sidebar:
     st.markdown("### ⚡ 系統核心設定")
@@ -696,11 +696,9 @@ with st.sidebar:
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 
 # =============================================================================
-# 頂部四塊核心指標看板 (精準對應：加權指數、櫃買指數、台指近月、台積電)
-# 開盤時間自動每 5 秒重新刷新一次
+# 頂部四塊核心指標看板 (加權指數、櫃買指數、台指近月、台積電 - 附完整中文說明)
 # =============================================================================
 market_data = fetch_realtime_market_indices()
-
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
 
 def render_metric_card(col, title, data):
@@ -712,12 +710,11 @@ def render_metric_card(col, title, data):
     </div>
     """, unsafe_allow_html=True)
 
-render_metric_card(m_col1, "加權指數 (TAIEX)", market_data["taiex"])
-render_metric_card(m_col2, "櫃買指數 (TPEX)", market_data["tpex"])
-render_metric_card(m_col3, "台指期近月 (TX)", market_data["futures"])
-render_metric_card(m_col4, "台積電 (2330)", market_data["tsmc"])
+render_metric_card(m_col1, "📊 加權指數 (TAIEX)", market_data["taiex"])
+render_metric_card(m_col2, "📈 櫃買指數 (TPEX)", market_data["tpex"])
+render_metric_card(m_col3, "⚡ 台指期近月 (TX)", market_data["futures"])
+render_metric_card(m_col4, "💎 台積電 (2330)", market_data["tsmc"])
 
-# 若為台股開盤時間，自動每 5 秒重新整理以達即時更新效果
 if is_market_hours():
     t_time.sleep(5)
     st.rerun()
@@ -726,7 +723,7 @@ if not STOCK_DICT:
     st.error("⚠️ 無法取得台股個股清單！請檢查 `FINMIND_TOKEN` 與網路連線。")
 
 # =============================================================================
-# 模式 A：全功能版 (包含全市場自動選股與備援清單)
+# 模式 A：全功能版 (全市場自動選股)
 # =============================================================================
 if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
@@ -743,7 +740,7 @@ if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
         csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_market_cache.csv")
         if os.path.exists(csv_path): os.remove(csv_path)
         st.cache_data.clear()
-        if "screener_df" in st.session_state: del st.session_state["screener_df"]
+        st.session_state["screener_executed"] = False
         st.toast("✅ 快取檔案已成功清除！", icon="⚡")
         st.rerun()
 
@@ -754,7 +751,7 @@ if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
             st.session_state["is_fallback"] = is_fallback
             st.session_state["screener_executed"] = True
 
-    if "screener_executed" in st.session_state and st.session_state["screener_executed"]:
+    if st.session_state.get("screener_executed", False):
         df_result = st.session_state.get("screener_df", pd.DataFrame())
         is_fallback = st.session_state.get("is_fallback", False)
         
@@ -764,7 +761,6 @@ if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
             else:
                 st.success(f"🎉 掃描完成！共找到 {len(df_result)} 檔符合條件個股：")
             
-            # 安全分頁顯示，避免前端一次渲染上千筆卡死
             st.dataframe(df_result.head(100), use_container_width=True)
             if len(df_result) > 100:
                 st.caption("ℹ️ 顯示前 100 筆以保持效能流暢。")
@@ -776,7 +772,7 @@ if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
     st.markdown("---")
 
 # =============================================================================
-# 模式 B：個股與多 Agent 分析區塊
+# 模式 B：個股與多 Agent 分析區塊 (確保點擊按鈕穩定觸發)
 # =============================================================================
 filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
 default_idx = 0
@@ -795,7 +791,11 @@ with col_m2:
     st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
     run_agent_button = st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True)
 
+# 狀態旗標：點擊按鈕後寫入 session_state 避免頁面重新整理後失效
 if run_agent_button:
+    st.session_state["run_diagnosis"] = True
+
+if st.session_state.get("run_diagnosis", False):
     if not stock_id:
         st.error("❌ 請先設定有效的 FinMind Token！")
     else:
@@ -844,3 +844,7 @@ if run_agent_button:
                             st.markdown(f"""<div class="agent-card" style="border: 1px solid #00E676 !important;"><div class="agent-card-header header-green">🏆 PM 最終決策</div><div class="agent-card-body">{agent_res['pm_decision']}</div></div>""", unsafe_allow_html=True)
                     except Exception as e:
                         st.error(f"❌ 執行失敗：{e}")
+            else:
+                st.warning("⚠️ 請在左側設定 Gemini API Key！")
+        else:
+            st.error(f"❌ 無法取得 {stock_id} 的 K 線價格資料，請檢查 API Token 或網路連線。")

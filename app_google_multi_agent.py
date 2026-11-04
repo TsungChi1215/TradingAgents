@@ -40,7 +40,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS
+# 全局 100% 覆蓋式深色 CSS (包含頂部 Header 與圖表防白塊修正)
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -48,6 +48,13 @@ st.markdown("""
     html, body, .stApp, .stApp > header {
         background-color: #0E1015 !important;
         color: #E0E6ED !important;
+    }
+    /* 強制覆蓋 Streamlit 頂端預設白色 Header 區塊 */
+    header[data-testid="stHeader"] {
+        background-color: #0E1015 !important;
+    }
+    [data-testid="stToolbar"] {
+        background-color: transparent !important;
     }
     /* 側邊欄完整深色底 */
     section[data-testid="stSidebar"] {
@@ -433,7 +440,7 @@ PURE_CHINESE_SYSTEM_INSTRUCTION = """
 
 def force_clean_english_lines(text):
     if not text: return ""
-    lines = str(text).split("\n")
+    lines = str(text).split('\n')
     valid_lines = []
     for line in lines:
         stripped = line.strip()
@@ -443,7 +450,7 @@ def force_clean_english_lines(text):
         ascii_chars = sum(1 for c in stripped if ord(c) < 128)
         if (ascii_chars / len(stripped)) > 0.7 and not any(c in stripped for c in ['張', '元', '日', '線', '量', '買', '賣', '個', '股']):
             continue
-        if re.match(r'^[\*\-\s]*(Role|Task|Constraint|Language|Target|Symbol|User Focus|Input Data|Word count|Coverage|Price|MA|Indicators|Volume|Chips|Shareholders|Flow|Technical|Bullish|Bearish|Risk Manager|Argument|Directly|NO English)', stripped, re.IGNORECASE):
+        if re.match(r'^[\*\-\s]*\b(Role|Task|Constraint|Language|Target|Symbol|User Focus|Input Data|Word count|Coverage|Price|MA|Indicators|Volume|Chips|Shareholders|Flow|Technical|Bullish|Bearish|Risk Manager|Argument|Directly|NO English)\b', stripped, re.IGNORECASE):
             continue
         valid_lines.append(line)
     result = '\n'.join(valid_lines).strip()
@@ -526,7 +533,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 4. 暗黑科技風 Plotly 圖表繪製
+# 4. 暗黑高對比科技風 Plotly 圖表繪製 (清晰字型與座標軸)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -536,15 +543,22 @@ def apply_dark_theme(fig, height=450):
         height=height,
         margin=dict(l=20, r=20, t=40, b=20),
         hovermode="x unified",
+        font=dict(color="#E0E6ED", size=12),
         legend=dict(
-            bgcolor="rgba(18, 21, 30, 0.8)",
+            bgcolor="rgba(18, 21, 30, 0.9)",
             bordercolor="#2C3245",
             borderwidth=1,
-            font=dict(color="#C5CEE0")
+            font=dict(color="#FFFFFF", size=11)
         )
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836")
+    fig.update_xaxes(
+        showgrid=True, gridwidth=1, gridcolor="#232836", type='category',
+        tickfont=dict(color="#E0E6ED", size=10), title_font=dict(color="#FFFFFF")
+    )
+    fig.update_yaxes(
+        showgrid=True, gridwidth=1, gridcolor="#232836",
+        tickfont=dict(color="#E0E6ED", size=11), title_font=dict(color="#FFFFFF")
+    )
     return fig
 
 def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):

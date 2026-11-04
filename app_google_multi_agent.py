@@ -13,8 +13,19 @@ from datetime import datetime, timedelta, time
 import google.generativeai as genai
 
 # -----------------------------------------------------------------------------
-# 自動載入 .env 檔案金鑰
+# 智慧金鑰載入機制（同時支援本機 .env 與 Streamlit Cloud Secrets）
 # -----------------------------------------------------------------------------
+def get_secret(key_name, default=""):
+    val = os.getenv(key_name)
+    if val:
+        return val
+    try:
+        if key_name in st.secrets:
+            return st.secrets[key_name]
+    except Exception:
+        pass
+    return default
+
 def load_env_file():
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
@@ -40,19 +51,16 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS (包含表格 stDataFrame 暗黑模式全面強制覆蓋)
+# 全局 100% 覆蓋式深色 CSS 與響應式裝置判斷調整 (自動適應電腦與手機排版)
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
-    html, body, .stApp, .stApp > header {
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"], [data-testid="stToolbar"] {
         background-color: #0E1015 !important;
         color: #FFFFFF !important;
     }
     header[data-testid="stHeader"] {
         background-color: #0E1015 !important;
-    }
-    [data-testid="stToolbar"] {
-        background-color: transparent !important;
     }
     section[data-testid="stSidebar"] {
         background-color: #12151E !important;
@@ -91,15 +99,13 @@ st.markdown("""
         font-weight: bold !important;
         border: none !important;
         border-radius: 8px !important;
-        padding: 0.5rem 1rem !important;
+        padding: 0.6rem 1.2rem !important;
         box-shadow: 0 4px 12px rgba(0,200,83,0.25) !important;
     }
     .stButton>button:hover {
         box-shadow: 0 0 15px rgba(0, 200, 83, 0.6) !important;
         transform: translateY(-1px);
     }
-    
-    /* --- 頂部四大指數卡片樣式 --- */
     .fin-top-card {
         background-color: #161A24 !important;
         border: 1px solid #232836 !important;
@@ -117,8 +123,6 @@ st.markdown("""
         font-size: 1.3rem !important;
         font-weight: bold !important;
     }
-
-    /* --- 強制將 st.dataframe / st.table 轉為黑底白字高對比 --- */
     div[data-testid="stDataFrame"] {
         background-color: #161A24 !important;
         border: 1px solid #2C3245 !important;
@@ -143,8 +147,6 @@ st.markdown("""
     tbody tr:hover td {
         background-color: #1F2533 !important;
     }
-
-    /* --- 多 Agent 診斷卡片 --- */
     .agent-card {
         background-color: #161A26 !important;
         border: 1px solid #23293A !important;
@@ -170,6 +172,17 @@ st.markdown("""
         font-size: 1rem !important;
         line-height: 1.65 !important;
         color: #E0E6ED !important;
+    }
+
+    /* --- 針對不同設備（電腦橫式 vs 手機直式）自動轉場的響應式控制 --- */
+    @media (max-width: 768px) {
+        /* 當使用手機等窄螢幕裝置瀏覽時，強制將 Streamlit 預設的多欄改為垂直堆疊，防止畫面分割或擠壓 */
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 100% !important;
+            min-width: 100% !important;
+            margin-bottom: 1rem;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -199,7 +212,7 @@ STRATEGY_CONDITIONS = {
 }
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (加權指數、櫃買指數、台指期近月、台積電)
+# 即時市場數據抓取
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_realtime_market_indices():
@@ -211,33 +224,20 @@ def fetch_realtime_market_indices():
     }
     try:
         import yfinance as yf
-        t_taiex = yf.Ticker("^TWII").fast_info
-        if hasattr(t_taiex, 'last_price') and t_taiex.last_price:
-            p = t_taiex.last_price
-            prev = getattr(t_taiex, 'previous_close', p)
-            diff = p - prev
-            data["taiex"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
-
-        t_tsmc = yf.Ticker("2330.TW").fast_info
-        if hasattr(t_tsmc, 'last_price') and t_tsmc.last_price:
-            p = t_tsmc.last_price
-            prev = getattr(t_tsmc, 'previous_close', p)
-            diff = p - prev
-            data["tsmc"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
-            
-        t_tpex = yf.Ticker("^TWOII").fast_info
-        if hasattr(t_tpex, 'last_price') and t_tpex.last_price:
-            p = t_tpex.last_price
-            prev = getattr(t_tpex, 'previous_close', p)
-            diff = p - prev
-            data["tpex"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
-            
-        t_fut = yf.Ticker("TX=F").fast_info
-        if hasattr(t_fut, 'last_price') and t_fut.last_price:
-            p = t_fut.last_price
-            prev = getattr(t_fut, 'previous_close', p)
-            diff = p - prev
-            data["futures"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        
+        for key, sym in [("taiex", "^TWII"), ("tpex", "^TWOII"), ("futures", "TX=F"), ("tsmc", "2330.TW")]:
+            try:
+                t = yf.Ticker(sym, session=session)
+                hist = t.history(period="2d")
+                if not hist.empty and len(hist) >= 1:
+                    p = float(hist['Close'].iloc[-1])
+                    prev = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else p
+                    diff = p - prev
+                    data[key] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
+            except Exception:
+                pass
     except Exception:
         pass
     return data
@@ -320,10 +320,12 @@ def fetch_stock_history_cached(stock_id, start_date, end_date, api_token=""):
 
         try:
             import yfinance as yf
-            ticker = yf.Ticker(f"{s_id}.TW")
+            session = requests.Session()
+            session.headers.update({"User-Agent": "Mozilla/5.0"})
+            ticker = yf.Ticker(f"{s_id}.TW", session=session)
             df_yf = ticker.history(start=s_date, end=e_date)
             if df_yf.empty:
-                df_yf = yf.Ticker(f"{s_id}.TWO").history(start=s_date, end=e_date)
+                df_yf = yf.Ticker(f"{s_id}.TWO", session=session).history(start=s_date, end=e_date)
             if not df_yf.empty:
                 df_yf = df_yf.reset_index()
                 df_yf.rename(columns={'Date': 'date', 'Open': 'open', 'High': 'max', 'Low': 'min', 'Close': 'close', 'Volume': 'Trading_Volume'}, inplace=True)
@@ -525,7 +527,7 @@ def force_clean_english_lines(text):
 
 def call_llm(gemini_key, prompt):
     if not gemini_key or not gemini_key.strip():
-        raise RuntimeError("請先輸入有效的 Google Gemini API Key 或於 .env 中設定！")
+        raise RuntimeError("請先設定有效的 Google Gemini API Key！")
     genai.configure(api_key=gemini_key.strip())
     candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']
     last_exception = None
@@ -689,10 +691,10 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=340)
 
 # -----------------------------------------------------------------------------
-# 5. Streamlit 主 UI 與狀態保持機制
+# 5. Streamlit 主 UI 與智慧金鑰初始化
 # -----------------------------------------------------------------------------
-default_gemini_key = os.getenv("GEMINI_API_KEY", "")
-default_finmind_token = os.getenv("FINMIND_TOKEN", "")
+default_gemini_key = get_secret("GEMINI_API_KEY", "")
+default_finmind_token = get_secret("FINMIND_TOKEN", "")
 
 if "gemini_key" not in st.session_state: st.session_state["gemini_key"] = default_gemini_key
 if "finmind_token" not in st.session_state: st.session_state["finmind_token"] = default_finmind_token
@@ -722,9 +724,10 @@ with st.sidebar:
     custom_query = st.text_area("多 Agent 關注重點", value="關注短期突破機會與籌碼大股東動態。")
 
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
+active_gemini_key = st.session_state.get("gemini_key") or default_gemini_key
 
 # =============================================================================
-# 頂部四塊核心指標看板 (加權指數、櫃買指數、台指近月、台積電 - 附強制中文大標題)
+# 頂部四塊核心指標看板
 # =============================================================================
 market_data = fetch_realtime_market_indices()
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -797,81 +800,89 @@ if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
             selected_from_screener = st.selectbox("📌 請選擇要進行多 Agent 診斷的個股：", options=screener_list)
             if selected_from_screener:
                 st.session_state["selected_stock_code"] = selected_from_screener.split(" ")[0]
+                if st.button("🚀 對此選定個股啟動多 Agent 深度診斷", type="primary"):
+                    st.session_state["run_diagnosis"] = True
+                    st.rerun()
     st.markdown("---")
 
 # =============================================================================
-# 模式 B：個股與多 Agent 分析區塊 (確保點擊診斷穩定觸發)
+# 模式 B：個股與多 Agent 分析區塊 (單股診斷模式專用)
 # =============================================================================
-filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
-default_idx = 0
-for idx, opt in enumerate(filtered_options):
-    if opt.startswith(st.session_state["selected_stock_code"]):
-        default_idx = idx
-        break
+if app_mode == "單股診斷版 (指定個股 + 圖表辯論)":
+    filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
+    default_idx = 0
+    for idx, opt in enumerate(filtered_options):
+        if opt.startswith(st.session_state["selected_stock_code"]):
+            default_idx = idx
+            break
 
-st.markdown("### 📊 指定個股深度診斷與多 Agent 辯論")
-col_m1, col_m2 = st.columns([3, 1])
-with col_m1:
-    selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options if filtered_options else ["無股票資料"], index=default_idx if filtered_options else 0)
-    stock_id = selected_stock_raw.split(" ")[0] if filtered_options else ""
-    stock_name = STOCK_DICT.get(stock_id, "") if stock_id else ""
-with col_m2:
-    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-    run_agent_button = st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True)
+    st.markdown("### 📊 指定個股深度診斷與多 Agent 辯論")
+    col_m1, col_m2 = st.columns([3, 1])
+    with col_m1:
+        selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options if filtered_options else ["無股票資料"], index=default_idx if filtered_options else 0)
+        stock_id = selected_stock_raw.split(" ")[0] if filtered_options else ""
+        stock_name = STOCK_DICT.get(stock_id, "") if stock_id else ""
+    with col_m2:
+        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+        if st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True):
+            st.session_state["run_diagnosis"] = True
+            if stock_id:
+                st.session_state["selected_stock_code"] = stock_id
 
-if run_agent_button:
-    st.session_state["run_diagnosis"] = True
+# 取得目前要分析的 stock_id
+current_stock_code = st.session_state.get("selected_stock_code", "2356")
+current_stock_name = STOCK_DICT.get(current_stock_code, "")
 
+# 執行診斷與圖表渲染
 if st.session_state.get("run_diagnosis", False):
-    if not stock_id:
-        st.error("❌ 請先設定有效的 FinMind Token！")
+    if not current_stock_code:
+        st.error("❌ 請先選擇有效的股票代碼！")
+    elif not active_gemini_key:
+        st.error("❌ 請於左側設定有效的 Google Gemini API Key！")
     else:
         s_date_str = start_date.strftime("%Y-%m-%d")
         e_date_str = end_date.strftime("%Y-%m-%d")
         buffer_start_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
         
-        with st.spinner(f"正在抓取 {stock_id} {stock_name} 量化行情數據..."):
+        with st.spinner(f"正在抓取 {current_stock_code} {current_stock_name} 量化行情數據..."):
             token = st.session_state["finmind_token"]
-            price_df = fetch_stock_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
-            chip_df = fetch_chip_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
-            margin_df = fetch_margin_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
-            norway_df = get_norway_big_shareholders(stock_id)
+            price_df = fetch_stock_history_cached(stock_id=current_stock_code, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+            chip_df = fetch_chip_history_cached(stock_id=current_stock_code, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+            margin_df = fetch_margin_history_cached(stock_id=current_stock_code, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+            norway_df = get_norway_big_shareholders(current_stock_code)
 
         if not price_df.empty:
-            st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_date_str), use_container_width=True)
+            st.plotly_chart(plot_main_kline_chart(price_df, current_stock_code, current_stock_name, s_date_str), use_container_width=True)
             st.plotly_chart(plot_macd_obv_chart(price_df, s_date_str), use_container_width=True)
             col1, col2 = st.columns(2)
             with col1: st.plotly_chart(plot_chip_chart(chip_df, s_date_str), use_container_width=True)
             with col2: st.plotly_chart(plot_margin_chart(margin_df, s_date_str), use_container_width=True)
-            st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name), use_container_width=True)
+            st.plotly_chart(plot_norway_pyramid_chart(norway_df, current_stock_code, current_stock_name), use_container_width=True)
             
-            if st.session_state["gemini_key"]:
-                with st.spinner("🤝 多 Agent 團隊正在召開投資決策會議..."):
-                    try:
-                        agent_res = run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, st.session_state["gemini_key"], custom_query)
-                        
-                        st.markdown("---")
-                        st.markdown("## 📊 分析結果")
-                        col_card1, col_card2 = st.columns(2)
-                        with col_card1:
-                            st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-yellow">⚡ 技術面分析</div><div class="agent-card-body">{agent_res['tech_report']}</div></div>""", unsafe_allow_html=True)
-                        with col_card2:
-                            st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-blue">🎯 籌碼面分析</div><div class="agent-card-body">{agent_res['chip_report']}</div></div>""", unsafe_allow_html=True)
+            with st.spinner("🤝 多 Agent 團隊正在召開投資決策會議..."):
+                try:
+                    agent_res = run_multi_agent_system(current_stock_code, current_stock_name, price_df, chip_df, norway_df, active_gemini_key, custom_query)
+                    
+                    st.markdown("---")
+                    st.markdown("## 📊 分析結果")
+                    col_card1, col_card2 = st.columns(2)
+                    with col_card1:
+                        st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-yellow">⚡ 技術面分析</div><div class="agent-card-body">{agent_res['tech_report']}</div></div>""", unsafe_allow_html=True)
+                    with col_card2:
+                        st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-blue">🎯 籌碼面分析</div><div class="agent-card-body">{agent_res['chip_report']}</div></div>""", unsafe_allow_html=True)
 
-                        col_card3, col_card4 = st.columns(2)
-                        with col_card3:
-                            st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-green">📈 看多觀點</div><div class="agent-card-body">{agent_res['bull_opinion']}</div></div>""", unsafe_allow_html=True)
-                        with col_card4:
-                            st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-purple">🔮 看空觀點</div><div class="agent-card-body">{agent_res['bear_opinion']}</div></div>""", unsafe_allow_html=True)
+                    col_card3, col_card4 = st.columns(2)
+                    with col_card3:
+                        st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-green">📈 看多觀點</div><div class="agent-card-body">{agent_res['bull_opinion']}</div></div>""", unsafe_allow_html=True)
+                    with col_card4:
+                        st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-purple">🔮 看空觀點</div><div class="agent-card-body">{agent_res['bear_opinion']}</div></div>""", unsafe_allow_html=True)
 
-                        col_card5, col_card6 = st.columns(2)
-                        with col_card5:
-                            st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-red">🛑 風險管理與部位配置</div><div class="agent-card-body">{agent_res['risk_report']}</div></div>""", unsafe_allow_html=True)
-                        with col_card6:
-                            st.markdown(f"""<div class="agent-card" style="border: 1px solid #00E676 !important;"><div class="agent-card-header header-green">🏆 PM 最終決策</div><div class="agent-card-body">{agent_res['pm_decision']}</div></div>""", unsafe_allow_html=True)
-                    except Exception as e:
-                        st.error(f"❌ 執行失敗：{e}")
-            else:
-                st.warning("⚠️ 請在左側設定 Gemini API Key！")
+                    col_card5, col_card6 = st.columns(2)
+                    with col_card5:
+                        st.markdown(f"""<div class="agent-card"><div class="agent-card-header header-red">🛑 風險管理與部位配置</div><div class="agent-card-body">{agent_res['risk_report']}</div></div>""", unsafe_allow_html=True)
+                    with col_card6:
+                        st.markdown(f"""<div class="agent-card" style="border: 1px solid #00E676 !important;"><div class="agent-card-header header-green">🏆 PM 最終決策</div><div class="agent-card-body">{agent_res['pm_decision']}</div></div>""", unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"❌ 執行失敗：{e}")
         else:
-            st.error(f"❌ 無法取得 {stock_id} 的 K 線價格資料，請檢查 API Token 或網路連線。")
+            st.error(f"❌ 無法取得 {current_stock_code} 的 K 線價格資料，請檢查 API Token 或網路連線。")

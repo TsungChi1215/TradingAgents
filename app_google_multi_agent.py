@@ -213,44 +213,48 @@ def get_dynamic_ttl():
     return 180 if is_market_hours() else 43200
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (台股真實行情，台灣慣例：紅漲綠跌)
+# 即時市場數據抓取 (嚴格串接台灣證交所與櫃買中心官方 API，無預設假資料)
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=60)
 def fetch_realtime_market_indices():
-    data = {
-        "taiex": {"val": 23150.20, "change": "+142.50", "up": True},
-        "tpex": {"val": 268.45, "change": "+0.85", "up": True},
-        "futures": {"val": 23180.00, "change": "+160.00", "up": True},
-        "tsmc": {"val": 1085.00, "change": "+15.00", "up": True}
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    data = {}
+    
+    # 1. 抓取加權指數與櫃買指數（證交所 MI_5MINS）
     try:
-        import yfinance as yf
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0"})
-        
-        mapping = [
-            ("taiex", "^TWII"),
-            ("tpex", "^TWOII"),
-            ("futures", "TX=F"),
-            ("tsmc", "2330.TW")
-        ]
-        for key, sym in mapping:
-            try:
-                t = yf.Ticker(sym, session=session)
-                hist = t.history(period="5d")
-                if not hist.empty and len(hist) >= 1:
-                    p = float(hist['Close'].iloc[-1])
-                    prev = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else p
-                    diff = p - prev
-                    data[key] = {
-                        "val": round(p, 2), 
-                        "change": f"{diff:+.2f}", 
-                        "up": diff >= 0
-                    }
-            except Exception:
-                pass
+        url_index = "https://openapi.twse.com.tw/v1/exchangeReport/MI_5MINS"
+        resp = requests.get(url_index, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            indices = resp.json()
+            for idx in indices:
+                code = idx.get("Code")
+                if code == "MS":
+                    val = float(str(idx.get("Index", 0)).replace(",", ""))
+                    change = float(str(idx.get("Diff", 0)).replace(",", ""))
+                    data["taiex"] = {"val": val, "change": f"{change:+.2f}", "up": change >= 0, "name": "加權指數 (TAIEX)"}
+                elif code == "OIC":
+                    val = float(str(idx.get("Index", 0)).replace(",", ""))
+                    change = float(str(idx.get("Diff", 0)).replace(",", ""))
+                    data["tpex"] = {"val": val, "change": f"{change:+.2f}", "up": change >= 0, "name": "櫃買指數 (TPEX)"}
     except Exception:
         pass
+
+    # 2. 抓取台積電 (2330) 即時行情
+    try:
+        url_tsmc = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw"
+        resp = requests.get(url_tsmc, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            j = resp.json()
+            if "msgArray" in j and len(j["msgArray"]) > 0:
+                info = j["msgArray"][0]
+                p = float(info.get("z", 0)) if info.get("z") and info.get("z") != "-" else 0.0
+                y = float(info.get("y", 0)) if info.get("y") else 0.0
+                if p > 0 and y > 0:
+                    diff = p - y
+                    data["tsmc"] = {"val": p, "change": f"{diff:+.2f}", "up": diff >= 0, "name": "台積電 (2330)"}
+    except Exception:
+        pass
+
     return data
 
 # -----------------------------------------------------------------------------
@@ -392,7 +396,7 @@ def calculate_indicators(df_price):
     df['60MA'] = df['Close'].rolling(window=60).mean().round(2)
     df['Volume_20MA'] = df['Volume_張'].rolling(window=20).mean().round(0)
 
-    # 布林上下軌計算（上下軌統一設為相同的亮紫色 #E040FB）
+    # 布林上下軌顏色相同（皆設為亮紫色 #E040FB）
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
     df['BB_Lower'] = (df['20MA'] - (std20 * 2)).round(2)
@@ -627,7 +631,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 4. 圖表繪製 (布林上下軌顏色相同，三大法人與融資融券正確呈現)
+# 4. 圖表繪製
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -700,12 +704,11 @@ def plot_chip_chart(chip_df, display_start_date):
         chip_sub = chip_df[chip_df[d_col] >= display_start_date].copy()
         if 'name' in chip_sub.columns:
             val_col = 'buy_sell' if 'buy_sell' in chip_sub.columns else ('buy' if 'buy' in chip_sub.columns else chip_sub.columns[-1])
-            # 三大法人：外資、投信、自營商
             for inv_name, color in [('Foreign', '#2962FF'), ('Trust', '#FF6D00'), ('Dealer', '#E040FB')]:
                 p_data = chip_sub[chip_sub['name'].astype(str).str.contains(inv_name, case=False, na=False)].groupby(d_col)[val_col].sum()
                 if not p_data.empty:
                     vals = (p_data / 1000).round(0)
-                    colors = np.where(vals >= 0, '#FF5252', '#00E676') # 買超紅、賣超綠
+                    colors = np.where(vals >= 0, '#FF5252', '#00E676')
                     fig.add_trace(go.Bar(x=p_data.index, y=vals, name=f"{inv_name}(張)", marker_color=colors))
     fig.update_layout(title="🏛️ 三大法人每日買賣超 (張 - 紅買綠賣)", barmode='group')
     return apply_dark_theme(fig, height=320)
@@ -791,20 +794,28 @@ active_gemini_key = st.session_state.get("gemini_key") or default_gemini_key
 market_data = fetch_realtime_market_indices()
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
 
-def render_metric_card(col, title, data):
-    # 台灣金融慣例：上漲用紅 #FF5252，下跌用綠 #00E676
-    color = "#FF5252" if data["up"] else "#00E676"
-    col.markdown(f"""
-    <div class='fin-top-card'>
-        <div class='fin-top-title'>{title}</div>
-        <div class='fin-top-val' style='color:{color};'>{data['val']:,.2f} <span style='font-size:0.8rem;'>{data['change']}</span></div>
-    </div>
-    """, unsafe_allow_html=True)
+def render_metric_card(col, title, key_name):
+    data = market_data.get(key_name)
+    if data:
+        color = "#FF5252" if data["up"] else "#00E676"
+        col.markdown(f"""
+        <div class='fin-top-card'>
+            <div class='fin-top-title'>{data['name']}</div>
+            <div class='fin-top-val' style='color:{color};'>{data['val']:,.2f} <span style='font-size:0.8rem;'>{data['change']}</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        col.markdown(f"""
+        <div class='fin-top-card'>
+            <div class='fin-top-title'>{title}</div>
+            <div class='fin-top-val' style='color:#9E9E9E; font-size:0.95rem;'>資料未取得</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-render_metric_card(m_col1, "📊 加權指數 (TAIEX)", market_data["taiex"])
-render_metric_card(m_col2, "📈 櫃買指數 (TPEX)", market_data["tpex"])
-render_metric_card(m_col3, "⚡ 台指期近月 (TX)", market_data["futures"])
-render_metric_card(m_col4, "💎 台積電 (2330)", market_data["tsmc"])
+render_metric_card(m_col1, "📊 加權指數 (TAIEX)", "taiex")
+render_metric_card(m_col2, "📈 櫃買指數 (TPEX)", "tpex")
+render_metric_card(m_col3, "⚡ 台指期近月 (TX)", "futures")
+render_metric_card(m_col4, "💎 台積電 (2330)", "tsmc")
 
 if is_market_hours():
     t_time.sleep(5)

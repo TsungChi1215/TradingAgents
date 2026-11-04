@@ -6,6 +6,7 @@ import time as t_time
 import pandas as pd
 import numpy as np
 import requests
+import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -16,7 +17,7 @@ from datetime import datetime, timedelta, time
 # -----------------------------------------------------------------------------
 def get_secret(key_name, default=""):
     try:
-        if key_name in st.secrets:
+        if st.secrets and key_name in st.secrets:
             val = st.secrets[key_name]
             if val:
                 return str(val).strip()
@@ -212,13 +213,13 @@ def get_dynamic_ttl():
     return 180 if is_market_hours() else 43200
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (確保四大台股核心指數絕對正確，對齊實際盤面)
+# 即時市場數據抓取 (台股真實行情，台灣慣例：紅漲綠跌)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=5)
 def fetch_realtime_market_indices():
     data = {
         "taiex": {"val": 23150.20, "change": "+142.50", "up": True},
-        "tpex": {"val": 268.45, "change": "-0.85", "up": False},
+        "tpex": {"val": 268.45, "change": "+0.85", "up": True},
         "futures": {"val": 23180.00, "change": "+160.00", "up": True},
         "tsmc": {"val": 1085.00, "change": "+15.00", "up": True}
     }
@@ -227,37 +228,27 @@ def fetch_realtime_market_indices():
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0"})
         
-        # 抓取加權指數 (^TWII)
-        t_twii = yf.Ticker("^TWII", session=session)
-        hist_twii = t_twii.history(period="5d")
-        if not hist_twii.empty:
-            p = float(hist_twii['Close'].iloc[-1])
-            prev = float(hist_twii['Close'].iloc[-2]) if len(hist_twii) >= 2 else p
-            diff = p - prev
-            data["taiex"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
-
-        # 抓取櫃買指數 (^TWOII 備份或預設合理區間)
-        data["tpex"] = {"val": 268.50, "change": "+0.45", "up": True}
-
-        # 抓取台指期近月 (TX=F)
-        t_tx = yf.Ticker("TX=F", session=session)
-        hist_tx = t_tx.history(period="5d")
-        if not hist_tx.empty:
-            p = float(hist_tx['Close'].iloc[-1])
-            prev = float(hist_tx['Close'].iloc[-2]) if len(hist_tx) >= 2 else p
-            diff = p - prev
-            data["futures"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
-        else:
-            data["futures"] = {"val": data["taiex"]["val"] + 30.0, "change": data["taiex"]["change"], "up": data["taiex"]["up"]}
-
-        # 抓取台積電 (2330.TW)
-        t_tsmc = yf.Ticker("2330.TW", session=session)
-        hist_tsmc = t_tsmc.history(period="5d")
-        if not hist_tsmc.empty:
-            p = float(hist_tsmc['Close'].iloc[-1])
-            prev = float(hist_tsmc['Close'].iloc[-2]) if len(hist_tsmc) >= 2 else p
-            diff = p - prev
-            data["tsmc"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
+        mapping = [
+            ("taiex", "^TWII"),
+            ("tpex", "^TWOII"),
+            ("futures", "TX=F"),
+            ("tsmc", "2330.TW")
+        ]
+        for key, sym in mapping:
+            try:
+                t = yf.Ticker(sym, session=session)
+                hist = t.history(period="5d")
+                if not hist.empty and len(hist) >= 1:
+                    p = float(hist['Close'].iloc[-1])
+                    prev = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else p
+                    diff = p - prev
+                    data[key] = {
+                        "val": round(p, 2), 
+                        "change": f"{diff:+.2f}", 
+                        "up": diff >= 0
+                    }
+            except Exception:
+                pass
     except Exception:
         pass
     return data
@@ -298,7 +289,6 @@ def get_norway_big_shareholders(stock_id):
     try:
         resp = requests.get(url, headers=headers, timeout=8)
         if resp.status_code == 200:
-            import io
             tables = pd.read_html(io.StringIO(resp.text))
             for tb in tables:
                 tb_str = str(tb.columns) + str(tb.values[:2])
@@ -364,7 +354,7 @@ def fetch_chip_history_cached(stock_id, start_date, end_date, api_token=""):
         if api_token and api_token.strip():
             try: fm.login_by_token(api_token.strip())
             except Exception: pass
-        df = fm.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date, end_date=end_date)
+        df = fm.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date, end_date=e_date)
         if not df.empty: return df
     except Exception: pass
     return pd.DataFrame()
@@ -377,7 +367,7 @@ def fetch_margin_history_cached(stock_id, start_date, end_date, api_token=""):
         if api_token and api_token.strip():
             try: fm.login_by_token(api_token.strip())
             except Exception: pass
-        df = fm.taiwan_stock_margin_purchase_short_sale(stock_id=stock_id, start_date=start_date, end_date=end_date)
+        df = fm.taiwan_stock_margin_purchase_short_sale(stock_id=stock_id, start_date=start_date, end_date=e_date)
         if not df.empty: return df
     except Exception: pass
     return pd.DataFrame()
@@ -402,7 +392,7 @@ def calculate_indicators(df_price):
     df['60MA'] = df['Close'].rolling(window=60).mean().round(2)
     df['Volume_20MA'] = df['Volume_張'].rolling(window=20).mean().round(0)
 
-    # 布林通道上下軌計算（布林上軌改為橘黃色 #FFB300，下軌改為亮紫色 #E040FB，與10MA的綠色完全區隔）
+    # 布林上下軌計算（上下軌統一設為相同的亮紫色 #E040FB）
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
     df['BB_Lower'] = (df['20MA'] - (std20 * 2)).round(2)
@@ -514,7 +504,7 @@ def run_market_screener(stock_dict, strategy_type, api_token):
     return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# 3. 多 Agent LLM 呼叫機制 (完美適配 google.genai 現代 Client API)
+# 3. 多 Agent LLM 呼叫機制 (完美適配 google.genai 現代 Client API 與 st.secrets)
 # -----------------------------------------------------------------------------
 PURE_CHINESE_SYSTEM_INSTRUCTION = """
 你是一位頂尖的台灣股市分析與投資顧問專家。
@@ -637,7 +627,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 4. 圖表繪製 (布林上下軌與均線顏色徹底區隔，確保辨識度)
+# 4. 圖表繪製 (布林上下軌顏色相同，三大法人與融資融券正確呈現)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -676,8 +666,8 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA (月線)", line=dict(color="#AA00FF", width=2.2)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['60MA'], name="60MA (季線)", line=dict(color="#2962FF", width=2.2)), row=1, col=1, secondary_y=False)
     
-    # 布林上軌改為橘黃色 #FFB300，下軌改為亮紫色 #E040FB，與10MA的綠色及60MA的藍色完全錯開
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#FFB300", width=1.6, dash="solid")), row=1, col=1, secondary_y=False)
+    # 布林上下軌顏色相同（皆設為亮紫色 #E040FB）
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#E040FB", width=1.6, dash="solid")), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#E040FB", width=1.6, dash="solid")), row=1, col=1, secondary_y=False)
     
     vol_colors = ['rgba(255, 82, 82, 0.4)' if df_price['Close'].iloc[i] >= df_price['Open'].iloc[i] else 'rgba(0, 230, 118, 0.4)' for i in range(len(df_price))]
@@ -710,11 +700,14 @@ def plot_chip_chart(chip_df, display_start_date):
         chip_sub = chip_df[chip_df[d_col] >= display_start_date].copy()
         if 'name' in chip_sub.columns:
             val_col = 'buy_sell' if 'buy_sell' in chip_sub.columns else ('buy' if 'buy' in chip_sub.columns else chip_sub.columns[-1])
-            p_foreign = chip_sub[chip_sub['name'].astype(str).str.contains('Foreign', case=False, na=False)].groupby(d_col)[val_col].sum()
-            p_trust = chip_sub[chip_sub['name'].astype(str).str.contains('Trust', case=False, na=False)].groupby(d_col)[val_col].sum()
-            if not p_foreign.empty: fig.add_trace(go.Bar(x=p_foreign.index, y=(p_foreign/1000).round(0), name="外資(張)", marker_color='#2962FF'))
-            if not p_trust.empty: fig.add_trace(go.Bar(x=p_trust.index, y=(p_trust/1000).round(0), name="投信(張)", marker_color='#FF6D00'))
-    fig.update_layout(title="🏛️ 三大法人每日買賣超 (張)")
+            # 三大法人：外資、投信、自營商
+            for inv_name, color in [('Foreign', '#2962FF'), ('Trust', '#FF6D00'), ('Dealer', '#E040FB')]:
+                p_data = chip_sub[chip_sub['name'].astype(str).str.contains(inv_name, case=False, na=False)].groupby(d_col)[val_col].sum()
+                if not p_data.empty:
+                    vals = (p_data / 1000).round(0)
+                    colors = np.where(vals >= 0, '#FF5252', '#00E676') # 買超紅、賣超綠
+                    fig.add_trace(go.Bar(x=p_data.index, y=vals, name=f"{inv_name}(張)", marker_color=colors))
+    fig.update_layout(title="🏛️ 三大法人每日買賣超 (張 - 紅買綠賣)", barmode='group')
     return apply_dark_theme(fig, height=320)
 
 def plot_margin_chart(margin_df, display_start_date):
@@ -722,15 +715,29 @@ def plot_margin_chart(margin_df, display_start_date):
     if not margin_df.empty:
         d_col = 'date' if 'date' in margin_df.columns else ('Date' if 'Date' in margin_df.columns else margin_df.columns[0])
         margin_sub = margin_df[margin_df[d_col] >= display_start_date].copy()
-        col_margin = [c for c in margin_sub.columns if 'MarginPurchase' in c or '融資' in c]
-        col_short = [c for c in margin_sub.columns if 'ShortSale' in c or '融券' in c]
-        if col_margin:
-            m_col = col_margin[0]
-            fig.add_trace(go.Scatter(x=margin_sub[d_col], y=margin_sub[m_col], name="融資餘額(張)", line=dict(color="#FF5252", width=2)), secondary_y=False)
-        if col_short:
-            s_col = col_short[0]
-            fig.add_trace(go.Scatter(x=margin_sub[d_col], y=margin_sub[s_col], name="融券餘額(張)", line=dict(color="#00E676", width=2)), secondary_y=True)
-    fig.update_layout(title="💳 融資融券餘額變化 (張)")
+        
+        col_m_buy = [c for c in margin_sub.columns if 'MarginPurchaseBuy' in c or '融資買進' in c]
+        col_m_sell = [c for c in margin_sub.columns if 'MarginPurchaseSell' in c or '融資賣出' in c]
+        col_s_buy = [c for c in margin_sub.columns if 'ShortSaleBuy' in c or '融券買進' in c]
+        col_s_sell = [c for c in margin_sub.columns if 'ShortSaleSell' in c or '融券賣出' in c]
+        
+        if col_m_buy and col_m_sell:
+            margin_sub['Margin_Diff'] = margin_sub[col_m_buy[0]] - margin_sub[col_m_sell[0]]
+            fig.add_trace(go.Bar(x=margin_sub[d_col], y=(margin_sub['Margin_Diff']/1000).round(0), name="融資增減(張)", marker_color=np.where(margin_sub['Margin_Diff']>=0, '#FF5252', '#00E676')), secondary_y=False)
+        else:
+            col_margin = [c for c in margin_sub.columns if 'MarginPurchase' in c or '融資餘額' in c]
+            if col_margin:
+                fig.add_trace(go.Scatter(x=margin_sub[d_col], y=margin_sub[col_margin[0]], name="融資餘額(張)", line=dict(color="#FF5252", width=2)), secondary_y=False)
+                
+        if col_s_buy and col_s_sell:
+            margin_sub['Short_Diff'] = margin_sub[col_s_sell[0]] - margin_sub[col_s_buy[0]]
+            fig.add_trace(go.Bar(x=margin_sub[d_col], y=(margin_sub['Short_Diff']/1000).round(0), name="融券增減(張)", marker_color=np.where(margin_sub['Short_Diff']>=0, '#00E676', '#FF5252')), secondary_y=True)
+        else:
+            col_short = [c for c in margin_sub.columns if 'ShortSale' in c or '融券餘額' in c]
+            if col_short:
+                fig.add_trace(go.Scatter(x=margin_sub[d_col], y=margin_sub[col_short[0]], name="融券餘額(張)", line=dict(color="#00E676", width=2)), secondary_y=True)
+                
+    fig.update_layout(title="💳 融資融券增減與餘額變化 (張)")
     return apply_dark_theme(fig, height=320)
 
 def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
@@ -785,7 +792,8 @@ market_data = fetch_realtime_market_indices()
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
 
 def render_metric_card(col, title, data):
-    color = "#00E676" if data["up"] else "#FF5252"
+    # 台灣金融慣例：上漲用紅 #FF5252，下跌用綠 #00E676
+    color = "#FF5252" if data["up"] else "#00E676"
     col.markdown(f"""
     <div class='fin-top-card'>
         <div class='fin-top-title'>{title}</div>

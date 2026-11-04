@@ -433,8 +433,7 @@ PURE_CHINESE_SYSTEM_INSTRUCTION = """
 
 def force_clean_english_lines(text):
     if not text: return ""
-    lines = str(text).split('
-')
+    lines = str(text).split("\n")
     valid_lines = []
     for line in lines:
         stripped = line.strip()

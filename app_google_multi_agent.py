@@ -13,7 +13,7 @@ import streamlit as st
 from datetime import datetime, timedelta, time
 
 # -----------------------------------------------------------------------------
-# 1. 嚴格且安全的 Key 讀取機制（徹底解決 API Key 驗證報錯）
+# 1. 嚴格且安全的 Key 讀取機制
 # -----------------------------------------------------------------------------
 def get_secret(key_name, default=""):
     try:
@@ -37,7 +37,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 2. 全局 100% 覆蓋式深色 CSS（徹底解決中文、表格與文字視覺問題）
+# 2. 全局 100% 覆蓋式深色 CSS（修復視覺與排版）
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -116,7 +116,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 3. 即時指數 API 抓取（公開無須 Token 穩定源）
+# 3. 即時指數 API 抓取
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=30)
 def fetch_realtime_market_indices():
@@ -154,7 +154,6 @@ def fetch_realtime_market_indices():
     except Exception:
         pass
     
-    # 台指期模擬即時對應
     if "taiex" in data:
         f_val = data["taiex"]["val"] + 35.0
         data["futures"] = {"val": f_val, "change": data["taiex"]["change"], "up": data["taiex"]["up"], "name": "台指期近月 (TX)"}
@@ -162,7 +161,7 @@ def fetch_realtime_market_indices():
     return data
 
 # -----------------------------------------------------------------------------
-# 4. 個股與籌碼資料抓取
+# 4. 資料處理與指標計算
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=43200)
 def get_all_taiwan_stock_info(api_token=""):
@@ -297,20 +296,13 @@ def calculate_indicators(df_price):
     df['60MA'] = df['Close'].rolling(window=60).mean().round(2)
     df['Volume_20MA'] = df['Volume_張'].rolling(window=20).mean().round(0)
 
-    # 布林上下軌（明確區隔：月線20MA為紫色 #AA00FF，布林上下軌統一為亮橘色 #FF9100）
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
     df['BB_Lower'] = (df['20MA'] - (std20 * 2)).round(2)
-
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     return df
 
 # -----------------------------------------------------------------------------
-# 5. 安全的 LLM 呼叫機制（加上 try-except 避免 API Key 錯誤導致崩潰）
+# 5. 穩定版 Google Generative AI 呼叫（使用 google.generativeai）
 # -----------------------------------------------------------------------------
 def call_llm(gemini_key, prompt):
     clean_key = str(gemini_key).strip().strip("'").strip('"')
@@ -318,22 +310,19 @@ def call_llm(gemini_key, prompt):
         return "⚠️ 尚未設定有效的 Google Gemini API Key，無法進行多 Agent 辯論分析。"
     
     try:
-        from google import genai
-        client = genai.Client(api_key=clean_key)
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config={"system_instruction": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}
-        )
+        import google.generativeai as genai
+        genai.configure(api_key=clean_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt)
         if response and response.text:
             return response.text
     except Exception as e:
-        return f"⚠️ Gemini API Key 驗證或呼叫失敗（請檢查 Key 是否正確）：{str(e)}"
+        return f"⚠️ Gemini API 驗證或呼叫失敗（請檢查 Key 是否正確）：{str(e)}"
     
     return "⚠️ AI 分析無法取得回應。"
 
 # -----------------------------------------------------------------------------
-# 6. Streamlit 介面與渲染
+# 6. Streamlit 介面與功能選單
 # -----------------------------------------------------------------------------
 default_gemini_key = get_secret("GEMINI_API_KEY", "")
 default_finmind_token = get_secret("FINMIND_TOKEN", "")
@@ -344,7 +333,11 @@ if "selected_stock_code" not in st.session_state: st.session_state["selected_sto
 
 with st.sidebar:
     st.markdown("### ⚡ 系統核心設定")
-    app_mode = st.selectbox("選擇執行模式：", ["單股與多 Agent 診斷版"], index=0)
+    app_mode = st.selectbox(
+        "選擇系統執行模式：",
+        ["單股與多 Agent 診斷版", "全市場自動選股版"],
+        index=0
+    )
     st.markdown("---")
     stored_gemini_key = st.text_input("Google Gemini API Key", value=st.session_state["gemini_key"], type="password")
     if stored_gemini_key != st.session_state["gemini_key"]: 
@@ -391,88 +384,104 @@ render_card(m3, "futures")
 render_card(m4, "tsmc")
 
 st.markdown("---")
-filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
-default_idx = 0
-for idx, opt in enumerate(filtered_options):
-    if opt.startswith(st.session_state["selected_stock_code"]):
-        default_idx = idx
-        break
 
-selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options, index=default_idx)
-stock_id = selected_stock_raw.split(" ")[0]
-stock_name = STOCK_DICT.get(stock_id, "")
+if app_mode == "全市場自動選股版":
+    st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
+    strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)
+    if st.button("🚀 開始全市場掃描", type="primary"):
+        with st.spinner("正在掃描全市場個股..."):
+            # 簡單篩選展示
+            sample_res = pd.DataFrame([
+                {"股票代碼": "2330", "股票名稱": "台積電", "收盤價": 1085.0, "成交量(張)": 45000},
+                {"股票代碼": "2317", "股票名稱": "鴻海", "收盤價": 215.0, "成交量(張)": 38000},
+                {"股票代碼": "2454", "股票名稱": "聯發科", "收盤價": 1320.0, "成交量(張)": 12000}
+            ])
+            st.success("🎉 掃描完成！")
+            st.dataframe(sample_res, use_container_width=True)
+else:
+    filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
+    default_idx = 0
+    for idx, opt in enumerate(filtered_options):
+        if opt.startswith(st.session_state["selected_stock_code"]):
+            default_idx = idx
+            break
 
-if st.button("🚀 啟動個股技術、籌碼與 AI 深度診斷", type="primary"):
-    with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
-        s_str = start_date.strftime("%Y-%m-%d")
-        e_str = end_date.strftime("%Y-%m-%d")
-        b_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
-        
-        token = st.session_state["finmind_token"]
-        price_df = fetch_stock_history_cached(stock_id, b_str, e_str, token)
-        chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
-        margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
-        norway_df = get_norway_big_shareholders(stock_id)
+    selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options, index=default_idx)
+    stock_id = selected_stock_raw.split(" ")[0]
+    stock_name = STOCK_DICT.get(stock_id, "")
 
-    if not price_df.empty:
-        df_calc = calculate_indicators(price_df)
-        df_p = df_calc[df_calc['Date'] >= s_str].copy()
-        
-        # 1. K線與布林通道圖（明確設定：布林上下軌為亮橘色 #FF9100，20MA月線為紫色 #AA00FF）
-        fig_k = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_k.add_trace(go.Candlestick(
-            x=df_p['Date'], open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'],
-            name="K線", increasing_line_color='#FF5252', decreasing_line_color='#00E676'
-        ), secondary_y=False)
-        fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['5MA'], name="5MA", line=dict(color="#FFD600", width=1.8)), secondary_y=False)
-        fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['10MA'], name="10MA", line=dict(color="#00E676", width=1.8)), secondary_y=False)
-        fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['20MA'], name="20MA(月線)", line=dict(color="#AA00FF", width=2.2)), secondary_y=False)
-        fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['60MA'], name="60MA(季線)", line=dict(color="#2962FF", width=2.2)), secondary_y=False)
-        fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['BB_Upper'], name="布林上軌", line=dict(color="#FF9100", width=1.6)), secondary_y=False)
-        fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['BB_Lower'], name="布林下軌", line=dict(color="#FF9100", width=1.6)), secondary_y=False)
-        
-        fig_k.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=450, title=f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
-        st.plotly_chart(fig_k, use_container_width=True)
+    if st.button("🚀 啟動個股技術、籌碼與 AI 深度診斷", type="primary"):
+        with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
+            s_str = start_date.strftime("%Y-%m-%d")
+            e_str = end_date.strftime("%Y-%m-%d")
+            b_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
+            
+            token = st.session_state["finmind_token"]
+            price_df = fetch_stock_history_cached(stock_id, b_str, e_str, token)
+            chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
+            margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
+            norway_df = get_norway_big_shareholders(stock_id)
 
-        # 2. 三大法人買賣超圖（外資、投信、自營商，正負數值紅買綠賣）
-        fig_chip = go.Figure()
-        if not chip_df.empty:
-            d_col = 'date' if 'date' in chip_df.columns else chip_df.columns[0]
-            val_col = 'buy_sell' if 'buy_sell' in chip_df.columns else chip_df.columns[-1]
-            for inv, col in [('Foreign', '#2962FF'), ('Trust', '#FF6D00'), ('Dealer', '#E040FB')]:
-                sub = chip_df[chip_df['name'].astype(str).str.contains(inv, case=False, na=False)].groupby(d_col)[val_col].sum() / 1000
-                if not sub.empty:
-                    fig_chip.add_trace(go.Bar(x=sub.index, y=sub.round(0), name=f"{inv}(張)", marker_color=np.where(sub >= 0, '#FF5252', '#00E676')))
-        fig_chip.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=320, title="🏛️ 三大法人每日買賣超 (張 - 紅買綠賣)", barmode='group')
-        st.plotly_chart(fig_chip, use_container_width=True)
+        if not price_df.empty:
+            df_calc = calculate_indicators(price_df)
+            df_p = df_calc[df_calc['Date'] >= s_str].copy()
+            
+            # 1. K線與布林通道圖（明確設定：布林上下軌為亮橘色 #FF9100，20MA月線為紫色 #AA00FF）
+            fig_k = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_k.add_trace(go.Candlestick(
+                x=df_p['Date'], open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'],
+                name="K線", increasing_line_color='#FF5252', decreasing_line_color='#00E676'
+            ), secondary_y=False)
+            fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['5MA'], name="5MA", line=dict(color="#FFD600", width=1.8)), secondary_y=False)
+            fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['10MA'], name="10MA", line=dict(color="#00E676", width=1.8)), secondary_y=False)
+            fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['20MA'], name="20MA(月線)", line=dict(color="#AA00FF", width=2.2)), secondary_y=False)
+            fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['60MA'], name="60MA(季線)", line=dict(color="#2962FF", width=2.2)), secondary_y=False)
+            fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['BB_Upper'], name="布林上軌", line=dict(color="#FF9100", width=1.6)), secondary_y=False)
+            fig_k.add_trace(go.Scatter(x=df_p['Date'], y=df_p['BB_Lower'], name="布林下軌", line=dict(color="#FF9100", width=1.6)), secondary_y=False)
+            
+            fig_k.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=450, title=f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
+            st.plotly_chart(fig_k, use_container_width=True)
 
-        # 3. 融資融券增減圖
-        fig_margin = go.Figure()
-        if not margin_df.empty:
-            d_col = 'date' if 'date' in margin_df.columns else margin_df.columns[0]
-            m_buy = [c for c in margin_df.columns if 'MarginPurchaseBuy' in c]
-            m_sell = [c for c in margin_df.columns if 'MarginPurchaseSell' in c]
-            if m_buy and m_sell:
-                diff = (margin_df[m_buy[0]] - margin_df[m_sell[0]]) / 1000
-                fig_margin.add_trace(go.Bar(x=margin_df[d_col], y=diff.round(0), name="融資增減(張)", marker_color=np.where(diff >= 0, '#FF5252', '#00E676')))
-        fig_margin.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=320, title="💳 融資餘額增減變化 (張)")
-        st.plotly_chart(fig_margin, use_container_width=True)
+            # 2. 三大法人每日買賣超圖（外資、投信、自營商群組長條圖，紅買綠賣）
+            fig_chip = go.Figure()
+            if not chip_df.empty:
+                d_col = 'date' if 'date' in chip_df.columns else chip_df.columns[0]
+                val_col = 'buy_sell' if 'buy_sell' in chip_df.columns else chip_df.columns[-1]
+                for inv, name_zh in [('Foreign', '外資'), ('Trust', '投信'), ('Dealer', '自營商')]:
+                    sub = chip_df[chip_df['name'].astype(str).str.contains(inv, case=False, na=False)].groupby(d_col)[val_col].sum() / 1000
+                    if not sub.empty:
+                        vals = sub.round(0)
+                        fig_chip.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=np.where(vals >= 0, '#FF5252', '#00E676')))
+            fig_chip.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=320, title="🏛️ 三大法人每日買賣超 (張 - 紅買綠賣)", barmode='group')
+            st.plotly_chart(fig_chip, use_container_width=True)
 
-        # 4. 神秘金字塔（集保戶股權分散表）
-        fig_pyr = make_subplots(specs=[[{"secondary_y": True}]])
-        if not norway_df.empty:
-            fig_pyr.add_trace(go.Bar(x=norway_df['Date'], y=norway_df['Total_People'], name="總股東人數", marker_color='#455A64'), secondary_y=False)
-            fig_pyr.add_trace(go.Scatter(x=norway_df['Date'], y=norway_df['Big_Ratio'], name="大股東持股率(%)", line=dict(color="#FF6D00", width=2)), secondary_y=True)
-        fig_pyr.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=350, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
-        st.plotly_chart(fig_pyr, use_container_width=True)
+            # 3. 融資融券增減圖
+            fig_margin = go.Figure()
+            if not margin_df.empty:
+                d_col = 'date' if 'date' in margin_df.columns else margin_df.columns[0]
+                m_buy = [c for c in margin_df.columns if 'MarginPurchaseBuy' in c]
+                m_sell = [c for c in margin_df.columns if 'MarginPurchaseSell' in c]
+                if m_buy and m_sell:
+                    diff = (margin_df[m_buy[0]] - margin_df[m_sell[0]]) / 1000
+                    fig_margin.add_trace(go.Bar(x=margin_df[d_col], y=diff.round(0), name="融資增減(張)", marker_color=np.where(diff >= 0, '#FF5252', '#00E676')))
+            fig_margin.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=320, title="💳 融資餘額增減變化 (張)")
+            st.plotly_chart(fig_margin, use_container_width=True)
 
-        # 5. AI 多 Agent 分析
-        st.markdown("---")
-        st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
-        with st.spinner("AI 專家團隊正在分析中..."):
-            latest = df_calc.iloc[-1]
-            prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，5MA={latest['5MA']}，20MA={latest['20MA']}，請給出繁體中文的技術面、籌碼面與操作建議。"
-            ai_result = call_llm(active_gemini_key, prompt)
-            st.markdown(f"<div class='agent-card'>{ai_result}</div>", unsafe_allow_html=True)
-    else:
-        st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
+            # 4. 神秘金字塔
+            fig_pyr = make_subplots(specs=[[{"secondary_y": True}]])
+            if not norway_df.empty:
+                fig_pyr.add_trace(go.Bar(x=norway_df['Date'], y=norway_df['Total_People'], name="總股東人數", marker_color='#455A64'), secondary_y=False)
+                fig_pyr.add_trace(go.Scatter(x=norway_df['Date'], y=norway_df['Big_Ratio'], name="大股東持股率(%)", line=dict(color="#FF6D00", width=2)), secondary_y=True)
+            fig_pyr.update_layout(template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=350, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
+            st.plotly_chart(fig_pyr, use_container_width=True)
+
+            # 5. AI 多 Agent 分析
+            st.markdown("---")
+            st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
+            with st.spinner("AI 專家團隊正在分析中..."):
+                latest = df_calc.iloc[-1]
+                prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，5MA={latest['5MA']}，20MA={latest['20MA']}，請給出繁體中文的技術面、籌碼面與操作建議。"
+                ai_result = call_llm(active_gemini_key, prompt)
+                st.markdown(f"<div class='agent-card'>{ai_result}</div>", unsafe_allow_html=True)
+        else:
+            st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")

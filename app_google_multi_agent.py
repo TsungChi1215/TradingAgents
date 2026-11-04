@@ -10,7 +10,7 @@ import streamlit as st
 from datetime import datetime, timedelta
 
 # -----------------------------------------------------------------------------
-# 1. 系統設定與金鑰解析（支援多組 AIzaSy 與 AQ. 格式 Key 自動輪替備援）
+# 1. 系統設定與強效金鑰清洗解析（徹底解決帶有引號與中括號的 401 錯誤）
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="TradingAgents - 專業金融量化選股終端",
@@ -31,14 +31,19 @@ def get_secret(key_name, default=""):
 
 def parse_api_keys(raw_input):
     """
-    將使用者輸入的字串、清單或 JSON 陣列解析成獨立的金鑰列表
+    強效清洗函式：自動過濾 Python 列表的中括號、單雙引號與多餘空白
     """
     if not raw_input:
         return []
     if isinstance(raw_input, list):
-        return [str(k).strip().strip("'").strip('"') for k in raw_input if k]
+        keys = []
+        for k in raw_input:
+            clean = str(k).strip().replace("[", "").replace("]", "").replace("'", "").replace('"', "").strip()
+            if clean: keys.append(clean)
+        return keys
         
     cleaned = str(raw_input).strip()
+    # 移除所有可能從介面或 Secrets 帶入的括號與引號
     cleaned = cleaned.replace("[", "").replace("]", "").replace("'", "").replace('"', "")
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
     if not parts and cleaned:
@@ -46,12 +51,14 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 # -----------------------------------------------------------------------------
-# 2. 官方 OpenAPI 即時指數
+# 2. 官方 OpenAPI 即時指數（具備強固的備援與錯誤防護）
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
-def fetch_market_indices_v5():
+def fetch_market_indices_v6():
     headers = {"User-Agent": "Mozilla/5.0"}
     data = {}
+    
+    # 嘗試抓取大盤與櫃買
     try:
         url_index = "https://openapi.twse.com.tw/v1/exchangeReport/MI_5MINS"
         resp = requests.get(url_index, headers=headers, timeout=5)
@@ -70,6 +77,26 @@ def fetch_market_indices_v5():
                         data["tpex"] = {"val": val, "change": change, "name": "櫃買指數 (TPEX)"}
     except Exception: pass
 
+    # 若 OpenAPI 沒資料（例如收盤後），使用備援 MIS 接口
+    if "taiex" not in data:
+        try:
+            url_mis = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw|otc_o00.tw"
+            resp = requests.get(url_mis, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                j = resp.json()
+                for info in j.get("msgArray", []):
+                    c = info.get("c")
+                    z_val = info.get("z", "")
+                    p = float(z_val) if z_val and z_val != "-" else float(info.get("y", 0))
+                    y = float(info.get("y", 0))
+                    diff = p - y if p > 0 and y > 0 else 0
+                    if c == "t00":
+                        data["taiex"] = {"val": p, "change": diff, "name": "加權指數 (TAIEX)"}
+                    elif c == "o00":
+                        data["tpex"] = {"val": p, "change": diff, "name": "櫃買指數 (TPEX)"}
+        except Exception: pass
+
+    # 台積電即時報價
     try:
         url_tsmc = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw"
         resp = requests.get(url_tsmc, headers=headers, timeout=5)
@@ -255,7 +282,6 @@ def plot_chip_chart(chip_df, display_start_date):
         d_col = 'date' if 'date' in chip_df.columns else chip_df.columns[0]
         chip_sub = chip_df[chip_df[d_col] >= display_start_date].copy()
         
-        # 確實計算「淨買賣超」(buy - sell)，呈現正確的紅買綠賣
         if 'buy' in chip_sub.columns and 'sell' in chip_sub.columns:
             chip_sub['net_buy'] = chip_sub['buy'] - chip_sub['sell']
         else:
@@ -293,7 +319,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 多組 API Key 智慧輪替備援機制（支援 AIzaSy 與 AQ. 格式）
+# 6. 多組 API Key 智慧輪替備援機制（支援 AIzaSy 與 AQ. 格式，自動避開 401/400 錯誤）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(raw_keys_input, prompt):
     keys_list = parse_api_keys(raw_keys_input)
@@ -318,7 +344,7 @@ def call_gemini_with_keys_rotation(raw_keys_input, prompt):
         except Exception as e:
             last_error_msg = f"SDK 模式錯誤: {e}"
 
-        # 2. 備援：透過 REST API 智慧發送請求 (AQ. 格式支援 Bearer Token 或 x-goog-api-key)
+        # 2. 備援：透過 REST API 智慧發送請求 (AQ. 格式使用 Bearer Token，AIzaSy 使用 ?key=)
         try:
             url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             headers = {"Content-Type": "application/json"}
@@ -337,7 +363,8 @@ def call_gemini_with_keys_rotation(raw_keys_input, prompt):
             if resp.status_code == 200:
                 return resp.json()['candidates'][0]['content']['parts'][0]['text']
             elif resp.status_code in [400, 401, 429]:
-                last_error_msg = f"Key #{idx+1} 狀態碼 {resp.status_code}"
+                # 401 (未授權) 或 400/429，自動切換到下一組 Key
+                last_error_msg = f"Key #{idx+1} 狀態碼 {resp.status_code} (授權失敗或超限)"
                 continue
             else:
                 last_error_msg = f"Key #{idx+1} 伺服器錯誤 ({resp.status_code}): {resp.text}"
@@ -399,7 +426,7 @@ with st.sidebar:
         "Google Gemini API Keys (支援多組，用逗號或換行隔開)", 
         value=str(st.session_state["gemini_key"]), 
         height=110,
-        help="您可以貼入多組 AIzaSy... 或 AQ... 開頭的 Key，用逗號隔開或換行。系統會自動輪替備援。"
+        help="您可以貼入多組 AIzaSy... 或 AQ... 開頭的 Key。程式會自動清洗引號與括號並輪替備援。"
     )
     if stored_gemini_key != st.session_state["gemini_key"]: 
         st.session_state["gemini_key"] = stored_gemini_key.strip()
@@ -416,8 +443,8 @@ with st.sidebar:
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 active_gemini_keys = st.session_state.get("gemini_key") or default_gemini_key
 
-# 頂部四塊指數看板 (使用原生 Streamlit metric，保證中文與數值 100% 正常顯示)
-market_data = fetch_market_indices_v5()
+# 頂部四塊指數看板
+market_data = fetch_market_indices_v6()
 m1, m2, m3, m4 = st.columns(4)
 
 def render_native_metric(col, title, data_key):
@@ -425,7 +452,7 @@ def render_native_metric(col, title, data_key):
     if d:
         col.metric(title, f"{d['val']:,.2f}", f"{d['change']:+.2f}")
     else:
-        col.metric(title, "--", "連線中")
+        col.metric(title, "--", "盤中休市/連線中")
 
 render_native_metric(m1, "加權指數 (TAIEX)", "taiex")
 render_native_metric(m2, "櫃買指數 (TPEX)", "tpex")

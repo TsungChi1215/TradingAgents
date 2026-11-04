@@ -40,7 +40,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS (徹底消除任何白色突兀區塊並提高文字對比)
+# 全局 100% 覆蓋式深色 CSS (包含表格 stDataFrame 暗黑模式全面強制覆蓋)
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -66,7 +66,6 @@ st.markdown("""
         padding-bottom: 2rem !important;
         max-width: 98% !important;
     }
-    /* 提高所有說明文字與標籤的能見度 */
     label, p, span, .stMarkdown, .stRadio, .stSelectbox {
         color: #FFFFFF !important;
         font-weight: 500 !important;
@@ -81,7 +80,6 @@ st.markdown("""
         background-color: #1A1E29 !important;
         color: #FFFFFF !important;
     }
-    /* 覆蓋 Streamlit 預設的白色 Info / Warning 訊息方塊為深色 */
     .stAlert {
         background-color: #161A24 !important;
         color: #00E676 !important;
@@ -100,23 +98,53 @@ st.markdown("""
         box-shadow: 0 0 15px rgba(0, 200, 83, 0.6) !important;
         transform: translateY(-1px);
     }
+    
+    /* --- 頂部四大指數卡片樣式 --- */
     .fin-top-card {
         background-color: #161A24 !important;
         border: 1px solid #232836 !important;
         border-radius: 12px !important;
-        padding: 12px 16px !important;
+        padding: 14px 18px !important;
         margin-bottom: 12px !important;
     }
     .fin-top-title {
-        font-size: 0.9rem !important;
-        color: #B0C4DE !important;
+        font-size: 0.95rem !important;
+        color: #00E676 !important;
         margin-bottom: 6px !important;
         font-weight: bold !important;
     }
     .fin-top-val {
-        font-size: 1.25rem !important;
+        font-size: 1.3rem !important;
         font-weight: bold !important;
     }
+
+    /* --- 強制將 st.dataframe / st.table 轉為黑底白字高對比 --- */
+    div[data-testid="stDataFrame"] {
+        background-color: #161A24 !important;
+        border: 1px solid #2C3245 !important;
+        border-radius: 10px !important;
+        padding: 4px !important;
+    }
+    table {
+        background-color: #161A24 !important;
+        color: #FFFFFF !important;
+    }
+    thead tr th {
+        background-color: #1E2330 !important;
+        color: #00E676 !important;
+        font-weight: bold !important;
+        border-bottom: 1px solid #2C3245 !important;
+    }
+    tbody tr td {
+        background-color: #161A24 !important;
+        color: #FFFFFF !important;
+        border-bottom: 1px solid #232836 !important;
+    }
+    tbody tr:hover td {
+        background-color: #1F2533 !important;
+    }
+
+    /* --- 多 Agent 診斷卡片 --- */
     .agent-card {
         background-color: #161A26 !important;
         border: 1px solid #23293A !important;
@@ -171,7 +199,7 @@ STRATEGY_CONDITIONS = {
 }
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (加權指數、櫃買指數、台指近月、台積電)
+# 即時市場數據抓取 (加權指數、櫃買指數、台指期近月、台積電)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_realtime_market_indices():
@@ -696,7 +724,7 @@ with st.sidebar:
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 
 # =============================================================================
-# 頂部四塊核心指標看板 (加權指數、櫃買指數、台指近月、台積電 - 附完整中文說明)
+# 頂部四塊核心指標看板 (加權指數、櫃買指數、台指近月、台積電 - 附強制中文大標題)
 # =============================================================================
 market_data = fetch_realtime_market_indices()
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -772,7 +800,7 @@ if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
     st.markdown("---")
 
 # =============================================================================
-# 模式 B：個股與多 Agent 分析區塊 (確保點擊按鈕穩定觸發)
+# 模式 B：個股與多 Agent 分析區塊 (確保點擊診斷穩定觸發)
 # =============================================================================
 filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
 default_idx = 0
@@ -791,7 +819,6 @@ with col_m2:
     st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
     run_agent_button = st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True)
 
-# 狀態旗標：點擊按鈕後寫入 session_state 避免頁面重新整理後失效
 if run_agent_button:
     st.session_state["run_diagnosis"] = True
 

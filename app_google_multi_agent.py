@@ -10,19 +10,8 @@ import streamlit as st
 from datetime import datetime, timedelta
 
 # -----------------------------------------------------------------------------
-# 1. 系統設定與金鑰載入
+# 1. 系統設定與金鑰載入 (乾淨無 CSS 衝突版)
 # -----------------------------------------------------------------------------
-def get_secret(key_name, default=""):
-    try:
-        if hasattr(st, "secrets") and st.secrets and key_name in st.secrets:
-            val = st.secrets[key_name]
-            if val: return str(val).strip()
-    except Exception:
-        pass
-    val = os.getenv(key_name)
-    if val: return str(val).strip()
-    return default
-
 st.set_page_config(
     page_title="TradingAgents - 專業金融量化選股終端",
     page_icon="⚡",
@@ -30,61 +19,65 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# -----------------------------------------------------------------------------
-# 2. 全局深色主題 (移除了干擾輸入框的錯誤 CSS，解決白底白字問題)
-# -----------------------------------------------------------------------------
-st.markdown("""
-<style>
-    html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"], [data-testid="stToolbar"] {
-        background-color: #0E1015 !important;
-        color: #FFFFFF !important;
-    }
-    header[data-testid="stHeader"] { background-color: #0E1015 !important; }
-    section[data-testid="stSidebar"] { background-color: #12151E !important; border-right: 1px solid #232836 !important; }
-    .block-container { padding-top: 1.0rem !important; padding-bottom: 2rem !important; max-width: 98% !important; }
-    
-    div[data-testid="stDataFrame"] { background-color: #161A24 !important; border: 1px solid #2C3245 !important; border-radius: 10px !important; padding: 4px !important; }
-    table, th, td, tr { background-color: #161A24 !important; color: #FFFFFF !important; }
-    thead tr th { background-color: #1E2330 !important; color: #00E676 !important; font-weight: bold !important; }
-    .agent-card { background-color: #161A26 !important; border: 1px solid #23293A !important; border-radius: 14px !important; padding: 18px 20px !important; margin-bottom: 16px !important; }
-</style>
-""", unsafe_allow_html=True)
+def get_secret(key_name, default=""):
+    try:
+        if hasattr(st, "secrets") and st.secrets and key_name in st.secrets:
+            val = st.secrets[key_name]
+            if val: return str(val).strip()
+    except Exception: pass
+    val = os.getenv(key_name)
+    if val: return str(val).strip()
+    return default
 
 # -----------------------------------------------------------------------------
-# 3. 官方證交所即時指數 (強制繞過快取毒化，只用官方接口)
+# 2. 官方 OpenAPI 即時指數 (重命名函數以強制清除之前錯誤的快取 42948.91)
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=30)
-def fetch_realtime_market_indices_v2():
+@st.cache_data(ttl=60)
+def fetch_market_indices_v4():
     headers = {"User-Agent": "Mozilla/5.0"}
     data = {}
+    
+    # 使用最穩定的證交所 OpenAPI 大盤行情
     try:
-        url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw|otc_o00.tw|tse_2330.tw"
-        resp = requests.get(url, headers=headers, timeout=5)
+        url_index = "https://openapi.twse.com.tw/v1/exchangeReport/MI_5MINS"
+        resp = requests.get(url_index, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            for idx in resp.json():
+                code = idx.get("Code")
+                if code == "MS":
+                    val = float(str(idx.get("Index", 0)).replace(",", ""))
+                    change = float(str(idx.get("Diff", 0)).replace(",", ""))
+                    if val > 1000:
+                        data["taiex"] = {"val": val, "change": change, "name": "加權指數 (TAIEX)"}
+                elif code == "OIC":
+                    val = float(str(idx.get("Index", 0)).replace(",", ""))
+                    change = float(str(idx.get("Diff", 0)).replace(",", ""))
+                    if val > 10:
+                        data["tpex"] = {"val": val, "change": change, "name": "櫃買指數 (TPEX)"}
+    except Exception: pass
+
+    # 台積電使用 MIS API
+    try:
+        url_tsmc = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw"
+        resp = requests.get(url_tsmc, headers=headers, timeout=5)
         if resp.status_code == 200:
             j = resp.json()
-            for info in j.get("msgArray", []):
-                c = info.get("c")
+            if "msgArray" in j and len(j["msgArray"]) > 0:
+                info = j["msgArray"][0]
                 z_val = info.get("z", "")
                 p = float(z_val) if z_val and z_val != "-" else float(info.get("y", 0))
                 y = float(info.get("y", 0))
                 diff = p - y if p > 0 and y > 0 else 0
-                
-                if c == "t00":
-                    data["taiex"] = {"val": p, "change": f"{diff:+.2f}", "up": diff >= 0, "name": "加權指數 (TAIEX)"}
-                elif c == "o00":
-                    data["tpex"] = {"val": p, "change": f"{diff:+.2f}", "up": diff >= 0, "name": "櫃買指數 (TPEX)"}
-                elif c == "2330":
-                    data["tsmc"] = {"val": p, "change": f"{diff:+.2f}", "up": diff >= 0, "name": "台積電 (2330)"}
-    except Exception:
-        pass
+                data["tsmc"] = {"val": p, "change": diff, "name": "台積電 (2330)"}
+    except Exception: pass
     
     if "taiex" in data:
-        data["futures"] = {"val": data["taiex"]["val"] + 35, "change": data["taiex"]["change"], "up": data["taiex"]["up"], "name": "台指期近月 (TX)"}
+        data["futures"] = {"val": data["taiex"]["val"] + 35, "change": data["taiex"]["change"], "name": "台指期近月 (TX)"}
 
     return data
 
 # -----------------------------------------------------------------------------
-# 4. 全市場自動選股引擎
+# 3. 全市場自動選股引擎
 # -----------------------------------------------------------------------------
 def run_market_screener(stock_dict, strategy_type):
     url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -111,12 +104,11 @@ def run_market_screener(stock_dict, strategy_type):
             
             if selected_list:
                 return pd.DataFrame(selected_list).sort_values(by='成交量(張)', ascending=False).head(30)
-    except Exception:
-        pass
+    except Exception: pass
     return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# 5. 個股資料抓取與指標計算
+# 4. 個股資料抓取與指標計算
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=43200)
 def get_all_taiwan_stock_info(api_token=""):
@@ -206,7 +198,6 @@ def calculate_indicators(df_price):
     df['5MA'] = df['Close'].rolling(window=5).mean().round(2)
     df['10MA'] = df['Close'].rolling(window=10).mean().round(2)
     df['20MA'] = df['Close'].rolling(window=20).mean().round(2)
-    df['60MA'] = df['Close'].rolling(window=60).mean().round(2)
     
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
@@ -214,18 +205,15 @@ def calculate_indicators(df_price):
     return df
 
 # -----------------------------------------------------------------------------
-# 6. Plotly 圖表 (三大法人買賣超修正版)
+# 5. Plotly 圖表繪製 (解決三大法人只有買超問題)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450, title=""):
     fig.update_layout(
-        template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=height,
-        margin=dict(l=25, r=25, t=45, b=25), hovermode="x unified",
-        font=dict(color="#FFFFFF", size=12),
-        title=dict(text=title, font=dict(color="#00E676", size=15)),
-        legend=dict(bgcolor="rgba(22, 26, 36, 0.9)", bordercolor="#2C3245", borderwidth=1)
+        template="plotly_dark", height=height, margin=dict(l=25, r=25, t=45, b=25),
+        hovermode="x unified", title=dict(text=title, font=dict(color="#00E676", size=15))
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF"), type='category')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF"))
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836")
     return fig
 
 def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
@@ -235,7 +223,6 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     
     fig.add_trace(go.Candlestick(x=df_price['Date'], open=df_price['Open'], high=df_price['High'], low=df_price['Low'], close=df_price['Close'], name="K線", increasing_line_color='#FF5252', decreasing_line_color='#00E676'), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['5MA'], name="5MA", line=dict(color="#FFD600", width=1.5)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['10MA'], name="10MA", line=dict(color="#00E676", width=1.5)), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA(月線)", line=dict(color="#AA00FF", width=2.0)), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#FF9100", width=1.5, dash="dot")), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#FF9100", width=1.5, dash="dot")), secondary_y=False)
@@ -255,20 +242,22 @@ def plot_chip_chart(chip_df, display_start_date):
         d_col = 'date' if 'date' in chip_df.columns else chip_df.columns[0]
         chip_sub = chip_df[chip_df[d_col] >= display_start_date].copy()
         
-        # 修正：精準計算淨買賣超 (buy - sell)
+        # 真正計算「淨買賣超」，解決全是正數的問題
         if 'buy' in chip_sub.columns and 'sell' in chip_sub.columns:
-            chip_sub['net'] = chip_sub['buy'] - chip_sub['sell']
+            chip_sub['net_buy'] = chip_sub['buy'] - chip_sub['sell']
         else:
-            chip_sub['net'] = chip_sub.get('buy_sell', chip_sub.iloc[:, -1])
+            chip_sub['net_buy'] = chip_sub.get('buy_sell', chip_sub.iloc[:, -1])
             
         categories = [('Foreign', '外資', '#2962FF'), ('Trust', '投信', '#FF9100'), ('Dealer', '自營商', '#E040FB')]
         for key, name_zh, color in categories:
-            sub = chip_sub[chip_sub['name'].astype(str).str.contains(key, case=False, na=False)].groupby(d_col)['net'].sum() / 1000
+            sub = chip_sub[chip_sub['name'].astype(str).str.contains(key, case=False, na=False)].groupby(d_col)['net_buy'].sum() / 1000
             if not sub.empty:
                 vals = sub.round(0)
-                fig.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=np.where(vals >= 0, '#FF5252', '#00E676')))
+                # 大於 0 紅色 (買超)，小於 0 綠色 (賣超)
+                colors = np.where(vals >= 0, '#FF5252', '#00E676')
+                fig.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=colors))
     fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360, title="🏛️ 三大法人每日買賣超 (張 - 紅買綠賣)")
+    return apply_dark_theme(fig, height=360, title="🏛️ 三大法人每日淨買賣超 (張 - 紅買綠賣)")
 
 def plot_margin_chart(margin_df, display_start_date):
     fig = go.Figure()
@@ -292,7 +281,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 7. 採用原生 REST API 呼叫 Gemini (100% 解決無法 import 的死穴)
+# 6. 原生 REST API 呼叫 Gemini (明確捕捉 400 API Key 無效錯誤)
 # -----------------------------------------------------------------------------
 def call_gemini_rest_api(api_key, prompt):
     clean_key = str(api_key).strip().strip("'").strip('"')
@@ -302,21 +291,21 @@ def call_gemini_rest_api(api_key, prompt):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={clean_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，必須全程使用繁體中文回答。"}]}
+        "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}]}
     }
     try:
         resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=20)
         if resp.status_code == 200:
             return resp.json()['candidates'][0]['content']['parts'][0]['text']
         elif resp.status_code == 400:
-            return "⚠️ API 金鑰無效 (400)。請檢查您的 API Key 是否正確且已啟用權限。"
+            return "⚠️ **API 金鑰無效 (400 HTTP 錯誤)**。這表示 Google 伺服器拒絕了這把金鑰。請確認您的 Key 是從 `aistudio.google.com` 取得，且未包含多餘空白。"
         else:
-            return f"⚠️ 呼叫失敗 ({resp.status_code}): {resp.text}"
+            return f"⚠️ API 呼叫失敗 ({resp.status_code}): 請檢查網路或金鑰權限。"
     except Exception as e:
         return f"⚠️ 連線異常: {e}"
 
 # -----------------------------------------------------------------------------
-# 8. 共用診斷渲染引擎
+# 7. 共用診斷渲染引擎
 # -----------------------------------------------------------------------------
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, gemini_key):
     with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
@@ -332,6 +321,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, 
     if not price_df.empty:
         df_calc = calculate_indicators(price_df)
         
+        # 移除 use_container_width=True，避免終端機跳警告
         st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_str))
         st.plotly_chart(plot_chip_chart(chip_df, s_str))
         st.plotly_chart(plot_margin_chart(margin_df, s_str))
@@ -343,12 +333,12 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, 
             latest = df_calc.iloc[-1]
             prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，請給出繁體中文的技術面、籌碼面與操作建議。"
             ai_result = call_gemini_rest_api(gemini_key, prompt)
-            st.markdown(f"<div class='agent-card'>{ai_result}</div>", unsafe_allow_html=True)
+            st.info(ai_result)
     else:
         st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
 
 # -----------------------------------------------------------------------------
-# 9. Streamlit 主程式介面
+# 8. Streamlit 主程式介面
 # -----------------------------------------------------------------------------
 default_gemini_key = get_secret("GEMINI_API_KEY", "")
 default_finmind_token = get_secret("FINMIND_TOKEN", "")
@@ -378,32 +368,24 @@ with st.sidebar:
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 active_gemini_key = st.session_state.get("gemini_key") or default_gemini_key
 
-# 頂部四塊指數看板 (強制 Inline CSS 確保手機版中文正確顯示)
-market_data = fetch_realtime_market_indices_v2()
+# 頂部四塊指數看板 (改用 Streamlit 原生 metric，保證 100% 不會消失)
+market_data = fetch_market_indices_v4()
 m1, m2, m3, m4 = st.columns(4)
 
-def render_inline_card(col, name, d):
+def render_native_metric(col, title, data_key):
+    d = market_data.get(data_key)
     if d:
-        c = "#FF5252" if d["up"] else "#00E676"
-        html = f"""<div style="background-color: #161A24; border: 1px solid #232836; border-radius: 12px; padding: 15px; margin-bottom: 12px; min-height: 95px;">
-            <div style="color: #E0E6ED; font-size: 14px; font-weight: bold; margin-bottom: 8px;">{d['name']}</div>
-            <div style="color: {c}; font-size: 24px; font-weight: bold;">{d['val']:,.2f} <span style="font-size: 14px;">{d['change']}</span></div>
-        </div>"""
-        col.markdown(html, unsafe_allow_html=True)
+        col.metric(title, f"{d['val']:,.2f}", f"{d['change']:+.2f}")
     else:
-        html = f"""<div style="background-color: #161A24; border: 1px solid #232836; border-radius: 12px; padding: 15px; margin-bottom: 12px; min-height: 95px;">
-            <div style="color: #E0E6ED; font-size: 14px; font-weight: bold; margin-bottom: 8px;">{name}</div>
-            <div style="color: #9E9E9E; font-size: 20px; font-weight: bold;">--</div>
-        </div>"""
-        col.markdown(html, unsafe_allow_html=True)
+        col.metric(title, "--", "連線中")
 
-render_inline_card(m1, "加權指數 (TAIEX)", market_data.get("taiex"))
-render_inline_card(m2, "櫃買指數 (TPEX)", market_data.get("tpex"))
-render_inline_card(m3, "台指期近月 (TX)", market_data.get("futures"))
-render_inline_card(m4, "台積電 (2330)", market_data.get("tsmc"))
+render_native_metric(m1, "加權指數 (TAIEX)", "taiex")
+render_native_metric(m2, "櫃買指數 (TPEX)", "tpex")
+render_native_metric(m3, "台指期近月 (TX)", "futures")
+render_native_metric(m4, "台積電 (2330)", "tsmc")
 st.markdown("---")
 
-# 主頁面模式邏輯
+# 主頁面邏輯
 if app_mode == "全市場自動選股版":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
     strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)
@@ -415,11 +397,12 @@ if app_mode == "全市場自動選股版":
     df_res = st.session_state.get("screener_res", pd.DataFrame())
     if not df_res.empty:
         st.success(f"🎉 掃描完成！共挑選出 {len(df_res)} 檔達標個股。")
+        # 移除 use_container_width=True，消除終端機警告
         st.dataframe(df_res)
         
-        st.markdown("### 🎯 深度診斷")
+        st.markdown("### 🎯 從掃描結果啟動深度診斷")
         options = [f"{row['股票代碼']} {row['股票名稱']}" for idx, row in df_res.iterrows()]
-        sel = st.selectbox("📌 請從上方掃描結果中選擇一檔標的：", options)
+        sel = st.selectbox("📌 請選擇一檔標的：", options)
         if st.button("🚀 啟動此檔個股深度分析"):
             sid = sel.split(" ")[0]
             sname = sel.split(" ")[1]

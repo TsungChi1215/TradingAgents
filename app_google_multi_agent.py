@@ -1,7 +1,5 @@
 import os
-import sys
 import json
-import re
 import pandas as pd
 import numpy as np
 import requests
@@ -12,7 +10,7 @@ import streamlit as st
 from datetime import datetime, timedelta
 
 # -----------------------------------------------------------------------------
-# 1. 安全金鑰載入機制
+# 1. 系統設定與金鑰載入
 # -----------------------------------------------------------------------------
 def get_secret(key_name, default=""):
     try:
@@ -33,24 +31,18 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 2. 全局深色主題與 UI 樣式
+# 2. 全局深色主題 (移除了干擾輸入框的錯誤 CSS，解決白底白字問題)
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
     html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"], [data-testid="stToolbar"] {
         background-color: #0E1015 !important;
         color: #FFFFFF !important;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
     }
     header[data-testid="stHeader"] { background-color: #0E1015 !important; }
     section[data-testid="stSidebar"] { background-color: #12151E !important; border-right: 1px solid #232836 !important; }
-    section[data-testid="stSidebar"] * { color: #FFFFFF !important; }
     .block-container { padding-top: 1.0rem !important; padding-bottom: 2rem !important; max-width: 98% !important; }
-    label, p, span, .stMarkdown, .stRadio, .stSelectbox { color: #FFFFFF !important; font-weight: 500 !important; }
-    div[data-baseweb="select"] > div, input, textarea { background-color: #1A1E29 !important; border: 1px solid #2C3245 !important; color: #FFFFFF !important; border-radius: 8px !important; }
-    .fin-top-card { background-color: #161A24 !important; border: 1px solid #232836 !important; border-radius: 12px !important; padding: 12px 14px !important; margin-bottom: 12px !important; min-height: 95px !important; }
-    .fin-top-title { font-size: 0.88rem !important; color: #00E676 !important; margin-bottom: 6px !important; font-weight: bold !important; }
-    .fin-top-val { font-size: 1.15rem !important; font-weight: bold !important; white-space: nowrap !important; }
+    
     div[data-testid="stDataFrame"] { background-color: #161A24 !important; border: 1px solid #2C3245 !important; border-radius: 10px !important; padding: 4px !important; }
     table, th, td, tr { background-color: #161A24 !important; color: #FFFFFF !important; }
     thead tr th { background-color: #1E2330 !important; color: #00E676 !important; font-weight: bold !important; }
@@ -59,14 +51,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 3. 官方證交所即時指數抓取（徹底拋棄 yfinance 避免 429 與假數據）
+# 3. 官方證交所即時指數 (強制繞過快取毒化，只用官方接口)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=30)
-def fetch_realtime_market_indices():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+def fetch_realtime_market_indices_v2():
+    headers = {"User-Agent": "Mozilla/5.0"}
     data = {}
     try:
-        # 使用證交所最穩定的 MIS 即時接口 (t00=大盤, o00=櫃買, 2330=台積)
         url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw|otc_o00.tw|tse_2330.tw"
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
@@ -93,7 +84,7 @@ def fetch_realtime_market_indices():
     return data
 
 # -----------------------------------------------------------------------------
-# 4. 全市場自動選股引擎 (真實運算，無假資料)
+# 4. 全市場自動選股引擎
 # -----------------------------------------------------------------------------
 def run_market_screener(stock_dict, strategy_type):
     url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -110,26 +101,22 @@ def run_market_screener(stock_dict, strategy_type):
                     vol = float(str(item.get('TradeVolume', 0)).replace(',', '')) if item.get('TradeVolume') else 0
                     vol_lots = int(vol / 1000)
                     
-                    if vol_lots < 500: continue # 過濾無量僵屍股
-                    
+                    if vol_lots < 500: continue
                     sname = stock_dict.get(sid, sid)
                     
-                    if strategy_type == "短線強勢爆發":
-                        if close_p > open_p and vol_lots > 2000:
-                            selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '今日開盤': open_p, '成交量(張)': vol_lots})
-                    elif strategy_type == "波段多頭排列":
-                        if close_p > open_p:
-                            selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '今日開盤': open_p, '成交量(張)': vol_lots})
+                    if strategy_type == "短線強勢爆發" and close_p > open_p and vol_lots > 2000:
+                        selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '今日開盤': open_p, '成交量(張)': vol_lots})
+                    elif strategy_type == "波段多頭排列" and close_p > open_p:
+                        selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '今日開盤': open_p, '成交量(張)': vol_lots})
             
             if selected_list:
-                df = pd.DataFrame(selected_list).sort_values(by='成交量(張)', ascending=False).head(50)
-                return df
+                return pd.DataFrame(selected_list).sort_values(by='成交量(張)', ascending=False).head(30)
     except Exception:
         pass
     return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# 5. 個股歷史資料抓取
+# 5. 個股資料抓取與指標計算
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=43200)
 def get_all_taiwan_stock_info(api_token=""):
@@ -140,31 +127,16 @@ def get_all_taiwan_stock_info(api_token=""):
                 res = json.load(f)
                 if len(res) > 0: return res
         except Exception: pass
-    return {"2330": "台積電", "2356": "英業達", "2317": "鴻海", "2454": "聯發科", "3231": "緯創"}
+    return {"2330": "台積電", "2356": "英業達", "2317": "鴻海", "2454": "聯發科"}
 
 @st.cache_data(ttl=43200)
 def fetch_stock_history_cached(stock_id, start_date, end_date, api_token=""):
     try:
         from FinMind.data import DataLoader
         fm = DataLoader()
-        if api_token and api_token.strip():
-            try: fm.login_by_token(api_token.strip())
-            except Exception: pass
+        if api_token: fm.login_by_token(api_token.strip())
         df = fm.taiwan_stock_daily(stock_id=stock_id, start_date=start_date, end_date=end_date)
         if not df.empty and len(df) > 5: return df
-    except Exception: pass
-
-    try:
-        import yfinance as yf
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0"})
-        ticker = yf.Ticker(f"{stock_id}.TW", session=session)
-        df_yf = ticker.history(start=start_date, end=end_date)
-        if not df_yf.empty:
-            df_yf = df_yf.reset_index()
-            df_yf.rename(columns={'Date': 'date', 'Open': 'open', 'High': 'max', 'Low': 'min', 'Close': 'close', 'Volume': 'Trading_Volume'}, inplace=True)
-            df_yf['date'] = df_yf['date'].dt.strftime('%Y-%m-%d')
-            return df_yf
     except Exception: pass
     return pd.DataFrame()
 
@@ -173,9 +145,7 @@ def fetch_chip_history_cached(stock_id, start_date, end_date, api_token=""):
     try:
         from FinMind.data import DataLoader
         fm = DataLoader()
-        if api_token and api_token.strip():
-            try: fm.login_by_token(api_token.strip())
-            except Exception: pass
+        if api_token: fm.login_by_token(api_token.strip())
         df = fm.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date, end_date=end_date)
         if not df.empty: return df
     except Exception: pass
@@ -186,9 +156,7 @@ def fetch_margin_history_cached(stock_id, start_date, end_date, api_token=""):
     try:
         from FinMind.data import DataLoader
         fm = DataLoader()
-        if api_token and api_token.strip():
-            try: fm.login_by_token(api_token.strip())
-            except Exception: pass
+        if api_token: fm.login_by_token(api_token.strip())
         df = fm.taiwan_stock_margin_purchase_short_sale(stock_id=stock_id, start_date=start_date, end_date=end_date)
         if not df.empty: return df
     except Exception: pass
@@ -197,14 +165,13 @@ def fetch_margin_history_cached(stock_id, start_date, end_date, api_token=""):
 @st.cache_data(ttl=86400)
 def get_norway_big_shareholders(stock_id):
     url = f"https://norway.twsthr.info/StockHolders.aspx?stock={stock_id}"
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         if resp.status_code == 200:
             tables = pd.read_html(io.StringIO(resp.text))
             for tb in tables:
                 tb_str = str(tb.columns) + str(tb.values[:2])
-                if '資料日期' in tb_str or '集保總張數' in tb_str or '1000張' in tb_str:
+                if '集保總張數' in tb_str or '1000張' in tb_str:
                     if isinstance(tb.columns, pd.MultiIndex):
                         tb.columns = ['_'.join([str(c) for c in col if 'Unnamed' not in str(c)]).strip() for col in tb.columns.values]
                     else:
@@ -214,7 +181,7 @@ def get_norway_big_shareholders(stock_id):
                     date_col = [c for c in cols if '日期' in c or 'Date' in c]
                     people_col = [c for c in cols if '人數' in c or '總人數' in c]
                     big_col = [c for c in cols if ('1000' in c or '千張' in c or '大股東' in c) and ('%' in c or '比例' in c or '率' in c)]
-                    if not big_col: big_col = [c for c in cols if '1000' in c or '千張' in c or '大股東' in c]
+                    if not big_col: big_col = [c for c in cols if '1000' in c or '大股東' in c]
                     if date_col and people_col and big_col:
                         tb['Date'] = tb[date_col[0]].astype(str).str.replace('-', '').str.replace('/', '').str.extract(r'(\d{8})')[0]
                         tb['Total_People'] = pd.to_numeric(tb[people_col[0]].astype(str).str.replace(',', ''), errors='coerce')
@@ -229,15 +196,10 @@ def get_norway_big_shareholders(stock_id):
 
 def calculate_indicators(df_price):
     df = df_price.copy()
-    col_map = {}
-    for c in df.columns:
-        c_lower = c.lower()
-        if c_lower in ['open', 'open_price']: col_map[c] = 'Open'
-        elif c_lower in ['high', 'max', 'high_price']: col_map[c] = 'High'
-        elif c_lower in ['low', 'min', 'low_price']: col_map[c] = 'Low'
-        elif c_lower in ['close', 'close_price']: col_map[c] = 'Close'
-        elif c_lower in ['date', 'time']: col_map[c] = 'Date'
-        elif c_lower in ['trading_volume', 'volume']: col_map[c] = 'Trading_Volume'
+    col_map = {c: c.capitalize() if c.lower() in ['open', 'high', 'low', 'close', 'date'] else c for c in df.columns}
+    if 'max' in df.columns: col_map['max'] = 'High'
+    if 'min' in df.columns: col_map['min'] = 'Low'
+    if 'Trading_Volume' in df.columns: col_map['Trading_Volume'] = 'Trading_Volume'
     df.rename(columns=col_map, inplace=True)
     
     df['Volume_張'] = (df['Trading_Volume'] / 1000).round(0) if 'Trading_Volume' in df.columns else 0
@@ -252,22 +214,18 @@ def calculate_indicators(df_price):
     return df
 
 # -----------------------------------------------------------------------------
-# 6. Plotly 圖表繪製
+# 6. Plotly 圖表 (三大法人買賣超修正版)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450, title=""):
     fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#161A24",
-        plot_bgcolor="#161A24",
-        height=height,
-        margin=dict(l=25, r=25, t=45, b=25),
-        hovermode="x unified",
+        template="plotly_dark", paper_bgcolor="#161A24", plot_bgcolor="#161A24", height=height,
+        margin=dict(l=25, r=25, t=45, b=25), hovermode="x unified",
         font=dict(color="#FFFFFF", size=12),
         title=dict(text=title, font=dict(color="#00E676", size=15)),
         legend=dict(bgcolor="rgba(22, 26, 36, 0.9)", bordercolor="#2C3245", borderwidth=1)
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF"), title_font=dict(color="#FFFFFF"), nticks=15, tickangle=-45)
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF"), title_font=dict(color="#FFFFFF"))
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF"), type='category')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF"))
     return fig
 
 def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
@@ -279,7 +237,6 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['5MA'], name="5MA", line=dict(color="#FFD600", width=1.5)), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['10MA'], name="10MA", line=dict(color="#00E676", width=1.5)), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA(月線)", line=dict(color="#AA00FF", width=2.0)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['60MA'], name="60MA(季線)", line=dict(color="#2962FF", width=2.0)), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#FF9100", width=1.5, dash="dot")), secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#FF9100", width=1.5, dash="dot")), secondary_y=False)
     
@@ -289,7 +246,7 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     max_vol = df_price['Volume_張'].max() if not df_price.empty else 10000
     fig.update_yaxes(title_text="價格 (元)", secondary_y=False)
     fig.update_yaxes(title_text="成交量 (張)", range=[0, max_vol * 3.5], secondary_y=True, showgrid=False)
-    fig.update_xaxes(type='category', rangeslider_visible=False)
+    fig.update_xaxes(rangeslider_visible=False)
     return apply_dark_theme(fig, height=500, title=f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
 
 def plot_chip_chart(chip_df, display_start_date):
@@ -298,16 +255,20 @@ def plot_chip_chart(chip_df, display_start_date):
         d_col = 'date' if 'date' in chip_df.columns else chip_df.columns[0]
         chip_sub = chip_df[chip_df[d_col] >= display_start_date].copy()
         
-        if 'name' in chip_sub.columns:
-            val_col = 'buy_sell' if 'buy_sell' in chip_sub.columns else ('buy' if 'buy' in chip_sub.columns else chip_sub.columns[-1])
-            categories = [('Foreign', '外資', '#2962FF'), ('Trust', '投信', '#FF9100'), ('Dealer', '自營商', '#E040FB')]
-            for key, name_zh, color in categories:
-                sub = chip_sub[chip_sub['name'].astype(str).str.contains(key, case=False, na=False)].groupby(d_col)[val_col].sum() / 1000
-                if not sub.empty:
-                    fig.add_trace(go.Bar(x=sub.index, y=sub.round(0), name=f"{name_zh}(張)", marker_color=color))
-    fig.update_xaxes(type='category')
+        # 修正：精準計算淨買賣超 (buy - sell)
+        if 'buy' in chip_sub.columns and 'sell' in chip_sub.columns:
+            chip_sub['net'] = chip_sub['buy'] - chip_sub['sell']
+        else:
+            chip_sub['net'] = chip_sub.get('buy_sell', chip_sub.iloc[:, -1])
+            
+        categories = [('Foreign', '外資', '#2962FF'), ('Trust', '投信', '#FF9100'), ('Dealer', '自營商', '#E040FB')]
+        for key, name_zh, color in categories:
+            sub = chip_sub[chip_sub['name'].astype(str).str.contains(key, case=False, na=False)].groupby(d_col)['net'].sum() / 1000
+            if not sub.empty:
+                vals = sub.round(0)
+                fig.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=np.where(vals >= 0, '#FF5252', '#00E676')))
     fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360, title="🏛️ 三大法人每日買賣超 (張 - 外資藍 / 投信橘 / 自營商紫)")
+    return apply_dark_theme(fig, height=360, title="🏛️ 三大法人每日買賣超 (張 - 紅買綠賣)")
 
 def plot_margin_chart(margin_df, display_start_date):
     fig = go.Figure()
@@ -318,9 +279,8 @@ def plot_margin_chart(margin_df, display_start_date):
         m_sell = [c for c in margin_sub.columns if 'MarginPurchaseSell' in c]
         
         if m_buy and m_sell:
-            diff_margin = (margin_sub[m_buy[0]] - margin_sub[m_sell[0]]) / 1000
-            fig.add_trace(go.Bar(x=margin_sub[d_col], y=diff_margin.round(0), name="融資增減(張)", marker_color=np.where(diff_margin >= 0, '#FF5252', '#00E676')))
-    fig.update_xaxes(type='category')
+            diff = (margin_sub[m_buy[0]] - margin_sub[m_sell[0]]) / 1000
+            fig.add_trace(go.Bar(x=margin_sub[d_col], y=diff.round(0), name="融資增減(張)", marker_color=np.where(diff >= 0, '#FF5252', '#00E676')))
     fig.update_layout(barmode='group')
     return apply_dark_theme(fig, height=360, title="💳 融資餘額每日增減變化 (張 - 紅增綠減)")
 
@@ -329,38 +289,66 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     if not norway_df.empty:
         fig.add_trace(go.Bar(x=norway_df['Date'], y=norway_df['Total_People'], name="總股東人數(人)", marker_color='#546E7A', opacity=0.8), secondary_y=False)
         fig.add_trace(go.Scatter(x=norway_df['Date'], y=norway_df['Big_Ratio'], name="大股東持股率(%)", mode="lines+markers", line=dict(color="#FF9100", width=2.5), marker=dict(size=5, color="#FFFFFF")), secondary_y=True)
-        fig.update_xaxes(type='category')
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 7. 採用最新 google.genai API，並防呆 400 API Key Invalid 錯誤
+# 7. 採用原生 REST API 呼叫 Gemini (100% 解決無法 import 的死穴)
 # -----------------------------------------------------------------------------
-def call_llm(gemini_key, prompt):
-    clean_key = str(gemini_key).strip().strip("'").strip('"')
+def call_gemini_rest_api(api_key, prompt):
+    clean_key = str(api_key).strip().strip("'").strip('"')
     if not clean_key:
         return "⚠️ 尚未設定 Google Gemini API Key，請於左側設定欄位輸入。"
     
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={clean_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，必須全程使用繁體中文回答。"}]}
+    }
     try:
-        # 完全替換為最新的官方套件，解決 deprecation 警告
-        from google import genai
-        client = genai.Client(api_key=clean_key)
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config={"system_instruction": "你是一位專業的台灣股市分析師，必須全程使用繁體中文回答。"}
-        )
-        if response and response.text:
-            return response.text
+        resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()['candidates'][0]['content']['parts'][0]['text']
+        elif resp.status_code == 400:
+            return "⚠️ API 金鑰無效 (400)。請檢查您的 API Key 是否正確且已啟用權限。"
+        else:
+            return f"⚠️ 呼叫失敗 ({resp.status_code}): {resp.text}"
     except Exception as e:
-        err_msg = str(e)
-        if "400" in err_msg or "API_KEY_INVALID" in err_msg or "not valid" in err_msg:
-            return f"⚠️ **您的 Gemini API Key 驗證失敗 (400 API_KEY_INVALID)**。請確認您輸入的金鑰正確無誤、無多餘空白，且該專案已啟用 API 權限。"
-        return f"⚠️ AI 呼叫失敗：{err_msg}"
-    
-    return "⚠️ 無法取得 AI 診斷回應。"
+        return f"⚠️ 連線異常: {e}"
 
 # -----------------------------------------------------------------------------
-# 8. Streamlit 主程式
+# 8. 共用診斷渲染引擎
+# -----------------------------------------------------------------------------
+def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, gemini_key):
+    with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
+        s_str = start_date.strftime("%Y-%m-%d")
+        e_str = end_date.strftime("%Y-%m-%d")
+        b_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
+        
+        price_df = fetch_stock_history_cached(stock_id, b_str, e_str, token)
+        chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
+        margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
+        norway_df = get_norway_big_shareholders(stock_id)
+
+    if not price_df.empty:
+        df_calc = calculate_indicators(price_df)
+        
+        st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_str))
+        st.plotly_chart(plot_chip_chart(chip_df, s_str))
+        st.plotly_chart(plot_margin_chart(margin_df, s_str))
+        st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name))
+
+        st.markdown("---")
+        st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
+        with st.spinner("AI 專家團隊正在連線 Gemini 分析中..."):
+            latest = df_calc.iloc[-1]
+            prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，請給出繁體中文的技術面、籌碼面與操作建議。"
+            ai_result = call_gemini_rest_api(gemini_key, prompt)
+            st.markdown(f"<div class='agent-card'>{ai_result}</div>", unsafe_allow_html=True)
+    else:
+        st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
+
+# -----------------------------------------------------------------------------
+# 9. Streamlit 主程式介面
 # -----------------------------------------------------------------------------
 default_gemini_key = get_secret("GEMINI_API_KEY", "")
 default_finmind_token = get_secret("FINMIND_TOKEN", "")
@@ -390,38 +378,53 @@ with st.sidebar:
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 active_gemini_key = st.session_state.get("gemini_key") or default_gemini_key
 
-# 頂部四塊指數看板
-market_data = fetch_realtime_market_indices()
+# 頂部四塊指數看板 (強制 Inline CSS 確保手機版中文正確顯示)
+market_data = fetch_realtime_market_indices_v2()
 m1, m2, m3, m4 = st.columns(4)
 
-def render_card(col, key):
-    d = market_data.get(key)
+def render_inline_card(col, name, d):
     if d:
         c = "#FF5252" if d["up"] else "#00E676"
-        col.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>{d['name']}</div><div class='fin-top-val' style='color:{c};'>{d['val']:,.2f} <span style='font-size:0.8rem;'>{d['change']}</span></div></div>", unsafe_allow_html=True)
+        html = f"""<div style="background-color: #161A24; border: 1px solid #232836; border-radius: 12px; padding: 15px; margin-bottom: 12px; min-height: 95px;">
+            <div style="color: #E0E6ED; font-size: 14px; font-weight: bold; margin-bottom: 8px;">{d['name']}</div>
+            <div style="color: {c}; font-size: 24px; font-weight: bold;">{d['val']:,.2f} <span style="font-size: 14px;">{d['change']}</span></div>
+        </div>"""
+        col.markdown(html, unsafe_allow_html=True)
     else:
-        col.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>即時行情連線中...</div><div class='fin-top-val' style='color:#9E9E9E;'>--</div></div>", unsafe_allow_html=True)
+        html = f"""<div style="background-color: #161A24; border: 1px solid #232836; border-radius: 12px; padding: 15px; margin-bottom: 12px; min-height: 95px;">
+            <div style="color: #E0E6ED; font-size: 14px; font-weight: bold; margin-bottom: 8px;">{name}</div>
+            <div style="color: #9E9E9E; font-size: 20px; font-weight: bold;">--</div>
+        </div>"""
+        col.markdown(html, unsafe_allow_html=True)
 
-render_card(m1, "taiex")
-render_card(m2, "tpex")
-render_card(m3, "futures")
-render_card(m4, "tsmc")
-
+render_inline_card(m1, "加權指數 (TAIEX)", market_data.get("taiex"))
+render_inline_card(m2, "櫃買指數 (TPEX)", market_data.get("tpex"))
+render_inline_card(m3, "台指期近月 (TX)", market_data.get("futures"))
+render_inline_card(m4, "台積電 (2330)", market_data.get("tsmc"))
 st.markdown("---")
 
+# 主頁面模式邏輯
 if app_mode == "全市場自動選股版":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
     strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)
-    # 移除 use_container_width=True 避免終端機跳警告
+    
     if st.button("🚀 開始連線證交所全市場掃描"):
         with st.spinner("正從證交所開放 API 撈取今日全市場資料進行運算..."):
-            df_res = run_market_screener(STOCK_DICT, strategy_choice)
-            if not df_res.empty:
-                st.success(f"🎉 掃描完成！共挑選出 {len(df_res)} 檔達標個股。")
-                # 移除 use_container_width=True 避免警告
-                st.dataframe(df_res)
-            else:
-                st.warning("⚠️ 目前無符合條件的個股，或盤後資料尚未更新。")
+            st.session_state["screener_res"] = run_market_screener(STOCK_DICT, strategy_choice)
+
+    df_res = st.session_state.get("screener_res", pd.DataFrame())
+    if not df_res.empty:
+        st.success(f"🎉 掃描完成！共挑選出 {len(df_res)} 檔達標個股。")
+        st.dataframe(df_res)
+        
+        st.markdown("### 🎯 深度診斷")
+        options = [f"{row['股票代碼']} {row['股票名稱']}" for idx, row in df_res.iterrows()]
+        sel = st.selectbox("📌 請從上方掃描結果中選擇一檔標的：", options)
+        if st.button("🚀 啟動此檔個股深度分析"):
+            sid = sel.split(" ")[0]
+            sname = sel.split(" ")[1]
+            render_diagnosis_section(sid, sname, start_date, end_date, st.session_state["finmind_token"], active_gemini_key)
+            
 else:
     filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
     default_idx = next((i for i, opt in enumerate(filtered_options) if opt.startswith(st.session_state["selected_stock_code"])), 0)
@@ -430,34 +433,5 @@ else:
     stock_id = selected_stock_raw.split(" ")[0]
     stock_name = STOCK_DICT.get(stock_id, "")
 
-    # 移除 use_container_width=True 避免終端機跳警告
     if st.button("🚀 啟動個股技術、籌碼與 AI 深度診斷"):
-        with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
-            s_str = start_date.strftime("%Y-%m-%d")
-            e_str = end_date.strftime("%Y-%m-%d")
-            b_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
-            
-            token = st.session_state["finmind_token"]
-            price_df = fetch_stock_history_cached(stock_id, b_str, e_str, token)
-            chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
-            margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
-            norway_df = get_norway_big_shareholders(stock_id)
-
-        if not price_df.empty:
-            df_calc = calculate_indicators(price_df)
-            
-            # 使用 st.plotly_chart 不會受 deprecation 影響
-            st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_str), use_container_width=True)
-            st.plotly_chart(plot_chip_chart(chip_df, s_str), use_container_width=True)
-            st.plotly_chart(plot_margin_chart(margin_df, s_str), use_container_width=True)
-            st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name), use_container_width=True)
-
-            st.markdown("---")
-            st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
-            with st.spinner("AI 專家團隊正在連線 Gemini 分析中..."):
-                latest = df_calc.iloc[-1]
-                prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，請給出繁體中文的技術面、籌碼面與操作建議。"
-                ai_result = call_llm(active_gemini_key, prompt)
-                st.markdown(f"<div class='agent-card'>{ai_result}</div>", unsafe_allow_html=True)
-        else:
-            st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
+        render_diagnosis_section(stock_id, stock_name, start_date, end_date, st.session_state["finmind_token"], active_gemini_key)

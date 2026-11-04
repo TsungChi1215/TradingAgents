@@ -49,11 +49,11 @@ st.set_page_config(
     page_title="TradingAgents - 專業金融量化終端",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"  # 改為 auto，讓行動版自動調整側邊欄
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS (優化手機與電腦介面)
+# 全局 100% 覆蓋式深色 CSS (針對手機與電腦版優化)
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>

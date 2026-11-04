@@ -1,6 +1,6 @@
-streamlit>=1.40.0
-pandas>=2.2.0
-numpy>=1.26.0
+streamlit>=1.38.0
+pandas>=2.0.0
+numpy>=1.24.0
 requests
 plotly
 yfinance
@@ -8,5 +8,3 @@ FinMind
 python-dotenv
 beautifulsoup4
 lxml
-anyio>=4.4.0
-starlette>=0.38.0

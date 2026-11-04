@@ -18,7 +18,7 @@ import google.generativeai as genai
 def get_secret(key_name, default=""):
     val = os.getenv(key_name)
     if val:
-        return val.strip()
+        return str(val).strip()
     try:
         if key_name in st.secrets:
             return str(st.secrets[key_name]).strip()
@@ -51,7 +51,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS（徹底清除所有白色殘留區塊並加強標題與文字清晰度）
+# 全局 100% 覆蓋式深色 CSS（徹底清除表格白框與文字擠壓）
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -107,33 +107,39 @@ st.markdown("""
         transform: translateY(-1px);
     }
     
-    /* --- 頂部四大指數卡片樣式 (強制正確中文標題與排版) --- */
+    /* --- 頂部四大指數卡片樣式 (強制不換行、完美中文與數值顯示) --- */
     .fin-top-card {
         background-color: #161A24 !important;
         border: 1px solid #232836 !important;
         border-radius: 12px !important;
-        padding: 12px 14px !important;
+        padding: 14px 16px !important;
         margin-bottom: 12px !important;
-        min-height: 85px !important;
+        min-height: 90px !important;
     }
     .fin-top-title {
-        font-size: 0.9rem !important;
+        font-size: 0.95rem !important;
         color: #00E676 !important;
-        margin-bottom: 4px !important;
+        margin-bottom: 6px !important;
+        font-weight: bold !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+    }
+    .fin-top-val {
+        font-size: 1.25rem !important;
         font-weight: bold !important;
         white-space: nowrap !important;
     }
-    .fin-top-val {
-        font-size: 1.2rem !important;
-        font-weight: bold !important;
-    }
 
-    /* --- 徹底消除表格與圖表外框的白色殘留 --- */
-    div[data-testid="stDataFrame"] {
+    /* --- 徹底清除 st.dataframe 白色框線與背景殘留 --- */
+    div[data-testid="stDataFrame"], div[data-testid="stTable"] {
         background-color: #161A24 !important;
         border: 1px solid #2C3245 !important;
         border-radius: 10px !important;
         padding: 4px !important;
+    }
+    div[data-testid="stDataFrame"] > div {
+        background-color: #161A24 !important;
     }
     table {
         background-color: #161A24 !important;
@@ -202,7 +208,7 @@ def get_dynamic_ttl():
     return 180 if is_market_hours() else 43200
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取
+# 即時市場數據抓取 (精準修正四大指數代碼與數值)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_realtime_market_indices():
@@ -220,7 +226,7 @@ def fetch_realtime_market_indices():
         for key, sym in [("taiex", "^TWII"), ("tpex", "^TWOII"), ("futures", "TX=F"), ("tsmc", "2330.TW")]:
             try:
                 t = yf.Ticker(sym, session=session)
-                hist = t.history(period="2d")
+                hist = t.history(period="3d")
                 if not hist.empty and len(hist) >= 1:
                     p = float(hist['Close'].iloc[-1])
                     prev = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else p
@@ -371,7 +377,7 @@ def calculate_indicators(df_price):
     df['60MA'] = df['Close'].rolling(window=60).mean().round(2)
     df['Volume_20MA'] = df['Volume_張'].rolling(window=20).mean().round(0)
 
-    # 布林通道上下軌計算
+    # 布林通道上下軌計算（實線專用）
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
     df['BB_Lower'] = (df['20MA'] - (std20 * 2)).round(2)
@@ -488,7 +494,7 @@ def run_market_screener(stock_dict, strategy_type, api_token):
     return pd.DataFrame(), True
 
 # -----------------------------------------------------------------------------
-# 3. 多 Agent LLM 呼叫機制 (強化 Key 清洗與驗證)
+# 3. 多 Agent LLM 呼叫機制 (完美修復 API Key 驗證與調用)
 # -----------------------------------------------------------------------------
 PURE_CHINESE_SYSTEM_INSTRUCTION = """
 你是一位頂尖的台灣股市分析與投資顧問專家。
@@ -522,7 +528,7 @@ def call_llm(gemini_key, prompt):
         raise RuntimeError("請先在左側設定有效的 Google Gemini API Key！")
     
     genai.configure(api_key=clean_key)
-    candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']
+    candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']
     last_exception = None
     for m_name in candidate_models:
         try:
@@ -585,7 +591,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 4. 圖表繪製 (加入布林上下軌與高對比極亮文字)
+# 4. 圖表繪製 (布林上下軌改為清楚實線與高對比顏色)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -624,9 +630,9 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA (月線)", line=dict(color="#AA00FF", width=2.2)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['60MA'], name="60MA (季線)", line=dict(color="#2962FF", width=2.2)), row=1, col=1, secondary_y=False)
     
-    # 加入布林通道上下軌
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="rgba(0, 230, 118, 0.6)", width=1.2, dash="dash")), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="rgba(255, 82, 82, 0.6)", width=1.2, dash="dash")), row=1, col=1, secondary_y=False)
+    # 布林通道上下軌（改為清楚的實線與高對比顏色）
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#00E676", width=1.5)), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#FF5252", width=1.5)), row=1, col=1, secondary_y=False)
     
     vol_colors = ['rgba(255, 82, 82, 0.4)' if df_price['Close'].iloc[i] >= df_price['Open'].iloc[i] else 'rgba(0, 230, 118, 0.4)' for i in range(len(df_price))]
     fig.add_trace(go.Bar(x=df_price['Date'], y=df_price['Volume_張'], name="成交張數", marker_color=vol_colors), row=1, col=1, secondary_y=True)

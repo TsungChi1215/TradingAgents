@@ -49,11 +49,11 @@ st.set_page_config(
     page_title="TradingAgents - 專業金融量化終端",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="auto"  # 改為 auto，讓行動版自動調整側邊欄
+    initial_sidebar_state="auto"
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS (針對手機與電腦版優化)
+# 全局 100% 覆蓋式深色 CSS
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -563,9 +563,9 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     請全程 100% 使用繁體中文輸出，並嚴格依照以下標題格式回傳：
     【技術面分析】：(針對 K 線、均線與 KD/MACD 動能進行 200 字內解析)
     【籌碼面分析】：(針對三大法人與大股東集保進行 200 字內解析)
-    【看多觀點】：(提出強烈看漲理由與潛在突破利多，200 字內)
-    【看空觀點】：(嚴厲質疑、反駁並指出潛在風險陷阱，200 字內)
-    【風控建議】：(包含進場區間、停利價、停損價與資金配置，200 字內)
+    【看多觀點】：(提出強烈看漲理由與潛在突破利多, 200 字內)
+    【看空觀點】：(嚴厲質疑、反駁並指出潛在風險陷阱, 200 字內)
+    【風控建議】：(包含進場區間、停利價、停損價與資金配置, 200 字內)
     【PM最終決策】：【PM 最終決策】：買進 (或觀望/賣出) \n 【核心理由總結】：(300 字以內統整主因)
     """
 
@@ -715,7 +715,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=340)
 
 # -----------------------------------------------------------------------------
-# Streamlit 主 UI
+# Streamlit 主 UI (支援執行模式切換)
 # -----------------------------------------------------------------------------
 default_gemini_keys = os.getenv("GEMINI_API_KEY", "")
 default_finmind_token = os.getenv("FINMIND_TOKEN", "")
@@ -755,126 +755,176 @@ STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 
 st.markdown("<div style='font-size:0.9rem; font-weight:bold; color:#8F9BB3; margin-bottom:6px;'>📈 市場重點指標與 Multi-Agent 系統狀態</div>", unsafe_allow_html=True)
 
-market_open = is_market_hours()
-fragment_decorator = st.fragment(run_every="5s") if market_open else (lambda f: f)
+# 採用穩定標準的 Banner 渲染
+top_banner_data = fetch_top_banner_realtime_yfinance()
+m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+with m_col1:
+    st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>加權指數 (TAIEX)</div><div class='fin-top-val'>{top_banner_data['taiex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['taiex']['color']};'>{top_banner_data['taiex']['change']}</span></div><div class='fin-top-desc'>台灣大盤市場最新點數與漲跌幅</div></div>", unsafe_allow_html=True)
+with m_col2:
+    st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>櫃買指數 (TPEX)</div><div class='fin-top-val'>{top_banner_data['tpex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tpex']['color']};'>{top_banner_data['tpex']['change']}</span></div><div class='fin-top-desc'>櫃買中心店頭市場指數與表現</div></div>", unsafe_allow_html=True)
+with m_col3:
+    st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>台指近月期貨 (TXF)</div><div class='fin-top-val'>{top_banner_data['tx']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tx']['color']};'>{top_banner_data['tx']['change']}</span></div><div class='fin-top-desc'>台股期貨近月合約成交價</div></div>", unsafe_allow_html=True)
+with m_col4:
+    st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>權值龍頭：台積電 (2330)</div><div class='fin-top-val'>{top_banner_data['tsmc']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tsmc']['color']};'>{top_banner_data['tsmc']['change']}</span></div><div class='fin-top-desc'>市值最高權值股報價</div></div>", unsafe_allow_html=True)
 
-@fragment_decorator
-def render_top_banner():
-    top_banner_data = fetch_top_banner_realtime_yfinance()
+# -----------------------------------------------------------------------------
+# 依據側邊欄選擇的模式進行分流執行
+# -----------------------------------------------------------------------------
+if "單股診斷版" in app_mode:
+    filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
+    default_idx = 0
+    for idx, opt in enumerate(filtered_options):
+        if opt.startswith(st.session_state["selected_stock_code"]):
+            default_idx = idx
+            break
 
-    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    with m_col1:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>加權指數 (TAIEX)</div><div class='fin-top-val'>{top_banner_data['taiex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['taiex']['color']};'>{top_banner_data['taiex']['change']}</span></div><div class='fin-top-desc'>台灣大盤市場最新點數與漲跌幅</div></div>", unsafe_allow_html=True)
-    with m_col2:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>櫃買指數 (TPEX)</div><div class='fin-top-val'>{top_banner_data['tpex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tpex']['color']};'>{top_banner_data['tpex']['change']}</span></div><div class='fin-top-desc'>櫃買中心店頭市場指數與表現</div></div>", unsafe_allow_html=True)
-    with m_col3:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>台指近月期貨 (TXF)</div><div class='fin-top-val'>{top_banner_data['tx']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tx']['color']};'>{top_banner_data['tx']['change']}</span></div><div class='fin-top-desc'>台股期貨近月合約成交價</div></div>", unsafe_allow_html=True)
-    with m_col4:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>權值龍頭：台積電 (2330)</div><div class='fin-top-val'>{top_banner_data['tsmc']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tsmc']['color']};'>{top_banner_data['tsmc']['change']}</span></div><div class='fin-top-desc'>市值最高權值股報價</div></div>", unsafe_allow_html=True)
+    st.markdown("### 📊 指定個股深度診斷與多 Agent 辯論")
+    col_m1, col_m2 = st.columns([3, 1])
+    with col_m1:
+        selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options if filtered_options else ["無股票資料"], index=default_idx if filtered_options else 0)
+        stock_id = selected_stock_raw.split(" ")[0] if filtered_options else ""
+        stock_name = STOCK_DICT.get(stock_id, "") if stock_id else ""
+    with col_m2:
+        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+        run_agent_button = st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True)
 
-render_top_banner()
+    if run_agent_button:
+        current_time = time.time()
+        elapsed_time = current_time - st.session_state["last_ai_call_time"]
+        if elapsed_time < 15:
+            remaining = int(15 - elapsed_time)
+            st.warning(f"⏳ **系統冷卻中**：為避免觸發 Google API 頻率限制（429），請等待 {remaining} 秒後再發送 AI 請求。")
+        else:
+            st.session_state["last_ai_call_time"] = current_time
 
-filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
-default_idx = 0
-for idx, opt in enumerate(filtered_options):
-    if opt.startswith(st.session_state["selected_stock_code"]):
-        default_idx = idx
-        break
+            if not stock_id:
+                st.error("❌ 請先設定有效的 FinMind Token 或選取股票！")
+            else:
+                s_date_str = start_date.strftime("%Y-%m-%d")
+                e_date_str = end_date.strftime("%Y-%m-%d")
+                buffer_start_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
+                
+                with st.spinner(f"正在抓取 {stock_id} {stock_name} 全套量化行情與防呆籌碼數據..."):
+                    token = st.session_state["finmind_token"]
+                    price_df = fetch_stock_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+                    chip_df = fetch_chip_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+                    margin_df = fetch_margin_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+                    norway_df = get_norway_big_shareholders(stock_id)
 
-st.markdown("### 📊 指定個股深度診斷與多 Agent 辯論")
-col_m1, col_m2 = st.columns([3, 1])
-with col_m1:
-    selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options if filtered_options else ["無股票資料"], index=default_idx if filtered_options else 0)
-    stock_id = selected_stock_raw.split(" ")[0] if filtered_options else ""
-    stock_name = STOCK_DICT.get(stock_id, "") if stock_id else ""
-with col_m2:
-    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-    run_agent_button = st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True)
+                if not price_df.empty:
+                    st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_date_str), use_container_width=True)
+                    st.plotly_chart(plot_macd_obv_chart(price_df, s_date_str), use_container_width=True)
+                    col1, col2 = st.columns(2)
+                    with col1: st.plotly_chart(plot_chip_chart(chip_df, s_date_str), use_container_width=True)
+                    with col2: st.plotly_chart(plot_margin_chart(margin_df, s_date_str), use_container_width=True)
+                    st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name), use_container_width=True)
+                    
+                    if st.session_state["gemini_keys"]:
+                        with st.spinner("🤝 多 Agent 團隊正在召開投資決策會議..."):
+                            try:
+                                agent_res = run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, st.session_state["gemini_keys"], custom_query)
+                                
+                                st.markdown("---")
+                                st.markdown("## 📊 分析結果")
 
-if run_agent_button:
-    current_time = time.time()
-    elapsed_time = current_time - st.session_state["last_ai_call_time"]
-    if elapsed_time < 15:
-        remaining = int(15 - elapsed_time)
-        st.warning(f"⏳ **系統冷卻中**：為避免觸發 Google API 頻率限制（429），請等待 {remaining} 秒後再發送 AI 請求。")
-    else:
-        st.session_state["last_ai_call_time"] = current_time
+                                st.markdown(f"""
+                                <div class="agent-card" style="border: 1px solid #00E676 !important;">
+                                    <div class="agent-card-header header-green">🏆 投資組合經理 (PM) 最終決策</div>
+                                    <div class="agent-card-body">{agent_res['pm_decision']}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
 
-        if not stock_id:
-            st.error("❌ 請先設定有效的 FinMind Token 或選取股票！")
+                                st.markdown(f"""
+                                <div class="agent-card">
+                                    <div class="agent-card-header header-yellow">⚡ 成交量與價格波動（技術面分析）</div>
+                                    <div class="agent-card-body">{agent_res['tech_report']}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                                st.markdown(f"""
+                                <div class="agent-card">
+                                    <div class="agent-card-header header-blue">🎯 籌碼與集中度（籌碼面分析）</div>
+                                    <div class="agent-card-body">{agent_res['chip_report']}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                                st.markdown(f"""
+                                <div class="agent-card">
+                                    <div class="agent-card-header header-green">📈 多方動能評價（看多觀點）</div>
+                                    <div class="agent-card-body">{agent_res['bull_opinion']}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                                st.markdown(f"""
+                                <div class="agent-card">
+                                    <div class="agent-card-header header-purple">🔮 空方風險反駁（看空觀點）</div>
+                                    <div class="agent-card-body">{agent_res['bear_opinion']}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                                st.markdown(f"""
+                                <div class="agent-card">
+                                    <div class="agent-card-header header-red">🛑 風險管理與部位配置</div>
+                                    <div class="agent-card-body">{agent_res['risk_report']}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+                    else:
+                        st.warning("⚠️ 請於左側邊欄或 Streamlit Secrets 填入有效的 GEMINI_API_KEY！")
+                else:
+                    st.error(f"❌ 無法取得 {stock_id} 的 K 線價格資料，請檢查網路連線。")
+else:
+    # 🚀 全功能自動選股與多 Agent 決策中心 (無預設標的，由使用者自由選取)
+    st.markdown("### 🚀 全功能自動選股與多 Agent 決策中心")
+    st.info("💡 **全功能版說明**：在此模式下，請透過下方多選框選擇欲掃描的標的清單。若無選取則無標的。")
+    
+    # 完全移除預設清單，由 STOCK_DICT 或空白清單提供選擇
+    options_list = list(STOCK_DICT.items()) if STOCK_DICT else []
+    selected_pool = st.multiselect("選擇自動掃描清單：", options=options_list, format_func=lambda x: f"{x[0]} {x[1]}")
+    
+    if st.button("🎯 開始全市場自動掃描與多 Agent 辯論", type="primary", use_container_width=True):
+        if not st.session_state["gemini_keys"]:
+            st.warning("⚠️ 請先在側邊欄填入有效的 GEMINI_API_KEY！")
+        elif not selected_pool:
+            st.warning("目前無標的，請確認已載入股票清單或選擇掃描標的。")
         else:
             s_date_str = start_date.strftime("%Y-%m-%d")
             e_date_str = end_date.strftime("%Y-%m-%d")
             buffer_start_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
-            
-            with st.spinner(f"正在抓取 {stock_id} {stock_name} 全套量化行情與防呆籌碼數據..."):
-                token = st.session_state["finmind_token"]
-                price_df = fetch_stock_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
-                chip_df = fetch_chip_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
-                margin_df = fetch_margin_history_cached(stock_id=stock_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
-                norway_df = get_norway_big_shareholders(stock_id)
+            token = st.session_state["finmind_token"]
 
-            if not price_df.empty:
-                st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_date_str), use_container_width=True)
-                st.plotly_chart(plot_macd_obv_chart(price_df, s_date_str), use_container_width=True)
-                col1, col2 = st.columns(2)
-                with col1: st.plotly_chart(plot_chip_chart(chip_df, s_date_str), use_container_width=True)
-                with col2: st.plotly_chart(plot_margin_chart(margin_df, s_date_str), use_container_width=True)
-                st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name), use_container_width=True)
+            for item in selected_pool:
+                s_id, s_name = item[0], item[1]
+
+                st.markdown(f"---")
+                st.markdown(f"### 🔍 多 Agent 正在掃描與評估：{s_name} ({s_id})")
                 
-                if st.session_state["gemini_keys"]:
-                    with st.spinner("🤝 多 Agent 團隊正在召開投資決策會議..."):
-                        try:
-                            agent_res = run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, st.session_state["gemini_keys"], custom_query)
-                            
-                            st.markdown("---")
-                            st.markdown("## 📊 分析結果")
+                with st.spinner(f"正在分析 {s_name} ({s_id}) 的行情與籌碼..."):
+                    price_df = fetch_stock_history_cached(stock_id=s_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+                    chip_df = fetch_chip_history_cached(stock_id=s_id, start_date=buffer_start_str, end_date=e_date_str, api_token=token)
+                    norway_df = get_norway_big_shareholders(s_id)
 
-                            st.markdown(f"""
-                            <div class="agent-card" style="border: 1px solid #00E676 !important;">
-                                <div class="agent-card-header header-green">🏆 投資組合經理 (PM) 最終決策</div>
-                                <div class="agent-card-body">{agent_res['pm_decision']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
+                if not price_df.empty:
+                    try:
+                        agent_res = run_multi_agent_system(s_id, s_name, price_df, chip_df, norway_df, st.session_state["gemini_keys"], custom_query)
+                        
+                        st.markdown(f"""
+                        <div class="agent-card" style="border: 1px solid #00E676 !important;">
+                            <div class="agent-card-header header-green">🏆 {s_name} ({s_id}) - PM 最終決策</div>
+                            <div class="agent-card-body">{agent_res['pm_decision']}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
 
-                            st.markdown(f"""
-                            <div class="agent-card">
-                                <div class="agent-card-header header-yellow">⚡ 成交量與價格波動（技術面分析）</div>
-                                <div class="agent-card-body">{agent_res['tech_report']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
+                        with st.expander(f"🔎 展開 {s_name} ({s_id}) 的詳細多面向辯論報告"):
+                            st.markdown(f"**⚡ 技術面分析：**\n\n{agent_res['tech_report']}")
+                            st.markdown(f"**🎯 籌碼面分析：**\n\n{agent_res['chip_report']}")
+                            st.markdown(f"**📈 看多觀點：**\n\n{agent_res['bull_opinion']}")
+                            st.markdown(f"**🔮 看空觀點：**\n\n{agent_res['bear_opinion']}")
+                            st.markdown(f"**🛑 風控建議：**\n\n{agent_res['risk_report']}")
 
-                            st.markdown(f"""
-                            <div class="agent-card">
-                                <div class="agent-card-header header-blue">🎯 籌碼與集中度（籌碼面分析）</div>
-                                <div class="agent-card-body">{agent_res['chip_report']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                            st.markdown(f"""
-                            <div class="agent-card">
-                                <div class="agent-card-header header-green">📈 多方動能評價（看多觀點）</div>
-                                <div class="agent-card-body">{agent_res['bull_opinion']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                            st.markdown(f"""
-                            <div class="agent-card">
-                                <div class="agent-card-header header-purple">🔮 空方風險反駁（看空觀點）</div>
-                                <div class="agent-card-body">{agent_res['bear_opinion']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                            st.markdown(f"""
-                            <div class="agent-card">
-                                <div class="agent-card-header header-red">🛑 風險管理與部位配置</div>
-                                <div class="agent-card-body">{agent_res['risk_report']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                        except Exception as e:
-                            st.error(f"❌ {e}")
+                    except Exception as e:
+                        st.error(f"❌ {s_name} ({s_id}) 分析失敗：{e}")
                 else:
-                    st.warning("⚠️ 請於左側邊欄或 Streamlit Secrets 填入有效的 GEMINI_API_KEY！")
-            else:
-                st.error(f"❌ 無法取得 {stock_id} 的 K 線價格資料，請檢查網路連線。")
+                    st.warning(f"⚠️ 無法取得 {s_name} ({s_id}) 的歷史行情資料。")

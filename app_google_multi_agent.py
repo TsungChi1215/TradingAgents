@@ -18,10 +18,10 @@ import google.generativeai as genai
 def get_secret(key_name, default=""):
     val = os.getenv(key_name)
     if val:
-        return val
+        return val.strip()
     try:
         if key_name in st.secrets:
-            return st.secrets[key_name]
+            return str(st.secrets[key_name]).strip()
     except Exception:
         pass
     return default
@@ -51,7 +51,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS 與響應式裝置判斷調整 (自動適應電腦與手機排版)
+# 全局 100% 覆蓋式深色 CSS（徹底清除所有白色殘留區塊並加強標題與文字清晰度）
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -106,23 +106,29 @@ st.markdown("""
         box-shadow: 0 0 15px rgba(0, 200, 83, 0.6) !important;
         transform: translateY(-1px);
     }
+    
+    /* --- 頂部四大指數卡片樣式 (強制正確中文標題與排版) --- */
     .fin-top-card {
         background-color: #161A24 !important;
         border: 1px solid #232836 !important;
         border-radius: 12px !important;
-        padding: 14px 18px !important;
+        padding: 12px 14px !important;
         margin-bottom: 12px !important;
+        min-height: 85px !important;
     }
     .fin-top-title {
-        font-size: 0.95rem !important;
+        font-size: 0.9rem !important;
         color: #00E676 !important;
-        margin-bottom: 6px !important;
+        margin-bottom: 4px !important;
         font-weight: bold !important;
+        white-space: nowrap !important;
     }
     .fin-top-val {
-        font-size: 1.3rem !important;
+        font-size: 1.2rem !important;
         font-weight: bold !important;
     }
+
+    /* --- 徹底消除表格與圖表外框的白色殘留 --- */
     div[data-testid="stDataFrame"] {
         background-color: #161A24 !important;
         border: 1px solid #2C3245 !important;
@@ -147,6 +153,8 @@ st.markdown("""
     tbody tr:hover td {
         background-color: #1F2533 !important;
     }
+
+    /* --- 多 Agent 診斷卡片 --- */
     .agent-card {
         background-color: #161A26 !important;
         border: 1px solid #23293A !important;
@@ -174,9 +182,7 @@ st.markdown("""
         color: #E0E6ED !important;
     }
 
-    /* --- 針對不同設備（電腦橫式 vs 手機直式）自動轉場的響應式控制 --- */
     @media (max-width: 768px) {
-        /* 當使用手機等窄螢幕裝置瀏覽時，強制將 Streamlit 預設的多欄改為垂直堆疊，防止畫面分割或擠壓 */
         [data-testid="column"] {
             width: 100% !important;
             flex: 100% !important;
@@ -194,22 +200,6 @@ def is_market_hours():
 
 def get_dynamic_ttl():
     return 180 if is_market_hours() else 43200
-
-STRATEGY_CONDITIONS = {
-    "短線強勢爆發": [
-        "日成交量限制：今日成交量 ≥ 50 張",
-        "價格位階：今日收盤價 > 20日均線 (20MA)",
-        "K 線型態：今日收盤價 > 今日開盤價 (收紅 K 棒)",
-        "成交量爆量：今日成交張數 ≥ 20日均量 × 1.5 倍",
-        "KD 動能指標：KD 指標呈黃金交叉 或 K 值大於 D 值且持續向上"
-    ],
-    "波段多頭排列": [
-        "日成交量限制：今日成交量 ≥ 50 張",
-        "均線多頭排列：5MA ≥ 10MA ≥ 20MA ≥ 60MA",
-        "價格位階：今日收盤價 > 20日均線 (20MA)",
-        "MACD 動能指標：MACD 柱狀體 (DIF - DEM) 保持正值"
-    ]
-}
 
 # -----------------------------------------------------------------------------
 # 即時市場數據抓取
@@ -381,6 +371,7 @@ def calculate_indicators(df_price):
     df['60MA'] = df['Close'].rolling(window=60).mean().round(2)
     df['Volume_20MA'] = df['Volume_張'].rolling(window=20).mean().round(0)
 
+    # 布林通道上下軌計算
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
     df['BB_Lower'] = (df['20MA'] - (std20 * 2)).round(2)
@@ -497,7 +488,7 @@ def run_market_screener(stock_dict, strategy_type, api_token):
     return pd.DataFrame(), True
 
 # -----------------------------------------------------------------------------
-# 3. 多 Agent LLM 呼叫機制
+# 3. 多 Agent LLM 呼叫機制 (強化 Key 清洗與驗證)
 # -----------------------------------------------------------------------------
 PURE_CHINESE_SYSTEM_INSTRUCTION = """
 你是一位頂尖的台灣股市分析與投資顧問專家。
@@ -526,9 +517,11 @@ def force_clean_english_lines(text):
     return result if result else "無分析內容"
 
 def call_llm(gemini_key, prompt):
-    if not gemini_key or not gemini_key.strip():
-        raise RuntimeError("請先設定有效的 Google Gemini API Key！")
-    genai.configure(api_key=gemini_key.strip())
+    clean_key = str(gemini_key).strip().strip("'").strip('"')
+    if not clean_key:
+        raise RuntimeError("請先在左側設定有效的 Google Gemini API Key！")
+    
+    genai.configure(api_key=clean_key)
     candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']
     last_exception = None
     for m_name in candidate_models:
@@ -541,7 +534,7 @@ def call_llm(gemini_key, prompt):
         except Exception as e:
             last_exception = e
             continue
-    raise RuntimeError(f"Gemini API 呼叫失敗：{last_exception}")
+    raise RuntimeError(f"Gemini API 呼叫失敗（請檢查您的 API Key 是否正確或額度是否足夠）：{last_exception}")
 
 def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, gemini_key, user_query):
     df = calculate_indicators(price_df)
@@ -592,7 +585,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 4. 圖表繪製
+# 4. 圖表繪製 (加入布林上下軌與高對比極亮文字)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -602,16 +595,17 @@ def apply_dark_theme(fig, height=450):
         height=height,
         margin=dict(l=20, r=20, t=40, b=20),
         hovermode="x unified",
-        font=dict(color="#FFFFFF", size=12),
+        font=dict(color="#FFFFFF", size=13),
+        title_font=dict(color="#00E676", size=15, family="sans-serif"),
         legend=dict(
-            bgcolor="rgba(18, 21, 30, 0.9)",
-            bordercolor="#2C3245",
+            bgcolor="rgba(22, 26, 36, 0.95)",
+            bordercolor="#00E676",
             borderwidth=1,
-            font=dict(color="#FFFFFF", size=11)
+            font=dict(color="#FFFFFF", size=12)
         )
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category', tickfont=dict(color="#FFFFFF", size=10))
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF", size=11))
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category', tickfont=dict(color="#FFFFFF", size=11))
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836", tickfont=dict(color="#FFFFFF", size=12))
     return fig
 
 def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
@@ -630,6 +624,10 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA (月線)", line=dict(color="#AA00FF", width=2.2)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['60MA'], name="60MA (季線)", line=dict(color="#2962FF", width=2.2)), row=1, col=1, secondary_y=False)
     
+    # 加入布林通道上下軌
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="rgba(0, 230, 118, 0.6)", width=1.2, dash="dash")), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="rgba(255, 82, 82, 0.6)", width=1.2, dash="dash")), row=1, col=1, secondary_y=False)
+    
     vol_colors = ['rgba(255, 82, 82, 0.4)' if df_price['Close'].iloc[i] >= df_price['Open'].iloc[i] else 'rgba(0, 230, 118, 0.4)' for i in range(len(df_price))]
     fig.add_trace(go.Bar(x=df_price['Date'], y=df_price['Volume_張'], name="成交張數", marker_color=vol_colors), row=1, col=1, secondary_y=True)
     
@@ -637,7 +635,8 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.update_yaxes(title_text="價格 (元)", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="成交量 (張)", range=[0, max_vol * 3.5], row=1, col=1, secondary_y=True, showgrid=False)
     fig.update_xaxes(rangeslider_visible=False)
-    return apply_dark_theme(fig, height=480)
+    fig.update_layout(title=f"📈 {stock_id} {stock_name} 股價 K 線與布林通道技術分析")
+    return apply_dark_theme(fig, height=500)
 
 def plot_macd_obv_chart(price_df, display_start_date):
     df_calc = calculate_indicators(price_df)
@@ -650,7 +649,7 @@ def plot_macd_obv_chart(price_df, display_start_date):
     
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['OBV'], name="OBV 能量潮", line=dict(color="#E040FB", width=2)), row=2, col=1)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['OBV_MA10'], name="OBV MA10", line=dict(color="#FFD600", width=1.8)), row=2, col=1)
-    return apply_dark_theme(fig, height=400)
+    return apply_dark_theme(fig, height=420)
 
 def plot_chip_chart(chip_df, display_start_date):
     fig = make_subplots(rows=1, cols=1)
@@ -663,8 +662,8 @@ def plot_chip_chart(chip_df, display_start_date):
             p_trust = chip_sub[chip_sub['name'].astype(str).str.contains('Trust', case=False, na=False)].groupby(d_col)[val_col].sum()
             if not p_foreign.empty: fig.add_trace(go.Bar(x=p_foreign.index, y=(p_foreign/1000).round(0), name="外資(張)", marker_color='#2962FF'))
             if not p_trust.empty: fig.add_trace(go.Bar(x=p_trust.index, y=(p_trust/1000).round(0), name="投信(張)", marker_color='#FF6D00'))
-    fig.update_layout(title="🏛️ 三大法人每日買賣超 (張)", barmode='group')
-    return apply_dark_theme(fig, height=300)
+    fig.update_layout(title="🏛️ 三大法人每日買賣超 (張)")
+    return apply_dark_theme(fig, height=320)
 
 def plot_margin_chart(margin_df, display_start_date):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -680,7 +679,7 @@ def plot_margin_chart(margin_df, display_start_date):
             s_col = col_short[0]
             fig.add_trace(go.Scatter(x=margin_sub[d_col], y=margin_sub[s_col], name="融券餘額(張)", line=dict(color="#00E676", width=2)), secondary_y=True)
     fig.update_layout(title="💳 融資融券餘額變化 (張)")
-    return apply_dark_theme(fig, height=300)
+    return apply_dark_theme(fig, height=320)
 
 def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -688,7 +687,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
         fig.add_trace(go.Bar(x=norway_df['Date'], y=norway_df['Total_People'], name="總股東人數 (人)", marker_color='#455A64', opacity=0.85), secondary_y=False)
         fig.add_trace(go.Scatter(x=norway_df['Date'], y=norway_df['Big_Ratio'], name="大股東持有率 (%)", mode="lines+markers", line=dict(color="#FF6D00", width=2.5), marker=dict(size=6, color="#FFFFFF")), secondary_y=True)
     fig.update_layout(title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持有率")
-    return apply_dark_theme(fig, height=340)
+    return apply_dark_theme(fig, height=360)
 
 # -----------------------------------------------------------------------------
 # 5. Streamlit 主 UI 與智慧金鑰初始化
@@ -710,11 +709,12 @@ with st.sidebar:
     )
     st.markdown("---")
     stored_gemini_key = st.text_input("Google Gemini API Key", value=st.session_state["gemini_key"], type="password")
-    if stored_gemini_key != st.session_state["gemini_key"]: st.session_state["gemini_key"] = stored_gemini_key
+    if stored_gemini_key != st.session_state["gemini_key"]: 
+        st.session_state["gemini_key"] = stored_gemini_key.strip()
 
     stored_finmind_token = st.text_input("FinMind Token", value=st.session_state["finmind_token"], type="password")
     if stored_finmind_token != st.session_state["finmind_token"]: 
-        st.session_state["finmind_token"] = stored_finmind_token
+        st.session_state["finmind_token"] = stored_finmind_token.strip()
         st.cache_data.clear()
 
     st.markdown("---")
@@ -727,7 +727,7 @@ STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 active_gemini_key = st.session_state.get("gemini_key") or default_gemini_key
 
 # =============================================================================
-# 頂部四塊核心指標看板
+# 頂部四塊核心指標看板 (加權指數、櫃買指數、台指期近月、台積電)
 # =============================================================================
 market_data = fetch_realtime_market_indices()
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -737,7 +737,7 @@ def render_metric_card(col, title, data):
     col.markdown(f"""
     <div class='fin-top-card'>
         <div class='fin-top-title'>{title}</div>
-        <div class='fin-top-val' style='color:{color};'>{data['val']:,.2f} <span style='font-size:0.85rem;'>{data['change']}</span></div>
+        <div class='fin-top-val' style='color:{color};'>{data['val']:,.2f} <span style='font-size:0.8rem;'>{data['change']}</span></div>
     </div>
     """, unsafe_allow_html=True)
 

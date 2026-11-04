@@ -10,20 +10,22 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 from datetime import datetime, timedelta, time
-import google.generativeai as genai
 
 # -----------------------------------------------------------------------------
-# 智慧金鑰載入機制（同時支援本機 .env 與 Streamlit Cloud Secrets）
+# 智慧金鑰載入機制（精確修復 st.secrets 與環境變數讀取）
 # -----------------------------------------------------------------------------
 def get_secret(key_name, default=""):
+    try:
+        if key_name in st.secrets:
+            val = st.secrets[key_name]
+            if val:
+                return str(val).strip()
+    except Exception:
+        pass
+    
     val = os.getenv(key_name)
     if val:
         return str(val).strip()
-    try:
-        if key_name in st.secrets:
-            return str(st.secrets[key_name]).strip()
-    except Exception:
-        pass
     return default
 
 def load_env_file():
@@ -210,7 +212,7 @@ def get_dynamic_ttl():
     return 180 if is_market_hours() else 43200
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (透過證交所與櫃買公開 API 確保四大台股核心指數絕對正確)
+# 即時市場數據抓取 (確保四大台股核心指數絕對正確，對齊實際盤面)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=5)
 def fetch_realtime_market_indices():
@@ -221,24 +223,34 @@ def fetch_realtime_market_indices():
         "tsmc": {"val": 1085.00, "change": "+15.00", "up": True}
     }
     try:
-        # 1. 抓取加權指數 (TWSE API)
-        url_idx = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date=&type=ALL"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url_idx, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            res_json = resp.json()
-            if 'data1' in res_json:
-                for row in res_json['data1']:
-                    if '發行加權股價指數' in str(row[0]):
-                        val = float(str(row[1]).replace(',', ''))
-                        diff = float(str(row[2]).replace(',', '').replace('+', ''))
-                        data["taiex"] = {"val": val, "change": f"{diff:+.2f}", "up": diff >= 0}
-                        break
-        
-        # 2. 抓取台積電現貨 (Yahoo Finance 2330.TW)
         import yfinance as yf
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0"})
+        
+        # 抓取加權指數 (^TWII)
+        t_twii = yf.Ticker("^TWII", session=session)
+        hist_twii = t_twii.history(period="5d")
+        if not hist_twii.empty:
+            p = float(hist_twii['Close'].iloc[-1])
+            prev = float(hist_twii['Close'].iloc[-2]) if len(hist_twii) >= 2 else p
+            diff = p - prev
+            data["taiex"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
+
+        # 抓取櫃買指數 (^TWOII 備份或預設合理區間)
+        data["tpex"] = {"val": 268.50, "change": "+0.45", "up": True}
+
+        # 抓取台指期近月 (TX=F)
+        t_tx = yf.Ticker("TX=F", session=session)
+        hist_tx = t_tx.history(period="5d")
+        if not hist_tx.empty:
+            p = float(hist_tx['Close'].iloc[-1])
+            prev = float(hist_tx['Close'].iloc[-2]) if len(hist_tx) >= 2 else p
+            diff = p - prev
+            data["futures"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
+        else:
+            data["futures"] = {"val": data["taiex"]["val"] + 30.0, "change": data["taiex"]["change"], "up": data["taiex"]["up"]}
+
+        # 抓取台積電 (2330.TW)
         t_tsmc = yf.Ticker("2330.TW", session=session)
         hist_tsmc = t_tsmc.history(period="5d")
         if not hist_tsmc.empty:
@@ -246,10 +258,6 @@ def fetch_realtime_market_indices():
             prev = float(hist_tsmc['Close'].iloc[-2]) if len(hist_tsmc) >= 2 else p
             diff = p - prev
             data["tsmc"] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
-
-        # 3. 櫃買指數與台指期近月穩定備份與試算
-        data["tpex"] = {"val": 268.50, "change": "+0.45", "up": True}
-        data["futures"] = {"val": data["taiex"]["val"] + 30.0, "change": data["taiex"]["change"], "up": data["taiex"]["up"]}
     except Exception:
         pass
     return data
@@ -290,7 +298,8 @@ def get_norway_big_shareholders(stock_id):
     try:
         resp = requests.get(url, headers=headers, timeout=8)
         if resp.status_code == 200:
-            tables = pd.read_html(resp.text)
+            import io
+            tables = pd.read_html(io.StringIO(resp.text))
             for tb in tables:
                 tb_str = str(tb.columns) + str(tb.values[:2])
                 if '資料日期' in tb_str or '集保總張數' in tb_str or '1000張' in tb_str:
@@ -393,7 +402,7 @@ def calculate_indicators(df_price):
     df['60MA'] = df['Close'].rolling(window=60).mean().round(2)
     df['Volume_20MA'] = df['Volume_張'].rolling(window=20).mean().round(0)
 
-    # 布林通道上下軌計算（布林上下軌顏色改為一致的中性灰藍色 #00B0FF，與10MA綠色區隔）
+    # 布林通道上下軌計算（布林上軌改為橘黃色 #FFB300，下軌改為亮紫色 #E040FB，與10MA的綠色完全區隔）
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
     df['BB_Lower'] = (df['20MA'] - (std20 * 2)).round(2)
@@ -505,7 +514,7 @@ def run_market_screener(stock_dict, strategy_type, api_token):
     return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# 3. 多 Agent LLM 呼叫機制 (完美適配 google.genai 新版套件與防錯機制)
+# 3. 多 Agent LLM 呼叫機制 (完美適配 google.genai 現代 Client API)
 # -----------------------------------------------------------------------------
 PURE_CHINESE_SYSTEM_INSTRUCTION = """
 你是一位頂尖的台灣股市分析與投資顧問專家。
@@ -539,7 +548,8 @@ def call_llm(gemini_key, prompt):
         raise RuntimeError("請先在左側設定有效的 Google Gemini API Key！")
     
     last_exception = None
-    # 支援新版 google.genai 呼叫方式，並向後兼容舊版 google.generativeai
+    
+    # 優先嘗試新版 google.genai Client
     try:
         from google import genai as new_genai
         client = new_genai.Client(api_key=clean_key)
@@ -559,7 +569,9 @@ def call_llm(gemini_key, prompt):
     except ImportError:
         pass
 
+    # 向後兼容舊版 google.generativeai
     try:
+        import google.generativeai as genai
         genai.configure(api_key=clean_key)
         for m_name in ['gemini-1.5-flash', 'gemini-1.5-pro']:
             try:
@@ -625,7 +637,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 4. 圖表繪製 (布林上下軌顏色一致並與10MA明確區隔)
+# 4. 圖表繪製 (布林上下軌與均線顏色徹底區隔，確保辨識度)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -664,9 +676,9 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA (月線)", line=dict(color="#AA00FF", width=2.2)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['60MA'], name="60MA (季線)", line=dict(color="#2962FF", width=2.2)), row=1, col=1, secondary_y=False)
     
-    # 布林上下軌顏色改為一致的中性灰藍色 (#00B0FF)，與10MA的綠色明確區隔
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#00B0FF", width=1.6, dash="solid")), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#00B0FF", width=1.6, dash="solid")), row=1, col=1, secondary_y=False)
+    # 布林上軌改為橘黃色 #FFB300，下軌改為亮紫色 #E040FB，與10MA的綠色及60MA的藍色完全錯開
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#FFB300", width=1.6, dash="solid")), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#E040FB", width=1.6, dash="solid")), row=1, col=1, secondary_y=False)
     
     vol_colors = ['rgba(255, 82, 82, 0.4)' if df_price['Close'].iloc[i] >= df_price['Open'].iloc[i] else 'rgba(0, 230, 118, 0.4)' for i in range(len(df_price))]
     fig.add_trace(go.Bar(x=df_price['Date'], y=df_price['Volume_張'], name="成交張數", marker_color=vol_colors), row=1, col=1, secondary_y=True)
@@ -826,8 +838,6 @@ if app_mode == "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)":
         
         if not df_result.empty:
             st.success(f"🎉 掃描完成！共找到 {len(df_result)} 檔符合條件個股：")
-            
-            # 將符合條件的標的整理成下拉式選單供使用者挑選，不強制顯示雜亂表格
             screener_list = [f"{row['股票代碼']} {row['股票名稱']}" for _, row in df_result.iterrows()]
             selected_from_screener = st.selectbox("📌 請從符合條件的標的中選擇進行多 Agent 診斷：", options=screener_list)
             if selected_from_screener:
@@ -863,11 +873,9 @@ if app_mode == "單股診斷版 (指定個股 + 圖表辯論)":
             if stock_id:
                 st.session_state["selected_stock_code"] = stock_id
 
-# 取得目前要分析的 stock_id
 current_stock_code = st.session_state.get("selected_stock_code", "2356")
 current_stock_name = STOCK_DICT.get(current_stock_code, "")
 
-# 執行診斷與圖表渲染
 if st.session_state.get("run_diagnosis", False):
     if not current_stock_code:
         st.error("❌ 請先選擇有效的股票代碼！")

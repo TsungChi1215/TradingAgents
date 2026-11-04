@@ -153,7 +153,7 @@ def is_market_hours():
     return True
 
 # -----------------------------------------------------------------------------
-# 上方 Banner 即時行情抓取
+# 上方 Banner 即時行情抓取 (已加強防呆，避免指數查無資料時崩潰)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_top_banner_realtime_yfinance():
@@ -176,7 +176,6 @@ def fetch_top_banner_realtime_yfinance():
         pass
 
     try:
-        # 使用標準櫃買指數代碼 ^TWOII，修正 006201 找不到報價問題
         df = yf.Ticker("^TWOII").history(period="2d")
         if len(df) >= 1:
             curr_p, prev_p = df['Close'].iloc[-1], df['Close'].iloc[-2] if len(df) >= 2 else df['Close'].iloc[-1]
@@ -416,7 +415,7 @@ def calculate_indicators(df_price):
     return df
 
 # -----------------------------------------------------------------------------
-# 🛡️ 智能自動匹配可用模型 (100% 根除 404 錯誤)
+# 🛡️ 智能自動匹配可用模型
 # -----------------------------------------------------------------------------
 PURE_CHINESE_SYSTEM_INSTRUCTION = """
 你是一位頂尖的台灣股市分析與投資顧問專家。
@@ -427,7 +426,6 @@ PURE_CHINESE_SYSTEM_INSTRUCTION = """
 """
 
 def get_available_models_for_key(api_key):
-    """向 Google 查詢該 API Key 當前真正有權限存取的模型列表"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
         resp = requests.get(url, timeout=10)
@@ -446,7 +444,6 @@ def get_available_models_for_key(api_key):
         return [], str(e)
 
 def test_api_key_connection(key_str):
-    """測試 API Key 並列出其開通的所有可用模型"""
     raw_keys = re.split(r'[,，\s]+', key_str.strip())
     api_keys = [k.strip() for k in raw_keys if k.strip()]
     
@@ -835,7 +832,6 @@ if run_agent_button:
                             st.markdown("---")
                             st.markdown("## 📊 分析結果")
 
-                            # 💡 改為由上而下單欄呈現，照邏輯順序排版
                             st.markdown(f"""
                             <div class="agent-card" style="border: 1px solid #00E676 !important;">
                                 <div class="agent-card-header header-green">🏆 投資組合經理 (PM) 最終決策</div>

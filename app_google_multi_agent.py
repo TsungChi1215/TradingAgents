@@ -10,7 +10,7 @@ import streamlit as st
 from datetime import datetime, timedelta
 
 # -----------------------------------------------------------------------------
-# 1. 系統設定與金鑰載入 (乾淨無 CSS 衝突版)
+# 1. 系統設定與金鑰解析（支援多組 AIzaSy 與 AQ. 格式 Key 自動輪替備援）
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="TradingAgents - 專業金融量化選股終端",
@@ -23,21 +23,35 @@ def get_secret(key_name, default=""):
     try:
         if hasattr(st, "secrets") and st.secrets and key_name in st.secrets:
             val = st.secrets[key_name]
-            if val: return str(val).strip()
+            if val: return val
     except Exception: pass
     val = os.getenv(key_name)
     if val: return str(val).strip()
     return default
 
+def parse_api_keys(raw_input):
+    """
+    將使用者輸入的字串、清單或 JSON 陣列解析成獨立的金鑰列表
+    """
+    if not raw_input:
+        return []
+    if isinstance(raw_input, list):
+        return [str(k).strip().strip("'").strip('"') for k in raw_input if k]
+        
+    cleaned = str(raw_input).strip()
+    cleaned = cleaned.replace("[", "").replace("]", "").replace("'", "").replace('"', "")
+    parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+    if not parts and cleaned:
+        parts = [cleaned]
+    return [p for p in parts if p]
+
 # -----------------------------------------------------------------------------
-# 2. 官方 OpenAPI 即時指數 (重命名函數以強制清除之前錯誤的快取 42948.91)
+# 2. 官方 OpenAPI 即時指數
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
-def fetch_market_indices_v4():
+def fetch_market_indices_v5():
     headers = {"User-Agent": "Mozilla/5.0"}
     data = {}
-    
-    # 使用最穩定的證交所 OpenAPI 大盤行情
     try:
         url_index = "https://openapi.twse.com.tw/v1/exchangeReport/MI_5MINS"
         resp = requests.get(url_index, headers=headers, timeout=5)
@@ -56,7 +70,6 @@ def fetch_market_indices_v4():
                         data["tpex"] = {"val": val, "change": change, "name": "櫃買指數 (TPEX)"}
     except Exception: pass
 
-    # 台積電使用 MIS API
     try:
         url_tsmc = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw"
         resp = requests.get(url_tsmc, headers=headers, timeout=5)
@@ -108,7 +121,7 @@ def run_market_screener(stock_dict, strategy_type):
     return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# 4. 個股資料抓取與指標計算
+# 4. 個股資料抓取與技術指標計算
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=43200)
 def get_all_taiwan_stock_info(api_token=""):
@@ -205,7 +218,7 @@ def calculate_indicators(df_price):
     return df
 
 # -----------------------------------------------------------------------------
-# 5. Plotly 圖表繪製 (解決三大法人只有買超問題)
+# 5. Plotly 圖表繪製
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450, title=""):
     fig.update_layout(
@@ -242,7 +255,7 @@ def plot_chip_chart(chip_df, display_start_date):
         d_col = 'date' if 'date' in chip_df.columns else chip_df.columns[0]
         chip_sub = chip_df[chip_df[d_col] >= display_start_date].copy()
         
-        # 真正計算「淨買賣超」，解決全是正數的問題
+        # 確實計算「淨買賣超」(buy - sell)，呈現正確的紅買綠賣
         if 'buy' in chip_sub.columns and 'sell' in chip_sub.columns:
             chip_sub['net_buy'] = chip_sub['buy'] - chip_sub['sell']
         else:
@@ -253,7 +266,6 @@ def plot_chip_chart(chip_df, display_start_date):
             sub = chip_sub[chip_sub['name'].astype(str).str.contains(key, case=False, na=False)].groupby(d_col)['net_buy'].sum() / 1000
             if not sub.empty:
                 vals = sub.round(0)
-                # 大於 0 紅色 (買超)，小於 0 綠色 (賣超)
                 colors = np.where(vals >= 0, '#FF5252', '#00E676')
                 fig.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=colors))
     fig.update_layout(barmode='group')
@@ -281,33 +293,65 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 原生 REST API 呼叫 Gemini (明確捕捉 400 API Key 無效錯誤)
+# 6. 多組 API Key 智慧輪替備援機制（支援 AIzaSy 與 AQ. 格式）
 # -----------------------------------------------------------------------------
-def call_gemini_rest_api(api_key, prompt):
-    clean_key = str(api_key).strip().strip("'").strip('"')
-    if not clean_key:
-        return "⚠️ 尚未設定 Google Gemini API Key，請於左側設定欄位輸入。"
+def call_gemini_with_keys_rotation(raw_keys_input, prompt):
+    keys_list = parse_api_keys(raw_keys_input)
+    if not keys_list:
+        return "⚠️ 尚未設定任何 Google Gemini API Key，請於左側設定欄位輸入。"
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={clean_key}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}]}
-    }
-    try:
-        resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=20)
-        if resp.status_code == 200:
-            return resp.json()['candidates'][0]['content']['parts'][0]['text']
-        elif resp.status_code == 400:
-            return "⚠️ **API 金鑰無效 (400 HTTP 錯誤)**。這表示 Google 伺服器拒絕了這把金鑰。請確認您的 Key 是從 `aistudio.google.com` 取得，且未包含多餘空白。"
-        else:
-            return f"⚠️ API 呼叫失敗 ({resp.status_code}): 請檢查網路或金鑰權限。"
-    except Exception as e:
-        return f"⚠️ 連線異常: {e}"
+    last_error_msg = ""
+    for idx, clean_key in enumerate(keys_list):
+        # 1. 嘗試使用 Google 官方 google-genai SDK
+        try:
+            from google import genai
+            client = genai.Client(api_key=clean_key)
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config={"system_instruction": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}
+            )
+            if response and response.text:
+                return response.text
+        except ImportError:
+            pass
+        except Exception as e:
+            last_error_msg = f"SDK 模式錯誤: {e}"
+
+        # 2. 備援：透過 REST API 智慧發送請求 (AQ. 格式支援 Bearer Token 或 x-goog-api-key)
+        try:
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+            headers = {"Content-Type": "application/json"}
+            
+            if clean_key.startswith("AQ."):
+                headers["Authorization"] = f"Bearer {clean_key}"
+            else:
+                url += f"?key={clean_key}"
+                
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}]}
+            }
+            
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code == 200:
+                return resp.json()['candidates'][0]['content']['parts'][0]['text']
+            elif resp.status_code in [400, 401, 429]:
+                last_error_msg = f"Key #{idx+1} 狀態碼 {resp.status_code}"
+                continue
+            else:
+                last_error_msg = f"Key #{idx+1} 伺服器錯誤 ({resp.status_code}): {resp.text}"
+                continue
+        except Exception as e:
+            last_error_msg = f"Key #{idx+1} 連線異常: {e}"
+            continue
+            
+    return f"⚠️ **所有設定的 API Key 均無法使用或已達額度上限**。最後錯誤訊息：{last_error_msg}"
 
 # -----------------------------------------------------------------------------
 # 7. 共用診斷渲染引擎
 # -----------------------------------------------------------------------------
-def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, gemini_key):
+def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, gemini_keys_input):
     with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
         s_str = start_date.strftime("%Y-%m-%d")
         e_str = end_date.strftime("%Y-%m-%d")
@@ -321,7 +365,6 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, 
     if not price_df.empty:
         df_calc = calculate_indicators(price_df)
         
-        # 移除 use_container_width=True，避免終端機跳警告
         st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_str))
         st.plotly_chart(plot_chip_chart(chip_df, s_str))
         st.plotly_chart(plot_margin_chart(margin_df, s_str))
@@ -329,10 +372,10 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, 
 
         st.markdown("---")
         st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
-        with st.spinner("AI 專家團隊正在連線 Gemini 分析中..."):
+        with st.spinner("AI 專家團隊正在透過多組 Key 備援機制連線 Gemini 分析中..."):
             latest = df_calc.iloc[-1]
             prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，請給出繁體中文的技術面、籌碼面與操作建議。"
-            ai_result = call_gemini_rest_api(gemini_key, prompt)
+            ai_result = call_gemini_with_keys_rotation(gemini_keys_input, prompt)
             st.info(ai_result)
     else:
         st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
@@ -352,7 +395,12 @@ with st.sidebar:
     app_mode = st.selectbox("選擇系統執行模式：", ["單股與多 Agent 診斷版", "全市場自動選股版"], index=0)
     st.markdown("---")
     
-    stored_gemini_key = st.text_input("Google Gemini API Key", value=st.session_state["gemini_key"], type="password")
+    stored_gemini_key = st.text_area(
+        "Google Gemini API Keys (支援多組，用逗號或換行隔開)", 
+        value=str(st.session_state["gemini_key"]), 
+        height=110,
+        help="您可以貼入多組 AIzaSy... 或 AQ... 開頭的 Key，用逗號隔開或換行。系統會自動輪替備援。"
+    )
     if stored_gemini_key != st.session_state["gemini_key"]: 
         st.session_state["gemini_key"] = stored_gemini_key.strip()
 
@@ -366,10 +414,10 @@ with st.sidebar:
     end_date = st.date_input("結束日期", value=datetime.today())
 
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
-active_gemini_key = st.session_state.get("gemini_key") or default_gemini_key
+active_gemini_keys = st.session_state.get("gemini_key") or default_gemini_key
 
-# 頂部四塊指數看板 (改用 Streamlit 原生 metric，保證 100% 不會消失)
-market_data = fetch_market_indices_v4()
+# 頂部四塊指數看板 (使用原生 Streamlit metric，保證中文與數值 100% 正常顯示)
+market_data = fetch_market_indices_v5()
 m1, m2, m3, m4 = st.columns(4)
 
 def render_native_metric(col, title, data_key):
@@ -385,7 +433,7 @@ render_native_metric(m3, "台指期近月 (TX)", "futures")
 render_native_metric(m4, "台積電 (2330)", "tsmc")
 st.markdown("---")
 
-# 主頁面邏輯
+# 主頁面模式邏輯
 if app_mode == "全市場自動選股版":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
     strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)
@@ -397,16 +445,15 @@ if app_mode == "全市場自動選股版":
     df_res = st.session_state.get("screener_res", pd.DataFrame())
     if not df_res.empty:
         st.success(f"🎉 掃描完成！共挑選出 {len(df_res)} 檔達標個股。")
-        # 移除 use_container_width=True，消除終端機警告
         st.dataframe(df_res)
         
         st.markdown("### 🎯 從掃描結果啟動深度診斷")
         options = [f"{row['股票代碼']} {row['股票名稱']}" for idx, row in df_res.iterrows()]
-        sel = st.selectbox("📌 請選擇一檔標的：", options)
+        sel = st.selectbox("📌 請選擇一檔標的進行分析：", options)
         if st.button("🚀 啟動此檔個股深度分析"):
             sid = sel.split(" ")[0]
             sname = sel.split(" ")[1]
-            render_diagnosis_section(sid, sname, start_date, end_date, st.session_state["finmind_token"], active_gemini_key)
+            render_diagnosis_section(sid, sname, start_date, end_date, st.session_state["finmind_token"], active_gemini_keys)
             
 else:
     filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
@@ -417,4 +464,4 @@ else:
     stock_name = STOCK_DICT.get(stock_id, "")
 
     if st.button("🚀 啟動個股技術、籌碼與 AI 深度診斷"):
-        render_diagnosis_section(stock_id, stock_name, start_date, end_date, st.session_state["finmind_token"], active_gemini_key)
+        render_diagnosis_section(stock_id, stock_name, start_date, end_date, st.session_state["finmind_token"], active_gemini_keys)

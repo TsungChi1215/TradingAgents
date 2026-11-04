@@ -107,7 +107,7 @@ st.markdown("""
         transform: translateY(-1px);
     }
     
-    /* --- 頂部四大指數卡片樣式 (修復中文被截斷的問題) --- */
+    /* --- 頂部四大指數卡片樣式 (修復中文被截斷與錯位問題) --- */
     .fin-top-card {
         background-color: #161A24 !important;
         border: 1px solid #232836 !important;
@@ -197,32 +197,42 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# -----------------------------------------------------------------------------
+# 盤中時間判定與動態 TTL 機制
+# -----------------------------------------------------------------------------
 def is_market_hours():
     now = datetime.now()
-    if now.weekday() >= 5: return False
+    # 週末不開盤 (星期六=5, 星期日=6)
+    if now.weekday() >= 5: 
+        return False
     return time(9, 0) <= now.time() <= time(13, 30)
 
 def get_dynamic_ttl():
     return 180 if is_market_hours() else 43200
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (精準校正四大指數與台積電最新真實行情)
+# 即時市場數據抓取 (四大台股核心指數與台積電)
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=5)
 def fetch_realtime_market_indices():
-    # 根據最新截圖行情設定準確的基準與備份數值
+    # 預設基準數值（若 API 逾時或離線時的備份顯示）
     data = {
-        "taiex": {"val": 42948.91, "change": "-358.63", "up": False},
-        "tpex": {"val": 343.50, "change": "-2.02", "up": False},
-        "futures": {"val": 43189.00, "change": "-164.00", "up": False},
-        "tsmc": {"val": 2260.00, "change": "-35.00", "up": False}
+        "taiex": {"val": 23150.20, "change": "+142.50", "up": True},
+        "tpex": {"val": 268.45, "change": "-0.85", "up": False},
+        "futures": {"val": 23180.00, "change": "+160.00", "up": True},
+        "tsmc": {"val": 1085.00, "change": "+15.00", "up": True}
     }
     try:
         import yfinance as yf
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         
-        mapping = [("taiex", "^TWII"), ("tpex", "^TWOII"), ("futures", "TX=F"), ("tsmc", "2330.TW")]
+        mapping = [
+            ("taiex", "^TWII"),      # 加權指數
+            ("tpex", "^TWOII"),      # 櫃買指數
+            ("futures", "TX=F"),     # 台指期近月
+            ("tsmc", "2330.TW")      # 台積電
+        ]
         for key, sym in mapping:
             try:
                 t = yf.Ticker(sym, session=session)
@@ -231,8 +241,11 @@ def fetch_realtime_market_indices():
                     p = float(hist['Close'].iloc[-1])
                     prev = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else p
                     diff = p - prev
-                    if p > 50:  # 確保指數級數正確
-                        data[key] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
+                    data[key] = {
+                        "val": round(p, 2), 
+                        "change": f"{diff:+.2f}", 
+                        "up": diff >= 0
+                    }
             except Exception:
                 pass
     except Exception:
@@ -734,7 +747,9 @@ STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 active_gemini_key = st.session_state.get("gemini_key") or default_gemini_key
 
 # =============================================================================
-# 頂部四塊核心指標看板 (加權指數、櫃買指數、台指期近月、台積電)
+# 頂部四塊核心指標看板 (台股加權、櫃買、台指期近月、台積電)
+# -----------------------------------------------------------------------------
+# 開盤時間每 5 秒自動重新整理一次；非開盤時間則凍結顯示最近收盤價
 # =============================================================================
 market_data = fetch_realtime_market_indices()
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
@@ -753,6 +768,7 @@ render_metric_card(m_col2, "📈 櫃買指數 (TPEX)", market_data["tpex"])
 render_metric_card(m_col3, "⚡ 台指期近月 (TX)", market_data["futures"])
 render_metric_card(m_col4, "💎 台積電 (2330)", market_data["tsmc"])
 
+# 動態重新整理邏輯：如果是台股開盤時間，每 5 秒觸發 st.rerun() 更新一次數據
 if is_market_hours():
     t_time.sleep(5)
     st.rerun()

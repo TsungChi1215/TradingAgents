@@ -12,9 +12,25 @@ import streamlit as st
 from datetime import datetime, timedelta, time as dt_time, date
 
 # -----------------------------------------------------------------------------
-# 自動載入 .env 檔案金鑰
+# 自動載入 .env 檔案與 Streamlit Secrets 金鑰 (支援多組 API Key 陣列與字串)
 # -----------------------------------------------------------------------------
 def load_env_file():
+    # 1. 優先嘗試讀取 Streamlit Cloud 的 Secrets
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets"):
+            if "GEMINI_API_KEY" in st.secrets:
+                val = st.secrets["GEMINI_API_KEY"]
+                if isinstance(val, list):
+                    os.environ["GEMINI_API_KEY"] = ",".join(val)
+                else:
+                    os.environ["GEMINI_API_KEY"] = str(val)
+            if "FINMIND_TOKEN" in st.secrets:
+                os.environ["FINMIND_TOKEN"] = str(st.secrets["FINMIND_TOKEN"])
+    except Exception:
+        pass
+
+    # 2. 本機開發時讀取 .env 檔案
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
         from dotenv import load_dotenv
@@ -463,7 +479,7 @@ def test_api_key_connection(key_str):
 
 def call_llm_with_rotation(keys_input, prompt):
     if not keys_input or not keys_input.strip():
-        raise RuntimeError("⚠️ 未偵測到 GEMINI_API_KEY，請確認 .env 檔案設定！")
+        raise RuntimeError("⚠️ 未偵測到 GEMINI_API_KEY，請確認 .env 或 Streamlit Secrets 設定！")
     
     raw_keys = re.split(r'[,，\s]+', keys_input.strip())
     api_keys = [k.strip() for k in raw_keys if k.strip()]
@@ -714,14 +730,14 @@ with st.sidebar:
     app_mode = st.selectbox("選擇系統執行模式：", ["單股診斷版 (指定個股 + 圖表辯論)", "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)"], index=0)
     st.markdown("---")
     
-    if default_gemini_keys: st.caption("✅ 已從 .env 自動載入 Gemini API Keys")
-    if default_finmind_token: st.caption("✅ 已從 .env 自動載入 FinMind Token")
+    if default_gemini_keys: st.caption("✅ 已自動載入 Gemini API Keys")
+    if default_finmind_token: st.caption("✅ 已自動載入 FinMind Token")
     
     stored_gemini_keys = st.text_input(
-        "Google Gemini API Keys (自動從 .env 載入)", 
+        "Google Gemini API Keys", 
         value=st.session_state["gemini_keys"], 
         type="password",
-        help="程式會自動讀取 .env 中的多組 Key 進行輪替（已隱藏為星號）。"
+        help="程式會自動讀取多組 Key 進行輪替（已隱藏為星號）。"
     )
     if stored_gemini_keys != st.session_state["gemini_keys"]: 
         st.session_state["gemini_keys"] = stored_gemini_keys
@@ -756,13 +772,6 @@ fragment_decorator = st.fragment(run_every="5s") if market_open else (lambda f: 
 @fragment_decorator
 def render_top_banner():
     top_banner_data = fetch_top_banner_realtime_yfinance()
-    
-    if market_open:
-        status_text = "盤中即時更新中"
-        status_color = "#00E676"
-    else:
-        status_text = "休市中 (非開盤時間，停止自動更新)"
-        status_color = "#8F9BB3"
 
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
     with m_col1:
@@ -877,6 +886,6 @@ if run_agent_button:
                         except Exception as e:
                             st.error(f"❌ {e}")
                 else:
-                    st.warning("⚠️ 請於左側邊欄或 .env 填入有效的 GEMINI_API_KEY！")
+                    st.warning("⚠️ 請於左側邊欄或 Streamlit Secrets 填入有效的 GEMINI_API_KEY！")
             else:
                 st.error(f"❌ 無法取得 {stock_id} 的 K 線價格資料，請檢查網路連線。")

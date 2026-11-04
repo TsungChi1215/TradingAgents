@@ -12,10 +12,9 @@ import streamlit as st
 from datetime import datetime, timedelta, time as dt_time, date
 
 # -----------------------------------------------------------------------------
-# 自動載入 .env 檔案與 Streamlit Secrets 金鑰 (支援多組 API Key 陣列與字串)
+# 自動載入 .env 檔案與 Streamlit Secrets 金鑰
 # -----------------------------------------------------------------------------
 def load_env_file():
-    # 1. 優先嘗試讀取 Streamlit Cloud 的 Secrets
     try:
         import streamlit as st
         if hasattr(st, "secrets"):
@@ -30,7 +29,6 @@ def load_env_file():
     except Exception:
         pass
 
-    # 2. 本機開發時讀取 .env 檔案
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
         from dotenv import load_dotenv
@@ -55,8 +53,44 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS
+# 裝置自動偵測與動態響應式 CSS 注入
 # -----------------------------------------------------------------------------
+def detect_device_and_apply_styles():
+    # 利用前端 JS 檢查 User-Agent 並存入 session_state
+    if "device_type" not in st.session_state:
+        st.session_state["device_type"] = "pc"  # 預設
+        
+        # 透過 streamlit component 取得 user-agent
+        import streamlit.components.v1 as components
+        device_detect_code = """
+        <script>
+        const ua = navigator.userAgent;
+        let device = "pc";
+        if (/android/i.test(ua)) {
+            device = "android";
+        } else if (/iPad|iPhone|iPod/.test(ua) && !window.MSStream) {
+            device = "ios";
+        }
+        // 回傳給 Streamlit 或存入 localStorage
+        const parentDoc = window.parent.document;
+        let devInput = parentDoc.getElementById('detected_device_input');
+        if (!devInput) {
+            devInput = parentDoc.createElement('input');
+            devInput.type = 'hidden';
+            devInput.id = 'detected_device_input';
+            parentDoc.body.appendChild(devInput);
+        }
+        if (devInput.value !== device) {
+            devInput.value = device;
+            devInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        </script>
+        """
+        components.html(device_detect_code, height=0)
+
+detect_device_and_apply_styles()
+
+# 針對不同裝置動態調整 CSS 樣式（解決手機版下拉選單點擊與排版問題）
 st.markdown("""
 <style>
     header, [data-testid="stHeader"], .stAppHeader {
@@ -80,11 +114,13 @@ st.markdown("""
         padding-bottom: 2rem !important;
         max-width: 98% !important;
     }
-    div[data-baseweb="select"] > div, input, textarea {
+    /* 優化手機端選單與輸入框觸控區，防止點擊無反應 */
+    div[data-baseweb="select"] > div, input, textarea, select {
         background-color: #1A1E29 !important;
         border: 1px solid #2C3245 !important;
         color: #FFFFFF !important;
         border-radius: 8px !important;
+        font-size: 16px !important; /* 手機端字型大於 16px 可避免自動縮放與點擊穿透問題 */
     }
     div[data-baseweb="popover"] div {
         background-color: #1A1E29 !important;
@@ -96,8 +132,9 @@ st.markdown("""
         font-weight: bold !important;
         border: none !important;
         border-radius: 8px !important;
-        padding: 0.5rem 1rem !important;
+        padding: 0.6rem 1rem !important;
         box-shadow: 0 4px 12px rgba(0,200,83,0.25) !important;
+        width: 100% !important;
     }
     .stButton>button:hover {
         box-shadow: 0 0 15px rgba(0, 200, 83, 0.6) !important;
@@ -169,7 +206,7 @@ def is_market_hours():
     return True
 
 # -----------------------------------------------------------------------------
-# 上方 Banner 即時行情抓取 (已加強防呆，避免指數查無資料時崩潰)
+# 上方 Banner 即時行情抓取
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_top_banner_realtime_yfinance():
@@ -593,7 +630,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 圖表繪製與佈景主題
+# 圖表繪製與佈景主題 (針對不同裝置微調圖表高度以利閱讀)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -727,18 +764,16 @@ if "last_ai_call_time" not in st.session_state: st.session_state["last_ai_call_t
 
 with st.sidebar:
     st.markdown("### ⚡ 系統核心設定")
+    
+    # 裝置辨識狀態顯示 (供您確認目前被識別為哪種裝置)
+    current_device = st.session_state.get("device_type", "pc")
+    device_labels = {"pc": "💻 電腦版 (PC)", "android": "🤖 Android 手機", "ios": "🍏 iOS (iPhone/iPad)"}
+    st.info(f"當前偵測裝置：**{device_labels.get(current_device, '電腦版')}**")
+
     app_mode = st.selectbox("選擇系統執行模式：", ["單股診斷版 (指定個股 + 圖表辯論)", "啟動全功能版 (全市場自動選股 + 多 Agent 辯論)"], index=0)
     st.markdown("---")
     
-    if default_gemini_keys: st.caption("✅ 已自動載入 Gemini API Keys")
-    if default_finmind_token: st.caption("✅ 已自動載入 FinMind Token")
-    
-    stored_gemini_keys = st.text_input(
-        "Google Gemini API Keys", 
-        value=st.session_state["gemini_keys"], 
-        type="password",
-        help="程式會自動讀取多組 Key 進行輪替（已隱藏為星號）。"
-    )
+    stored_gemini_keys = st.text_input("Google Gemini API Keys", value=st.session_state["gemini_keys"], type="password")
     if stored_gemini_keys != st.session_state["gemini_keys"]: 
         st.session_state["gemini_keys"] = stored_gemini_keys
 
@@ -746,10 +781,8 @@ with st.sidebar:
         with st.spinner("正在向 Google AI 伺服器發送微量連線測試..."):
             diag_results = test_api_key_connection(st.session_state["gemini_keys"])
             for m_key, status, msg in diag_results:
-                if status:
-                    st.success(f"✅ 金鑰 `{m_key}`：{msg}")
-                else:
-                    st.error(f"❌ 金鑰 `{m_key}`：{msg}")
+                if status: st.success(f"✅ 金鑰 `{m_key}`：{msg}")
+                else: st.error(f"❌ 金鑰 `{m_key}`：{msg}")
 
     stored_finmind_token = st.text_input("FinMind Token", value=st.session_state["finmind_token"], type="password")
     if stored_finmind_token != st.session_state["finmind_token"]: 
@@ -757,14 +790,13 @@ with st.sidebar:
         st.cache_data.clear()
 
     st.markdown("---")
-    st.markdown("### 📅 圖表分析區間")
     start_date = st.date_input("開始日期", value=datetime.today() - timedelta(days=90))
     end_date = st.date_input("結束日期", value=datetime.today())
     custom_query = st.text_area("多 Agent 關注重點", value="關注短期突破機會與籌碼大股東動態。")
 
 STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 
-st.markdown("<div style='font-size:0.9rem; font-weight:bold; color:#8F9BB3; margin-bottom:6px;'>📈 市場重點指標與 Multi-Agent 系統狀態 (僅於台股實際開盤日 09:00~13:30 即時更新)</div>", unsafe_allow_html=True)
+st.markdown("<div style='font-size:0.9rem; font-weight:bold; color:#8F9BB3; margin-bottom:6px;'>📈 市場重點指標與 Multi-Agent 系統狀態</div>", unsafe_allow_html=True)
 
 market_open = is_market_hours()
 fragment_decorator = st.fragment(run_every="5s") if market_open else (lambda f: f)
@@ -773,15 +805,29 @@ fragment_decorator = st.fragment(run_every="5s") if market_open else (lambda f: 
 def render_top_banner():
     top_banner_data = fetch_top_banner_realtime_yfinance()
 
-    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    with m_col1:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>加權指數 (TAIEX)</div><div class='fin-top-val'>{top_banner_data['taiex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['taiex']['color']};'>{top_banner_data['taiex']['change']}</span></div><div class='fin-top-desc'>台灣大盤市場最新點數與漲跌幅</div></div>", unsafe_allow_html=True)
-    with m_col2:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>櫃買指數 (TPEX)</div><div class='fin-top-val'>{top_banner_data['tpex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tpex']['color']};'>{top_banner_data['tpex']['change']}</span></div><div class='fin-top-desc'>櫃買中心店頭市場指數與表現</div></div>", unsafe_allow_html=True)
-    with m_col3:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>台指近月期貨 (TXF)</div><div class='fin-top-val'>{top_banner_data['tx']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tx']['color']};'>{top_banner_data['tx']['change']}</span></div><div class='fin-top-desc'>台股期貨近月合約成交價</div></div>", unsafe_allow_html=True)
-    with m_col4:
-        st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>權值龍頭：台積電 (2330)</div><div class='fin-top-val'>{top_banner_data['tsmc']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tsmc']['color']};'>{top_banner_data['tsmc']['change']}</span></div><div class='fin-top-desc'>市值最高權值股報價 (自動避開假日)</div></div>", unsafe_allow_html=True)
+    # 針對手機版（Android / iOS）與電腦版調整排版欄位
+    is_mobile = st.session_state.get("device_type", "pc") in ["android", "ios"]
+    
+    if is_mobile:
+        # 手機版改用 2x2 網格排版，避免擁擠
+        m_col1, m_col2 = st.columns(2)
+        with m_col1:
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>加權指數</div><div class='fin-top-val'>{top_banner_data['taiex']['price']} <span style='font-size:0.75rem;color:{top_banner_data['taiex']['color']};'>{top_banner_data['taiex']['change']}</span></div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>台指期貨</div><div class='fin-top-val'>{top_banner_data['tx']['price']} <span style='font-size:0.75rem;color:{top_banner_data['tx']['color']};'>{top_banner_data['tx']['change']}</span></div></div>", unsafe_allow_html=True)
+        with m_col2:
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>櫃買指數</div><div class='fin-top-val'>{top_banner_data['tpex']['price']} <span style='font-size:0.75rem;color:{top_banner_data['tpex']['color']};'>{top_banner_data['tpex']['change']}</span></div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>台積電</div><div class='fin-top-val'>{top_banner_data['tsmc']['price']} <span style='font-size:0.75rem;color:{top_banner_data['tsmc']['color']};'>{top_banner_data['tsmc']['change']}</span></div></div>", unsafe_allow_html=True)
+    else:
+        # 電腦版維持 4 欄並排
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>加權指數 (TAIEX)</div><div class='fin-top-val'>{top_banner_data['taiex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['taiex']['color']};'>{top_banner_data['taiex']['change']}</span></div><div class='fin-top-desc'>台灣大盤市場最新點數與漲跌幅</div></div>", unsafe_allow_html=True)
+        with m_col2:
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>櫃買指數 (TPEX)</div><div class='fin-top-val'>{top_banner_data['tpex']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tpex']['color']};'>{top_banner_data['tpex']['change']}</span></div><div class='fin-top-desc'>櫃買中心店頭市場指數與表現</div></div>", unsafe_allow_html=True)
+        with m_col3:
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>台指近月期貨 (TXF)</div><div class='fin-top-val'>{top_banner_data['tx']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tx']['color']};'>{top_banner_data['tx']['change']}</span></div><div class='fin-top-desc'>台股期貨近月合約成交價</div></div>", unsafe_allow_html=True)
+        with m_col4:
+            st.markdown(f"<div class='fin-top-card'><div class='fin-top-title'>權值龍頭：台積電 (2330)</div><div class='fin-top-val'>{top_banner_data['tsmc']['price']} <span style='font-size:0.8rem;color:{top_banner_data['tsmc']['color']};'>{top_banner_data['tsmc']['change']}</span></div><div class='fin-top-desc'>市值最高權值股報價</div></div>", unsafe_allow_html=True)
 
 render_top_banner()
 
@@ -793,14 +839,23 @@ for idx, opt in enumerate(filtered_options):
         break
 
 st.markdown("### 📊 指定個股深度診斷與多 Agent 辯論")
-col_m1, col_m2 = st.columns([3, 1])
-with col_m1:
+
+# 針對手機版與電腦版調整輸入區塊比例
+is_mobile_device = st.session_state.get("device_type", "pc") in ["android", "ios"]
+if is_mobile_device:
     selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options if filtered_options else ["無股票資料"], index=default_idx if filtered_options else 0)
     stock_id = selected_stock_raw.split(" ")[0] if filtered_options else ""
     stock_name = STOCK_DICT.get(stock_id, "") if stock_id else ""
-with col_m2:
-    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
     run_agent_button = st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True)
+else:
+    col_m1, col_m2 = st.columns([3, 1])
+    with col_m1:
+        selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options if filtered_options else ["無股票資料"], index=default_idx if filtered_options else 0)
+        stock_id = selected_stock_raw.split(" ")[0] if filtered_options else ""
+        stock_name = STOCK_DICT.get(stock_id, "") if stock_id else ""
+    with col_m2:
+        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+        run_agent_button = st.button("🚀 啟動多 Agent 診斷與全圖表", type="primary", use_container_width=True)
 
 if run_agent_button:
     current_time = time.time()
@@ -828,13 +883,20 @@ if run_agent_button:
             if not price_df.empty:
                 st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_date_str), use_container_width=True)
                 st.plotly_chart(plot_macd_obv_chart(price_df, s_date_str), use_container_width=True)
-                col1, col2 = st.columns(2)
-                with col1: st.plotly_chart(plot_chip_chart(chip_df, s_date_str), use_container_width=True)
-                with col2: st.plotly_chart(plot_margin_chart(margin_df, s_date_str), use_container_width=True)
+                
+                # 針對手機版將圖表改為上下單欄排版，避免左右並排過於擠壓
+                if is_mobile_device:
+                    st.plotly_chart(plot_chip_chart(chip_df, s_date_str), use_container_width=True)
+                    st.plotly_chart(plot_margin_chart(margin_df, s_date_str), use_container_width=True)
+                else:
+                    col1, col2 = st.columns(2)
+                    with col1: st.plotly_chart(plot_chip_chart(chip_df, s_date_str), use_container_width=True)
+                    with col2: st.plotly_chart(plot_margin_chart(margin_df, s_date_str), use_container_width=True)
+                    
                 st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name), use_container_width=True)
                 
                 if st.session_state["gemini_keys"]:
-                    with st.spinner("🤝 多 Agent 團隊正在召開投資決策會議 (已啟用穩定快取與防爆額度機制)..."):
+                    with st.spinner("🤝 多 Agent 團隊正在召開投資決策會議..."):
                         try:
                             agent_res = run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, st.session_state["gemini_keys"], custom_query)
                             

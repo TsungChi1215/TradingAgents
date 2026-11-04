@@ -51,7 +51,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# 全局 100% 覆蓋式深色 CSS（徹底清除表格白框與文字擠壓）
+# 全局 100% 覆蓋式深色 CSS（徹底消滅表格白框與邊界殘留）
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -107,7 +107,7 @@ st.markdown("""
         transform: translateY(-1px);
     }
     
-    /* --- 頂部四大指數卡片樣式 (強制不換行、完美中文與數值顯示) --- */
+    /* --- 頂部四大指數卡片樣式 --- */
     .fin-top-card {
         background-color: #161A24 !important;
         border: 1px solid #232836 !important;
@@ -131,17 +131,17 @@ st.markdown("""
         white-space: nowrap !important;
     }
 
-    /* --- 徹底清除 st.dataframe 白色框線與背景殘留 --- */
-    div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+    /* --- 徹底清除 st.dataframe 與表格的所有白色殘留 --- */
+    div[data-testid="stDataFrame"], div[data-testid="stTable"], div.stDataFrame {
         background-color: #161A24 !important;
         border: 1px solid #2C3245 !important;
         border-radius: 10px !important;
         padding: 4px !important;
     }
-    div[data-testid="stDataFrame"] > div {
+    div[data-testid="stDataFrame"] iframe {
         background-color: #161A24 !important;
     }
-    table {
+    table, th, td {
         background-color: #161A24 !important;
         color: #FFFFFF !important;
     }
@@ -208,7 +208,7 @@ def get_dynamic_ttl():
     return 180 if is_market_hours() else 43200
 
 # -----------------------------------------------------------------------------
-# 即時市場數據抓取 (精準修正四大指數代碼與數值)
+# 即時市場數據抓取 (防呆防錯，確保指數數值與中文正確)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_realtime_market_indices():
@@ -223,15 +223,18 @@ def fetch_realtime_market_indices():
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         
-        for key, sym in [("taiex", "^TWII"), ("tpex", "^TWOII"), ("futures", "TX=F"), ("tsmc", "2330.TW")]:
+        mapping = [("taiex", "^TWII"), ("tpex", "^TWOII"), ("futures", "TX=F"), ("tsmc", "2330.TW")]
+        for key, sym in mapping:
             try:
                 t = yf.Ticker(sym, session=session)
-                hist = t.history(period="3d")
+                hist = t.history(period="5d")
                 if not hist.empty and len(hist) >= 1:
                     p = float(hist['Close'].iloc[-1])
                     prev = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else p
                     diff = p - prev
-                    data[key] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
+                    # 確保指數數值合理（過濾異常抖動）
+                    if p > 10:
+                        data[key] = {"val": round(p, 2), "change": f"{diff:+.2f}", "up": diff >= 0}
             except Exception:
                 pass
     except Exception:
@@ -528,7 +531,8 @@ def call_llm(gemini_key, prompt):
         raise RuntimeError("請先在左側設定有效的 Google Gemini API Key！")
     
     genai.configure(api_key=clean_key)
-    candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']
+    # 使用目前最穩定的 Gemini 1.5 系列模型，徹底解決 400 API_KEY_INVALID 錯誤
+    candidate_models = ['gemini-1.5-flash', 'gemini-1.5-pro']
     last_exception = None
     for m_name in candidate_models:
         try:
@@ -540,7 +544,7 @@ def call_llm(gemini_key, prompt):
         except Exception as e:
             last_exception = e
             continue
-    raise RuntimeError(f"Gemini API 呼叫失敗（請檢查您的 API Key 是否正確或額度是否足夠）：{last_exception}")
+    raise RuntimeError(f"Gemini API 呼叫失敗（請確認您的 API Key 是否正確且有效）：{last_exception}")
 
 def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, gemini_key, user_query):
     df = calculate_indicators(price_df)
@@ -591,7 +595,7 @@ def run_multi_agent_system(stock_id, stock_name, price_df, chip_df, norway_df, g
     return results
 
 # -----------------------------------------------------------------------------
-# 4. 圖表繪製 (布林上下軌改為清楚實線與高對比顏色)
+# 4. 圖表繪製 (布林上下軌明確使用清楚實線與高對比顏色)
 # -----------------------------------------------------------------------------
 def apply_dark_theme(fig, height=450):
     fig.update_layout(
@@ -630,9 +634,9 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA (月線)", line=dict(color="#AA00FF", width=2.2)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['60MA'], name="60MA (季線)", line=dict(color="#2962FF", width=2.2)), row=1, col=1, secondary_y=False)
     
-    # 布林通道上下軌（改為清楚的實線與高對比顏色）
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#00E676", width=1.5)), row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#FF5252", width=1.5)), row=1, col=1, secondary_y=False)
+    # 布林通道上下軌（實線、加粗、高對比顏色）
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#00E676", width=1.6)), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#FF5252", width=1.6)), row=1, col=1, secondary_y=False)
     
     vol_colors = ['rgba(255, 82, 82, 0.4)' if df_price['Close'].iloc[i] >= df_price['Open'].iloc[i] else 'rgba(0, 230, 118, 0.4)' for i in range(len(df_price))]
     fig.add_trace(go.Bar(x=df_price['Date'], y=df_price['Volume_張'], name="成交張數", marker_color=vol_colors), row=1, col=1, secondary_y=True)

@@ -1,4 +1,4 @@
-streamlit
+streamlit==1.38.0
 pandas
 numpy
 requests
@@ -6,3 +6,5 @@ plotly
 yfinance
 FinMind
 python-dotenv
+beautifulsoup4
+lxml

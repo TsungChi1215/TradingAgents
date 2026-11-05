@@ -277,12 +277,12 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 多組 API Key 智慧輪替（純 REST API 實作，完美支援 AQ. 與 AIzaSy 憑證）
+# 6. 多組 API Key 智慧輪替（完美支援 AQ. 憑證 Bearer Token 與一般金鑰）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(raw_keys_input, prompt):
     keys_list = parse_api_keys(raw_keys_input)
     if not keys_list:
-        return "⚠️ 尚未設定任何 Google Gemini API Key，請於左側設定欄位輸入。"
+        return "⚠️ 逐漸設定任何 Google Gemini API Key，請於左側設定欄位輸入。"
     
     last_error_msg = ""
     for idx, clean_key in enumerate(keys_list):
@@ -290,6 +290,7 @@ def call_gemini_with_keys_rotation(raw_keys_input, prompt):
             url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             headers = {"Content-Type": "application/json"}
             
+            # 針對 AQ. 格式憑證，使用 Bearer Token 授權以解決 401 問題
             if clean_key.startswith("AQ."):
                 headers["Authorization"] = f"Bearer {clean_key}"
             else:
@@ -303,7 +304,7 @@ def call_gemini_with_keys_rotation(raw_keys_input, prompt):
             resp = requests.post(url, headers=headers, json=payload, timeout=25)
             if resp.status_code == 200:
                 return resp.json()['candidates'][0]['content']['parts'][0]['text']
-            elif resp.status_code in [400, 401, 404, 429]:
+            elif resp.status_code in [400, 401, 403, 404, 429]:
                 last_error_msg = f"Key #{idx+1} 狀態碼 {resp.status_code}"
                 continue
             else:
@@ -339,7 +340,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, 
 
         st.markdown("---")
         st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
-        with st.spinner("AI 專家團隊正在透過 REST API 連線 Gemini 分析中..."):
+        with st.spinner("AI 專家團隊正在透過多組 Key 備援機制連線 Gemini 分析中..."):
             latest = df_calc.iloc[-1]
             prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，請給出繁體中文的技術面、籌碼面與操作建議。"
             ai_result = call_gemini_with_keys_rotation(gemini_keys_input, prompt)

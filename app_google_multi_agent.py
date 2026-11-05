@@ -56,7 +56,6 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 def is_taiwan_market_open():
-    """Refresh window only; this is not a holiday-calendar validator."""
     now = taipei_now()
     weekday, minutes = now.weekday(), now.hour * 60 + now.minute
     if weekday <= 4 and 8 * 60 + 45 <= minutes <= 13 * 60 + 45:
@@ -78,7 +77,6 @@ def taipei_now():
 
 
 def safe_log(source, error):
-    # Never log exception text, request objects, headers or response bodies.
     logger.warning("%s failed (%s)", source, type(error).__name__)
 
 
@@ -124,7 +122,6 @@ def select_tx_near_month(rows, official=False):
         if str(contract).strip() != 'TX':
             continue
         month = str(first_field(row, 'ContractMonth(Week)', 'contract_date') or '').strip()
-        # Exclude spreads and weekly contracts; only monthly outright contracts.
         if not re.fullmatch(r'\d{6}', month):
             continue
         price = as_number(first_field(row, 'Close', 'close'))
@@ -154,7 +151,6 @@ def fetch_realtime_market_data(api_token=''):
     now = taipei_now()
     today_str = now.strftime('%Y-%m-%d')
     start_str = (now - timedelta(days=14)).strftime('%Y-%m-%d')
-    # Official index quotes: do not use individual-stock or total-return indices.
     try:
         payload = market_json('https://mis.twse.com.tw/stock/api/getStockInfo.jsp',
                               params={'ex_ch': 'tse_t00.tw|otc_o00.tw', 'json': '1', 'delay': '0'})
@@ -246,7 +242,7 @@ def fetch_realtime_market_data(api_token=''):
 
 
 # -----------------------------------------------------------------------------
-# 3. 全市場自動選股引擎（優化 4：加上 5 分鐘快取）
+# 3. 全市場自動選股引擎（5 分鐘快取）
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def run_market_screener(stock_dict, strategy_type):
@@ -454,10 +450,9 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎 (優化 1 & 2: 快取與智慧直連)
+# 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎
 # -----------------------------------------------------------------------------
 def clean_and_parse_json(raw_text):
-    """強效 JSON 清洗與容錯解析"""
     if not raw_text:
         return None
     txt = raw_text.strip()
@@ -528,7 +523,6 @@ def discover_gemini_models(_api_key, key_fingerprint):
         for model in result.get('models', []):
             name = model.get('name', '')
             if 'generateContent' in model.get('supportedGenerationMethods', []) and name.startswith('models/gemini-'):
-                # Image/audio-only models are not suitable for text JSON diagnosis.
                 if not any(word in name.lower() for word in ('image', 'tts', 'audio', 'robotics')):
                     models.append(name)
         page_token = result.get('nextPageToken')
@@ -549,25 +543,8 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
     cached = st.session_state.get('_agent_success_cache', {})
     if cache_key in cached and time.time() - cached[cache_key][0] < 1800:
         return cached[cache_key][1], None
-    prompt = f"""
-    你是由 TauricResearch/TradingAgents 密集的 AI 多智能體團隊，正在為台股【{stock_id} {stock_name}】（當前收盤價：{latest_price} 元）進行深度投資裁決會議。
-    請根據以下數據進行內部團隊辯論與風控審核：
-    【技術面數據】：{tech_summary}
-    【籌碼與大股東數據】：{chip_summary}
-
-    請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：
-    {{
-      "volume_price_volatility": "成交量與價格波動分析說明...",
-      "market_stage": "目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...",
-      "key_price_levels": "關鍵價格門檻與支撐壓力位...",
-      "signal_analysis": "技術指標 (RSI/MACD/KD) 訊號評估...",
-      "pattern_recognition": "K線圖表模式與型態識別...",
-      "trend_strength": "趨勢強度與動能綜合評估...",
-      "bull_bear_debate": "看多研究員 vs 看空研究員 辯論焦點說明...",
-      "trader_decision": "交易員最終買賣建議與推薦部位比例...",
-      "risk_management": "風控團隊與投資組合經理最終核准/否決評估、停損價與目標價設定..."
-    }}
-    """
+    
+    prompt = f"你是由 TauricResearch/TradingAgents 密集的 AI 多智能體團隊，正在為台股【{stock_id} {stock_name}】（當前收盤價：{latest_price} 元）進行深度投資裁決會議。\n請根據以下數據進行內部團隊辯論與風控審核：\n【技術面數據】：{tech_summary}\n【籌碼與大股東數據】：{chip_summary}\n\n請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：\n{{\n  \"volume_price_volatility\": \"成交量與價格波動分析說明...\",\n  \"market_stage\": \"目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...\",\n  \"key_price_levels\": \"關鍵價格門檻與支撐壓力位...\",\n  \"signal_analysis\": \"技術指標 (RSI/MACD/KD) 訊號評估...\",\n  \"pattern_recognition\": \"K線圖表模式與型態識別...\",\n  \"trend_strength\": \"趨勢強度與動能綜合評估...\",\n  \"bull_bear_debate\": \"看多研究員 vs 看空研究員 辯論焦點說明...\",\n  \"trader_decision\": \"交易員最終買賣建議與推薦部位比例...\",\n  \"risk_management\": \"風控團隊與投資組合經理最終核准/否決評估、停損價與目標價設定...\"\n}}"
     prompt += '\n僅依提供數據判斷；未提供或未計算的指標須明確標示資料不足，不得捏造。'
     failures = []
     start_idx = int(st.session_state.get('last_working_key_idx', 0)) % len(keys_list)
@@ -626,63 +603,109 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
 
 
 def render_trading_agents_cards(res):
-    """將 TradingAgents 多 Agent 裁決結果渲染為深色卡片」"""
+    """將 TradingAgents 多 Agent 裁決結果改為由上而下、先結論後說明的單欄立體流式排版"""
     if isinstance(res, str):
         st.info(res)
         return
 
-    col1, col2 = st.columns(2)
     card_style = """
         background-color: #1A1E29; 
         border: 1px solid #2A2E3D; 
         border-radius: 12px; 
-        padding: 16px; 
-        margin-bottom: 16px;
+        padding: 20px; 
+        margin-bottom: 18px;
         color: #E0E0E0;
     """
-    
-    with col1:
-        st.markdown(f"""
-            <div style="{card_style}">
-                <div style="color: #FFB74D; font-weight: bold; font-size: 16px; margin-bottom: 8px;">⚡ 成交量和價格波動</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('volume_price_volatility', '數據解析中...')}</div>
-            </div>
-            <div style="{card_style}">
-                <div style="color: #64B5F6; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🧭 目前市場階段</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('market_stage', '數據解析中...')}</div>
-            </div>
-            <div style="{card_style}">
-                <div style="color: #81C784; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🚪 關鍵價格門檻</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('key_price_levels', '數據解析中...')}</div>
-            </div>
-            <div style="{card_style}">
-                <div style="color: #BA68C8; font-weight: bold; font-size: 16px; margin-bottom: 8px;">⚔️ 多空研究員正反辯論</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('bull_bear_debate', '數據解析中...')}</div>
-            </div>
-        """, unsafe_allow_html=True)
 
-    with col2:
-        st.markdown(f"""
-            <div style="{card_style}">
-                <div style="color: #FF8A65; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🎯 訊號分析 (RSI/MACD)</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('signal_analysis', '數據解析中...')}</div>
+    # -------------------------------------------------------------------------
+    # 頂部最顯眼區塊：【先說結論】終極裁決與投資決策結論 (Executive Summary)
+    # -------------------------------------------------------------------------
+    st.markdown(f"""
+        <div style="{card_style}; border: 2px solid #FF5252; background-color: #241920;">
+            <div style="color: #FF5252; font-weight: bold; font-size: 18px; margin-bottom: 12px; border-bottom: 1px solid #FF5252; padding-bottom: 8px;">
+                🏆 終極裁決與投資決策結論 (Executive Summary)
             </div>
-            <div style="{card_style}">
-                <div style="color: #4DD0E1; font-weight: bold; font-size: 16px; margin-bottom: 8px;">📊 圖表模式識別</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('pattern_recognition', '數據解析中...')}</div>
-            </div>
-            <div style="{card_style}">
-                <div style="color: #FFD54F; font-weight: bold; font-size: 16px; margin-bottom: 8px;">⚡ 趨勢強度評估</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('trend_strength', '數據解析中...')}</div>
-            </div>
-            <div style="{card_style}; border: 1px solid #FF5252;">
-                <div style="color: #FF5252; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🛡️ 風險管理與交易員裁決</div>
-                <div style="font-size: 14px; line-height: 1.6;">
-                    <b>交易員決策：</b>{res.get('trader_decision', '')}<br><br>
-                    <b>風控團隊審核：</b>{res.get('risk_management', '')}
+            <div style="font-size: 15px; line-height: 1.7; margin-bottom: 14px;">
+                <span style="color: #FFD54F; font-weight: bold; font-size: 16px;">💡 交易員最終買賣建議與推薦部位比例：</span><br>
+                <div style="margin-top: 6px; padding: 10px 14px; background-color: #1A1E29; border-radius: 8px; color: #FFF; border-left: 4px solid #FFD54F;">
+                    {res.get('trader_decision', '數據解析中...')}
                 </div>
             </div>
-        """, unsafe_allow_html=True)
+            <div style="font-size: 15px; line-height: 1.7;">
+                <span style="color: #FF8A65; font-weight: bold; font-size: 16px;">🛡️ 風控團隊與投資組合經理最終核准/否決評估（含停損與目標價）：</span><br>
+                <div style="margin-top: 6px; padding: 10px 14px; background-color: #1A1E29; border-radius: 8px; color: #FFF; border-left: 4px solid #FF5252;">
+                    {res.get('risk_management', '數據解析中...')}
+                </div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # -------------------------------------------------------------------------
+    # 依序加入各順序的詳細說明區塊 (由上而下縱向排版)
+    # -------------------------------------------------------------------------
+    
+    # 1. 目前市場階段與關鍵價格門檻
+    st.markdown(f"""
+        <div style="{card_style}">
+            <div style="color: #64B5F6; font-weight: bold; font-size: 16px; margin-bottom: 12px; border-bottom: 1px solid #2A2E3D; padding-bottom: 6px;">
+                1. 🧭 目前市場階段評估與關鍵價格門檻
+            </div>
+            <div style="font-size: 14.5px; line-height: 1.7; margin-bottom: 12px;">
+                <b style="color: #90CAF9;">【市場階段評估】：</b><br>
+                <div style="margin-top: 4px; padding-left: 8px;">{res.get('market_stage', '數據解析中...')}</div>
+            </div>
+            <div style="font-size: 14.5px; line-height: 1.7;">
+                <b style="color: #A5D6A7;">【關鍵價格門檻與支撐壓力位】：</b><br>
+                <div style="margin-top: 4px; padding-left: 8px;">{res.get('key_price_levels', '數據解析中...')}</div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # 2. 成交量與價格波動與趨勢動能
+    st.markdown(f"""
+        <div style="{card_style}">
+            <div style="color: #FFB74D; font-weight: bold; font-size: 16px; margin-bottom: 12px; border-bottom: 1px solid #2A2E3D; padding-bottom: 6px;">
+                2. ⚡ 成交量、價格波動與趨勢動能評估
+            </div>
+            <div style="font-size: 14.5px; line-height: 1.7; margin-bottom: 12px;">
+                <b style="color: #FFE082;">【成交量與價格波動分析】：</b><br>
+                <div style="margin-top: 4px; padding-left: 8px;">{res.get('volume_price_volatility', '數據解析中...')}</div>
+            </div>
+            <div style="font-size: 14.5px; line-height: 1.7;">
+                <b style="color: #FFF59D;">【趨勢強度與動能評估】：</b><br>
+                <div style="margin-top: 4px; padding-left: 8px;">{res.get('trend_strength', '數據解析中...')}</div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # 3. 技術指標與型態特徵分析
+    st.markdown(f"""
+        <div style="{card_style}">
+            <div style="color: #4DD0E1; font-weight: bold; font-size: 16px; margin-bottom: 12px; border-bottom: 1px solid #2A2E3D; padding-bottom: 6px;">
+                3. 🎯 技術指標訊號與 K 線型態識別
+            </div>
+            <div style="font-size: 14.5px; line-height: 1.7; margin-bottom: 12px;">
+                <b style="color: #80DEEA;">【技術指標 (RSI/MACD/KD) 訊號評估】：</b><br>
+                <div style="margin-top: 4px; padding-left: 8px;">{res.get('signal_analysis', '數據解析中...')}</div>
+            </div>
+            <div style="font-size: 14.5px; line-height: 1.7;">
+                <b style="color: #B2EBF2;">【K 線圖表模式與型態識別】：</b><br>
+                <div style="margin-top: 4px; padding-left: 8px;">{res.get('pattern_recognition', '數據解析中...')}</div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # 4. 多空研究員辯論焦點
+    st.markdown(f"""
+        <div style="{card_style}">
+            <div style="color: #BA68C8; font-weight: bold; font-size: 16px; margin-bottom: 12px; border-bottom: 1px solid #2A2E3D; padding-bottom: 6px;">
+                4. ⚔️ 看多研究員 vs 看空研究員 正反辯論焦點 (Bull vs Bear Debate)
+            </div>
+            <div style="font-size: 14.5px; line-height: 1.7; padding-left: 8px;">
+                {res.get('bull_bear_debate', '數據解析中...')}
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # 7. 共用診斷渲染引擎
@@ -737,7 +760,7 @@ with st.sidebar:
     end_date = st.date_input("結束日期", value=taipei_now())
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四大指數獨立區塊（優化 3：僅在盤中交易時間 60 秒自動重新整理）
+# 9. 頂部四大指數獨立區塊（僅在盤中交易時間 60 秒自動重新整理）
 # -----------------------------------------------------------------------------
 run_interval = 60 if is_taiwan_market_open() else None
 

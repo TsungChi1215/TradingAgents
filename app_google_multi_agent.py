@@ -25,6 +25,29 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# 注入行動端滿版 CSS：自動偵測手機螢幕並把左右邊界壓縮至極致
+st.markdown("""
+    <style>
+    @media (max-width: 768px) {
+        /* 移除手機端 Streamlit 主區塊左右預設留白 */
+        .main .block-container {
+            padding-left: 0.25rem !important;
+            padding-right: 0.25rem !important;
+            padding-top: 1rem !important;
+            max-width: 100% !important;
+        }
+        /* 強制 Plotly 繪圖元件擴展至 100% 手機寬度 */
+        div[data-testid="stPlotlyChart"] {
+            width: 100% !important;
+        }
+        div[data-testid="stPlotlyChart"] > div {
+            width: 100% !important;
+        }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+
 if "selected_stock_code" not in st.session_state:
     st.session_state["selected_stock_code"] = "2356"
 
@@ -376,43 +399,18 @@ def calculate_indicators(df_price):
     return df
 
 # -----------------------------------------------------------------------------
-# 5. Plotly 圖表繪製 (手機端完美抗重疊與極致寬度最佳化)
+# 5. Plotly 圖表繪製
 # -----------------------------------------------------------------------------
-def apply_dark_theme(fig, height=520):
+def apply_dark_theme(fig, height=450, title=""):
     fig.update_layout(
-        template="plotly_dark",
-        height=height,
-        margin=dict(l=10, r=10, t=45, b=30),
-        hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
-            font=dict(size=10.5, color="#CFD8DC"),
-            bgcolor="rgba(0,0,0,0)"
-        ),
-        autosize=True
+        template="plotly_dark", height=height, margin=dict(l=25, r=25, t=45, b=25),
+        hovermode="x unified", title=dict(text=title, font=dict(color="#00E676", size=15))
     )
-    fig.update_xaxes(
-        showgrid=True,
-        gridwidth=1,
-        gridcolor="#232836",
-        type='category',
-        tickangle=-45,
-        nticks=6,
-        tickfont=dict(size=10)
-    )
-    fig.update_yaxes(
-        showgrid=True,
-        gridwidth=1,
-        gridcolor="#232836",
-        tickfont=dict(size=10)
-    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836")
     return fig
 
-def plot_main_kline_chart(price_df, display_start_date):
+def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     df_calc = calculate_indicators(price_df)
     df_price = df_calc[df_calc['Date'] >= display_start_date].copy()
     fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
@@ -427,10 +425,10 @@ def plot_main_kline_chart(price_df, display_start_date):
     fig.add_trace(go.Bar(x=df_price['Date'], y=df_price['Volume_張'], name="成交張數", marker_color=vol_colors), secondary_y=True)
     
     max_vol = df_price['Volume_張'].max() if not df_price.empty else 10000
-    fig.update_yaxes(title_text="", secondary_y=False)
-    fig.update_yaxes(title_text="", range=[0, max_vol * 3.5], secondary_y=True, showgrid=False)
+    fig.update_yaxes(title_text="價格 (元)", secondary_y=False)
+    fig.update_yaxes(title_text="成交量 (張)", range=[0, max_vol * 3.5], secondary_y=True, showgrid=False)
     fig.update_xaxes(rangeslider_visible=False)
-    return apply_dark_theme(fig, height=520)
+    return apply_dark_theme(fig, height=500, title=f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
 
 def plot_chip_chart(chip_df, display_start_date):
     fig = go.Figure()
@@ -451,7 +449,7 @@ def plot_chip_chart(chip_df, display_start_date):
                 colors = np.where(vals >= 0, '#FF5252', '#00E676')
                 fig.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=colors))
     fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360)
+    return apply_dark_theme(fig, height=360, title="🏛️ 三大法人每日淨買賣超 (張 - 紅買綠賣)")
 
 def plot_margin_chart(margin_df, display_start_date):
     fig = go.Figure()
@@ -465,15 +463,14 @@ def plot_margin_chart(margin_df, display_start_date):
             diff = (margin_sub[m_buy[0]] - margin_sub[m_sell[0]]) / 1000
             fig.add_trace(go.Bar(x=margin_sub[d_col], y=diff.round(0), name="融資增減(張)", marker_color=np.where(diff >= 0, '#FF5252', '#00E676')))
     fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360)
+    return apply_dark_theme(fig, height=360, title="💳 融資餘額每日增減變化 (張 - 紅增綠減)")
 
-def plot_norway_pyramid_chart(norway_df):
+def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     if not norway_df.empty:
-        formatted_date = norway_df['Date'].astype(str).apply(lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d)==8 else d)
-        fig.add_trace(go.Bar(x=formatted_date, y=norway_df['Total_People'], name="總股東人數(人)", marker_color='#546E7A', opacity=0.8), secondary_y=False)
-        fig.add_trace(go.Scatter(x=formatted_date, y=norway_df['Big_Ratio'], name="大股東持股率(%)", mode="lines+markers", line=dict(color="#FF9100", width=2.5), marker=dict(size=4, color="#FFFFFF")), secondary_y=True)
-    return apply_dark_theme(fig, height=380)
+        fig.add_trace(go.Bar(x=norway_df['Date'], y=norway_df['Total_People'], name="總股東人數(人)", marker_color='#546E7A', opacity=0.8), secondary_y=False)
+        fig.add_trace(go.Scatter(x=norway_df['Date'], y=norway_df['Big_Ratio'], name="大股東持股率(%)", mode="lines+markers", line=dict(color="#FF9100", width=2.5), marker=dict(size=5, color="#FFFFFF")), secondary_y=True)
+    return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
 # 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎
@@ -750,18 +747,10 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     if not price_df.empty:
         df_calc = calculate_indicators(price_df)
         
-        # 標題獨立顯示，完全避免 Plotly 內部標題與多行圖例重疊
-        st.markdown(f"### 📈 {stock_id} {stock_name} 股價 K 線與布林通道")
-        st.plotly_chart(plot_main_kline_chart(price_df, s_str), use_container_width=True)
-        
-        st.markdown("### 🏛️ 三大法人每日淨買賣超 (張 - 紅買綠賣)")
-        st.plotly_chart(plot_chip_chart(chip_df, s_str), use_container_width=True)
-        
-        st.markdown("### 💳 融資餘額每日增減變化 (張 - 紅增綠減)")
-        st.plotly_chart(plot_margin_chart(margin_df, s_str), use_container_width=True)
-        
-        st.markdown(f"### 🏛️ {stock_id} {stock_name} 神秘金字塔 (股東人數 vs 大股東持股率)")
-        st.plotly_chart(plot_norway_pyramid_chart(norway_df), use_container_width=True)
+        st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_str))
+        st.plotly_chart(plot_chip_chart(chip_df, s_str))
+        st.plotly_chart(plot_margin_chart(margin_df, s_str))
+        st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name))
 
         st.markdown("---")
         st.markdown("## 🤖 TradingAgents 多 Agent 投資診斷會議與終極裁決")

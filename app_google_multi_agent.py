@@ -77,7 +77,6 @@ def fetch_realtime_market_data(api_token=""):
     today_str = datetime.today().strftime("%Y-%m-%d")
     start_str = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
     
-    # 嘗試初始化 FinMind
     fm = None
     try:
         from FinMind.data import DataLoader
@@ -99,7 +98,7 @@ def fetch_realtime_market_data(api_token=""):
 
     if "taiex" not in data:
         try:
-            url_fmtqik = "[https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK](https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK)"
+            url_fmtqik = "https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK"
             resp = requests.get(url_fmtqik, timeout=5)
             if resp.status_code == 200 and len(resp.json()) > 0:
                 latest = resp.json()[-1]
@@ -121,10 +120,9 @@ def fetch_realtime_market_data(api_token=""):
                 data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
         except Exception: pass
 
-    # 櫃買中心 (TPEx) 官方 OpenAPI 備援
     if "tpex" not in data:
         try:
-            url_tpex = "[https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes](https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes)"
+            url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
             resp = requests.get(url_tpex, timeout=5)
             if resp.status_code == 200:
                 items = resp.json()
@@ -155,10 +153,9 @@ def fetch_realtime_market_data(api_token=""):
                             data["futures"] = {"val": val, "change": prev, "name": "台指近月 (TX)"}
         except Exception: pass
 
-    # 期交所 (TAIFEX) 官方 API 備援
     if "futures" not in data:
         try:
-            url_taifex = "[https://openapi.taifex.com.tw/v1/DailyMarketReport](https://openapi.taifex.com.tw/v1/DailyMarketReport)"
+            url_taifex = "https://openapi.taifex.com.tw/v1/DailyMarketReport"
             resp = requests.get(url_taifex, timeout=5)
             if resp.status_code == 200:
                 raw_f = resp.json()
@@ -183,7 +180,7 @@ def fetch_realtime_market_data(api_token=""):
 
     if "tsmc" not in data:
         try:
-            url_twse = "[https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL](https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL)"
+            url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
             resp = requests.get(url_twse, timeout=5)
             if resp.status_code == 200:
                 for item in resp.json():
@@ -198,10 +195,11 @@ def fetch_realtime_market_data(api_token=""):
     return data
 
 # -----------------------------------------------------------------------------
-# 3. 全市場自動選股引擎
+# 3. 全市場自動選股引擎（優化 4：加上 5 分鐘快取）
 # -----------------------------------------------------------------------------
+@st.cache_data(ttl=300)
 def run_market_screener(stock_dict, strategy_type):
-    url_twse = "[https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL](https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL)"
+    url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     try:
         resp = requests.get(url_twse, timeout=10)
         if resp.status_code == 200:
@@ -282,7 +280,7 @@ def fetch_margin_history_cached(stock_id, start_date, end_date, api_token=""):
 
 @st.cache_data(ttl=86400)
 def get_norway_big_shareholders(stock_id):
-    url = f"[https://norway.twsthr.info/StockHolders.aspx?stock=](https://norway.twsthr.info/StockHolders.aspx?stock=){stock_id}"
+    url = f"https://norway.twsthr.info/StockHolders.aspx?stock={stock_id}"
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         if resp.status_code == 200:
@@ -405,10 +403,10 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎
+# 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎 (優化 1 & 2: 快取與智慧直連)
 # -----------------------------------------------------------------------------
 def clean_and_parse_json(raw_text):
-    """強效 JSON 清洗與容錯解析，防止格式微瑕疵導致全盤連線失敗報錯"""
+    """強效 JSON 清洗與容錯解析"""
     if not raw_text:
         return None
     txt = raw_text.strip()
@@ -420,7 +418,6 @@ def clean_and_parse_json(raw_text):
     try:
         return json.loads(txt)
     except Exception:
-        # 正則表達式抓取第一組完整 JSON {}
         match = re.search(r'\{.*\}', txt, re.DOTALL)
         if match:
             try:
@@ -428,6 +425,7 @@ def clean_and_parse_json(raw_text):
             except Exception: pass
     return None
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, chip_summary):
     raw_keys = get_secret("GEMINI_API_KEY", "")
     keys_list = parse_api_keys(raw_keys)
@@ -457,7 +455,11 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
     models_to_try = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-flash-latest']
     log_errs = []
     
-    for idx, clean_key in enumerate(keys_list):
+    # 智慧排序 Key：優先從上一次成功的 Key 開始試驗
+    last_working_key_idx = st.session_state.get("last_working_key_idx", 0)
+    ordered_keys = keys_list[last_working_key_idx:] + keys_list[:last_working_key_idx]
+
+    for idx, clean_key in enumerate(ordered_keys):
         for m in models_to_try:
             # SDK 方式呼叫
             try:
@@ -466,33 +468,34 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
                 response = client.models.generate_content(model=m, contents=prompt)
                 if response and response.text:
                     parsed = clean_and_parse_json(response.text)
+                    st.session_state["last_working_key_idx"] = keys_list.index(clean_key)
                     if parsed:
                         return parsed, None
-                    # 若 JSON 解析失敗，平滑降級傳回純文字，絕不掛掉
                     return {"volume_price_volatility": response.text}, None
             except Exception as e_sdk:
-                log_errs.append(f"Key #{idx+1} ({m}) SDK Error: {e_sdk}")
+                log_errs.append(f"Key ({m}) SDK Error: {e_sdk}")
 
             # REST 備援方式呼叫
             try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={clean_key}"
+                url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){m}:generateContent?key={clean_key}"
                 headers = {"Content-Type": "application/json"}
                 payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                resp = requests.post(url, headers=headers, json=payload, timeout=15)
+                resp = requests.post(url, headers=headers, json=payload, timeout=12)
                 if resp.status_code == 200:
                     res_json = resp.json()
                     if 'candidates' in res_json:
                         txt = res_json['candidates'][0]['content']['parts'][0]['text']
                         parsed = clean_and_parse_json(txt)
+                        st.session_state["last_working_key_idx"] = keys_list.index(clean_key)
                         if parsed:
                             return parsed, None
                         return {"volume_price_volatility": txt}, None
                 else:
-                    log_errs.append(f"Key #{idx+1} ({m}) REST HTTP {resp.status_code}")
+                    log_errs.append(f"Key ({m}) REST HTTP {resp.status_code}")
             except Exception as e_rest:
-                log_errs.append(f"Key #{idx+1} ({m}) REST Error: {e_rest}")
+                log_errs.append(f"Key ({m}) REST Error: {e_rest}")
 
-    err_detail = " | ".join(log_errs[:3]) # 顯示前三條詳細紀錄
+    err_detail = " | ".join(log_errs[:3])
     return None, f"❌ 所有 Secrets 中的 API Key 均連線失敗。\n測試日誌：{err_detail}"
 
 def render_trading_agents_cards(res):
@@ -607,9 +610,9 @@ with st.sidebar:
     end_date = st.date_input("結束日期", value=datetime.today())
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四大指數獨立區塊（僅在盤中交易時間 5 秒自動重新整理）
+# 9. 頂部四大指數獨立區塊（優化 3：僅在盤中交易時間 60 秒自動重新整理）
 # -----------------------------------------------------------------------------
-run_interval = 5 if is_taiwan_market_open() else None
+run_interval = 60 if is_taiwan_market_open() else None
 
 @st.fragment(run_every=run_interval)
 def render_market_ticker():

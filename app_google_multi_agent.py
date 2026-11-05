@@ -1,8 +1,6 @@
 import os
 import json
 import re
-import time
-import logging
 import pandas as pd
 import numpy as np
 import requests
@@ -10,14 +8,15 @@ import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-from datetime import datetime, timedelta
-
-# 設定內部安全日誌
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TradingAgents")
+from datetime import datetime, timedelta, timezone
+import logging
+import time
+import random
+import hashlib
+import html
 
 # -----------------------------------------------------------------------------
-# 1. 系統設定與金鑰安全解析
+# 1. 系統設定與金鑰解析
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="TradingAgents - 專業金融量化選股終端",
@@ -56,177 +55,198 @@ def parse_api_keys(raw_input):
         parts = [cleaned]
     return [p for p in parts if p]
 
-def mask_api_key(key):
-    """遮罩 API Key 避免於前端與 Log 中洩漏敏感資訊"""
-    if not key or len(key) < 10:
-        return "****"
-    return f"{key[:4]}...{key[-4:]}"
-
 def is_taiwan_market_open():
-    """判斷當前是否處於台股一般交易時段 (08:45 - 13:45) 或期貨夜盤 (15:00 - 05:00)"""
-    now = datetime.now()
-    if now.weekday() in [5, 6]:
-        return False
-    
-    t = now.time()
-    day_open = datetime.strptime("08:45", "%H:%M").time()
-    day_close = datetime.strptime("13:45", "%H:%M").time()
-    night_open = datetime.strptime("15:00", "%H:%M").time()
-    night_close = datetime.strptime("05:00", "%H:%M").time()
-    
-    if day_open <= t <= day_close:
+    """Refresh window only; this is not a holiday-calendar validator."""
+    now = taipei_now()
+    weekday, minutes = now.weekday(), now.hour * 60 + now.minute
+    if weekday <= 4 and 8 * 60 + 45 <= minutes <= 13 * 60 + 45:
         return True
-    if t >= night_open or t <= night_close:
+    if weekday <= 4 and minutes >= 15 * 60:
         return True
-    return False
+    return weekday in (1, 2, 3, 4, 5) and minutes <= 5 * 60
+
 
 # -----------------------------------------------------------------------------
-# 2. 四大指數與台積電精準介接與備援抓取
+# 2. 四大指數與台積電三重備援抓取（證交所/櫃買中心/期交所 官方 API 串接）
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=15)
-def fetch_realtime_market_data(api_token=""):
-    data = {}
-    today_str = datetime.today().strftime("%Y-%m-%d")
-    start_str = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
-    
+TAIPEI = timezone(timedelta(hours=8))
+logger = logging.getLogger("trading_agents")
+
+
+def taipei_now():
+    return datetime.now(TAIPEI)
+
+
+def safe_log(source, error):
+    # Never log exception text, request objects, headers or response bodies.
+    logger.warning("%s failed (%s)", source, type(error).__name__)
+
+
+def as_number(value):
+    if value is None:
+        return None
+    text = str(value).strip().replace(',', '').replace('−', '-').replace('＋', '+')
+    if text in ('', '--', '-', 'None', 'nan', 'NaN'):
+        return None
+    try:
+        number = float(text)
+        return number if np.isfinite(number) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def first_field(row, *names):
+    for name in names:
+        if name in row and row[name] not in (None, ''):
+            return row[name]
+    return None
+
+
+def market_json(url, **kwargs):
+    response = requests.get(url, timeout=(5, 12),
+                            headers={'User-Agent': 'Mozilla/5.0'}, **kwargs)
+    response.raise_for_status()
+    return response.json()
+
+
+def quote_record(value, change, source, date='', **extra):
+    value = as_number(value)
+    if value is None or value <= 0:
+        raise ValueError('No valid positive price')
+    return dict(val=value, change=as_number(change), source=source,
+                date=str(date or ''), **extra)
+
+
+def select_tx_near_month(rows, official=False):
+    candidates = []
+    for row in rows:
+        contract = first_field(row, 'Contract', 'futures_id', 'stock_id')
+        if str(contract).strip() != 'TX':
+            continue
+        month = str(first_field(row, 'ContractMonth(Week)', 'contract_date') or '').strip()
+        # Exclude spreads and weekly contracts; only monthly outright contracts.
+        if not re.fullmatch(r'\d{6}', month):
+            continue
+        price = as_number(first_field(row, 'Close', 'close'))
+        if price is None or price <= 0:
+            continue
+        date = str(first_field(row, 'Date', 'date') or '')
+        date_key = re.sub(r'\D', '', date)
+        if len(date_key) == 7:
+            date_key = str(int(date_key[:3]) + 1911) + date_key[3:]
+        session = str(first_field(row, 'TradingSession', 'trading_session') or '')
+        rank = 0 if session.lower() in ('position', '一般', '一般交易時段', 'regular') else 1
+        candidates.append((date_key, month, rank, row, session))
+    if not candidates:
+        raise ValueError('No valid TX monthly contract')
+    latest = max(item[0] for item in candidates)
+    subset = [item for item in candidates if item[0] == latest]
+    _, month, _, row, session = min(subset, key=lambda item: (item[1], item[2]))
+    change = first_field(row, 'Change', 'spread')
+    return quote_record(first_field(row, 'Close', 'close'), change,
+                        'TAIFEX 日行情' if official else 'FinMind 日行情',
+                        first_field(row, 'Date', 'date'), contract=month, session=session)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_realtime_market_data(api_token=''):
+    data, errors = {}, {}
+    now = taipei_now()
+    today_str = now.strftime('%Y-%m-%d')
+    start_str = (now - timedelta(days=14)).strftime('%Y-%m-%d')
+    # Official index quotes: do not use individual-stock or total-return indices.
+    try:
+        payload = market_json('https://mis.twse.com.tw/stock/api/getStockInfo.jsp',
+                              params={'ex_ch': 'tse_t00.tw|otc_o00.tw', 'json': '1', 'delay': '0'})
+        for row in payload.get('msgArray', []):
+            key = {'t00': 'taiex', 'o00': 'tpex'}.get(str(row.get('ch', '')).split('.')[0])
+            if not key:
+                continue
+            value, previous = as_number(row.get('z')), as_number(row.get('y'))
+            if value is not None and value > 0:
+                data[key] = quote_record(value, value - previous if previous else None,
+                                         'TWSE MIS 指數報價', row.get('d', ''), time=row.get('t', ''))
+    except Exception as exc:
+        safe_log('official index quotes', exc)
+    if 'taiex' not in data:
+        try:
+            rows = market_json('https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK')
+            row = max(rows, key=lambda r: re.sub(r'\D', '', str(r.get('Date', ''))))
+            data['taiex'] = quote_record(row.get('INDEXTAIEX'), row.get('Change'),
+                                         'TWSE 日行情', row.get('Date'))
+        except Exception as exc:
+            errors['taiex'] = '加權指數來源暫時無法取得有效資料'
+            safe_log('TWSE TAIEX', exc)
+    if 'tpex' not in data:
+        try:
+            rows = market_json('https://www.tpex.org.tw/openapi/v1/tpex_index')
+            if not isinstance(rows, list):
+                raise ValueError('Unexpected TPEx response')
+            matches = []
+            for row in rows:
+                name = str(first_field(row, 'IndexName', 'Name', '指數名稱') or '').strip()
+                code = str(first_field(row, 'IndexCode', 'Code') or '').strip()
+                if name in ('櫃買指數', '櫃買加權指數', 'TPEX', 'TPEx Index',
+                            'TPEx Exchange Capitalization Weighted Stock Index') or code == '101':
+                    matches.append(row)
+            if not matches:
+                raise ValueError('TPEx index schema/name not recognized')
+            row = max(matches, key=lambda r: str(first_field(r, 'Date', '日期') or ''))
+            data['tpex'] = quote_record(first_field(row, 'Close', 'Index', 'ClosingIndex', '收盤指數'),
+                                        first_field(row, 'Change', '漲跌'), 'TPEx 指數日行情',
+                                        first_field(row, 'Date', '日期'))
+        except Exception as exc:
+            errors['tpex'] = '櫃買指數來源暫時無法取得有效資料'
+            safe_log('TPEx index', exc)
     fm = None
     try:
         from FinMind.data import DataLoader
         fm = DataLoader()
-        if api_token: fm.login_by_token(api_token.strip())
-    except Exception as e:
-        logger.warning(f"FinMind 載入失敗: {e}")
-
-    # --- 1. 加權指數 (TAIEX) ---
-    if fm:
+        if api_token:
+            fm.login_by_token(str(api_token).strip())
+    except Exception as exc:
+        safe_log('FinMind initialization', exc)
+    if fm is not None:
         try:
-            df_taiex = fm.taiwan_stock_daily(stock_id="TAIEX", start_date=start_str, end_date=today_str)
-            if df_taiex.empty:
-                df_taiex = fm.taiwan_stock_daily(stock_id="001", start_date=start_str, end_date=today_str)
-            if not df_taiex.empty:
-                val = float(df_taiex['close'].iloc[-1])
-                prev = float(df_taiex['close'].iloc[-2]) if len(df_taiex) > 1 else val
-                data["taiex"] = {"val": val, "change": val - prev, "name": "加權指數 (TAIEX)"}
-        except Exception as e:
-            logger.warning(f"FinMind TAIEX 抓取失敗: {e}")
-
-    if "taiex" not in data:
+            frame = fm.taiwan_futures_daily(futures_id='TX', start_date=start_str, end_date=today_str)
+            data['futures'] = select_tx_near_month(frame.to_dict('records'))
+        except Exception as exc:
+            safe_log('FinMind TX', exc)
         try:
-            url_fmtqik = "https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK"
-            resp = requests.get(url_fmtqik, timeout=5)
-            if resp.status_code == 200 and len(resp.json()) > 0:
-                latest = resp.json()[-1]
-                val = float(str(latest.get("INDEXTAIEX", 0)).replace(",", ""))
-                change = float(str(latest.get("Change", 0)).replace(",", ""))
-                if val > 0:
-                    data["taiex"] = {"val": val, "change": change, "name": "加權指數 (TAIEX)"}
-        except Exception as e:
-            logger.warning(f"TWSE 備援 TAIEX 抓取失敗: {e}")
-
-    # --- 2. 櫃買指數 (TPEX) ---
-    if fm:
+            frame = fm.taiwan_stock_daily(stock_id='2330', start_date=start_str, end_date=today_str)
+            frame = frame.copy()
+            frame['close'] = pd.to_numeric(frame['close'], errors='coerce')
+            frame = frame[frame['close'] > 0].sort_values('date')
+            row = frame.iloc[-1]
+            change = as_number(row.get('spread'))
+            if change is None and len(frame) > 1:
+                change = float(row['close']) - float(frame.iloc[-2]['close'])
+            data['tsmc'] = quote_record(row['close'], change, 'FinMind 日行情', row['date'])
+        except Exception as exc:
+            safe_log('FinMind 2330', exc)
+    if 'futures' not in data:
         try:
-            # 修正：FinMind 官方規定櫃買指數代碼為 'TPEx' (注意大小寫)
-            df_tpex = fm.taiwan_stock_daily(stock_id="TPEx", start_date=start_str, end_date=today_str)
-            if not df_tpex.empty:
-                val = float(df_tpex['close'].iloc[-1])
-                prev = float(df_tpex['close'].iloc[-2]) if len(df_tpex) > 1 else val
-                data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
-        except Exception as e:
-            logger.warning(f"FinMind TPEx 抓取失敗: {e}")
-
-    if "tpex" not in data:
+            rows = market_json('https://openapi.taifex.com.tw/v1/DailyMarketReportFut')
+            data['futures'] = select_tx_near_month(rows, official=True)
+        except Exception as exc:
+            errors['futures'] = '台指期來源暫時無法取得有效資料'
+            safe_log('TAIFEX TX', exc)
+    if 'tsmc' not in data:
         try:
-            # 修正：使用真正的櫃買指數 OpenAPI 端點，而非個股收盤行情表
-            url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_index"
-            resp = requests.get(url_tpex, timeout=5)
-            if resp.status_code == 200:
-                items = resp.json()
-                if isinstance(items, list) and len(items) > 0:
-                    for item in reversed(items):
-                        close_v = float(str(item.get("Close", item.get("Index", 0))).replace(",", ""))
-                        change_v = float(str(item.get("Change", 0)).replace(",", ""))
-                        if close_v > 0:
-                            data["tpex"] = {"val": close_v, "change": change_v, "name": "櫃買指數 (TPEX)"}
-                            break
-        except Exception as e:
-            logger.warning(f"TPEX 官方備援抓取失敗: {e}")
-
-    # --- 3. 台指期近月 (TX) ---
-    if fm:
-        try:
-            # 修正：顯式帶入 futures_id="TX" 限制商品
-            df_futures = fm.taiwan_futures_daily(futures_id="TX", start_date=start_str, end_date=today_str)
-            if not df_futures.empty:
-                df_tx = df_futures.sort_values(by='date', ascending=True)
-                latest_date = df_tx['date'].max()
-                df_tx_latest = df_tx[df_tx['date'] == latest_date]
-                
-                # 若有契約月份，優先挑選近月契約
-                if 'contract_date' in df_tx_latest.columns:
-                    df_tx_latest = df_tx_latest.sort_values(by='contract_date')
-                
-                if not df_tx_latest.empty:
-                    val = float(df_tx_latest['close'].iloc[0])
-                    open_p = float(df_tx_latest['open'].iloc[0]) if 'open' in df_tx_latest.columns else val
-                    data["futures"] = {"val": val, "change": val - open_p, "name": "台指近月 (TX)"}
-        except Exception as e:
-            logger.warning(f"FinMind Futures TX 抓取失敗: {e}")
-
-    if "futures" not in data:
-        try:
-            # 修正：端點路徑補上 Fut 成為 DailyMarketReportFut
-            url_taifex = "https://openapi.taifex.com.tw/v1/DailyMarketReportFut"
-            resp = requests.get(url_taifex, timeout=5)
-            if resp.status_code == 200:
-                raw_f = resp.json()
-                tx_rows = []
-                for row in raw_f:
-                    contract = str(row.get("Contract", row.get("CommodityID", ""))).strip()
-                    if contract == "TX":
-                        tx_rows.append(row)
-                
-                if tx_rows:
-                    # 排序選取近月契約 (ContractMonth/Week)
-                    tx_rows.sort(key=lambda x: str(x.get("ContractMonth(Week)", "999999")))
-                    target = tx_rows[0]
-                    close_p = float(str(target.get("Close", target.get("Last", 0))).replace(",", ""))
-                    open_p = float(str(target.get("Open", close_p)).replace(",", ""))
-                    if close_p > 0:
-                        data["futures"] = {"val": close_p, "change": close_p - open_p, "name": "台指近月 (TX)"}
-        except Exception as e:
-            logger.warning(f"TAIFEX 備援 TX 抓取失敗: {e}")
-
-    # --- 4. 台積電 (2330) ---
-    if fm:
-        try:
-            df_tsmc = fm.taiwan_stock_daily(stock_id="2330", start_date=start_str, end_date=today_str)
-            if not df_tsmc.empty:
-                val = float(df_tsmc['close'].iloc[-1])
-                prev = float(df_tsmc['close'].iloc[-2]) if len(df_tsmc) > 1 else val
-                data["tsmc"] = {"val": val, "change": val - prev, "name": "台積電 (2330)"}
-        except Exception as e:
-            logger.warning(f"FinMind 2330 抓取失敗: {e}")
-
-    if "tsmc" not in data:
-        try:
-            url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-            resp = requests.get(url_twse, timeout=5)
-            if resp.status_code == 200:
-                for item in resp.json():
-                    if str(item.get("Code", "")).strip() == "2330":
-                        close_p = float(str(item.get("ClosingPrice", 0)).replace(",", ""))
-                        open_p = float(str(item.get("OpeningPrice", close_p)).replace(",", ""))
-                        if close_p > 0:
-                            data["tsmc"] = {"val": close_p, "change": close_p - open_p, "name": "台積電 (2330)"}
-                            break
-        except Exception as e:
-            logger.warning(f"TWSE 備援 2330 抓取失敗: {e}")
-
+            rows = market_json('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL')
+            row = next(r for r in rows if str(r.get('Code', '')).strip() == '2330')
+            data['tsmc'] = quote_record(row.get('ClosingPrice'), row.get('Change'),
+                                        'TWSE 日行情', row.get('Date'))
+        except Exception as exc:
+            errors['tsmc'] = '台積電來源暫時無法取得有效資料'
+            safe_log('TWSE 2330', exc)
+    data['_errors'] = errors
+    data['_fetched_at'] = now.isoformat()
     return data
 
+
 # -----------------------------------------------------------------------------
-# 3. 全市場自動選股引擎
+# 3. 全市場自動選股引擎（優化 4：加上 5 分鐘快取）
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def run_market_screener(stock_dict, strategy_type):
@@ -259,8 +279,7 @@ def run_market_screener(stock_dict, strategy_type):
                 df_res = pd.DataFrame(selected_list)
                 sort_col = '漲幅(%)' if strategy_type == "短線強勢爆發" else '成交量(張)'
                 return df_res.sort_values(by=sort_col, ascending=False).head(30)
-    except Exception as e:
-        logger.error(f"選股引擎執行失敗: {e}")
+    except Exception: pass
     return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
@@ -435,7 +454,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 安全、防護降級與包含退避重試的 TradingAgents LLM 裁決引擎
+# 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎 (優化 1 & 2: 快取與智慧直連)
 # -----------------------------------------------------------------------------
 def clean_and_parse_json(raw_text):
     """強效 JSON 清洗與容錯解析"""
@@ -457,95 +476,154 @@ def clean_and_parse_json(raw_text):
             except Exception: pass
     return None
 
-@st.cache_data(ttl=1800, show_spinner=False)
+class GeminiCallError(Exception):
+    def __init__(self, status, category):
+        self.status = status
+        self.category = category
+        super().__init__(category)
+
+
+def gemini_request(method, path, key, deadline=None, **kwargs):
+    transient = {429, 500, 502, 503, 504}
+    for attempt in range(3):
+        remaining = (deadline - time.monotonic()) if deadline is not None else 30
+        if remaining <= 1:
+            raise GeminiCallError(0, 'timeout')
+        try:
+            response = requests.request(
+                method, 'https://generativelanguage.googleapis.com/v1beta/' + path,
+                headers={'x-goog-api-key': key, 'Content-Type': 'application/json'},
+                timeout=(min(5, remaining / 2), min(25, remaining / 2)), **kwargs)
+        except requests.RequestException as exc:
+            safe_log('Gemini transport', exc)
+            if attempt == 2:
+                raise GeminiCallError(0, 'network') from None
+        else:
+            status = response.status_code
+            if status == 200:
+                try:
+                    return response.json()
+                except ValueError:
+                    raise GeminiCallError(status, 'invalid_response') from None
+            logger.warning('Gemini request failed HTTP=%s attempt=%s', status, attempt + 1)
+            if status not in transient or attempt == 2:
+                category = ('rate_limit' if status == 429 else 'busy' if status in transient
+                            else 'auth' if status in (401, 403) else 'model' if status == 404 else 'request')
+                raise GeminiCallError(status, category)
+        delay = min(2 ** attempt + random.uniform(0, 0.5), 5)
+        if deadline is not None and time.monotonic() + delay >= deadline:
+            raise GeminiCallError(0, 'timeout')
+        time.sleep(delay)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def discover_gemini_models(_api_key, key_fingerprint):
+    models, page_token = [], None
+    deadline = time.monotonic() + 45
+    for _ in range(10):
+        params = {'pageSize': 100}
+        if page_token:
+            params['pageToken'] = page_token
+        result = gemini_request('GET', 'models', _api_key, deadline=deadline, params=params)
+        for model in result.get('models', []):
+            name = model.get('name', '')
+            if 'generateContent' in model.get('supportedGenerationMethods', []) and name.startswith('models/gemini-'):
+                # Image/audio-only models are not suitable for text JSON diagnosis.
+                if not any(word in name.lower() for word in ('image', 'tts', 'audio', 'robotics')):
+                    models.append(name)
+        page_token = result.get('nextPageToken')
+        if not page_token:
+            return sorted(set(models))
+    raise GeminiCallError(0, 'model_list_incomplete')
+
+
 def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, chip_summary):
-    raw_keys = get_secret("GEMINI_API_KEY", "")
-    keys_list = parse_api_keys(raw_keys)
-    
+    keys_list = list(dict.fromkeys(parse_api_keys(get_secret('GEMINI_API_KEY', ''))))
     if not keys_list:
-        return None, "⚠️ 系統未偵測到任何 Gemini API Key，請至 Streamlit Secrets 設定 `GEMINI_API_KEY`。"
-    
+        return None, '未設定 GEMINI_API_KEY，請至 Streamlit Secrets 設定。'
+    configured = parse_api_keys(get_secret('GEMINI_MODELS', ''))
+    config_id = hashlib.sha256(('\0'.join(keys_list + configured)).encode()).hexdigest()
+    cache_key = hashlib.sha256(json.dumps(
+        [config_id, stock_id, stock_name, latest_price, tech_summary, chip_summary],
+        ensure_ascii=False, default=str).encode()).hexdigest()
+    cached = st.session_state.get('_agent_success_cache', {})
+    if cache_key in cached and time.time() - cached[cache_key][0] < 1800:
+        return cached[cache_key][1], None
     prompt = f"""
-你是由 TauricResearch/TradingAgents 密集的 AI 多智能體團隊，正在為台股【{stock_id} {stock_name}】（當前收盤價：{latest_price} 元）進行深度投資裁決會議。
-請根據以下數據進行內部團隊辯論與風控審核：
-【技術面數據】：{tech_summary}
-【籌碼與大股東數據】：{chip_summary}
+    你是由 TauricResearch/TradingAgents 密集的 AI 多智能體團隊，正在為台股【{stock_id} {stock_name}】（當前收盤價：{latest_price} 元）進行深度投資裁決會議。
+    請根據以下數據進行內部團隊辯論與風控審核：
+    【技術面數據】：{tech_summary}
+    【籌碼與大股東數據】：{chip_summary}
 
-請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：
-{{
-  "volume_price_volatility": "成交量與價格波動分析說明...",
-  "market_stage": "目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...",
-  "key_price_levels": "關鍵價格門檻與支撐壓力位...",
-  "signal_analysis": "技術指標 (RSI/MACD/KD) 訊號評估...",
-  "pattern_recognition": "K線圖表模式與型態識別...",
-  "trend_strength": "趨勢強度與動能綜合評估...",
-  "bull_bear_debate": "看多研究員 vs 看空研究員 辯論焦點說明...",
-  "trader_decision": "交易員最終買賣建議與推薦部位比例...",
-  "risk_management": "風控團隊與投資組合經理最終核准/否決評估、停損價與目標價設定..."
-}}
-"""
-    # 修正：採用符合目前 API 標準的相容模型代號清單
-    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
-    log_errs = []
-    
-    last_working_key_idx = st.session_state.get("last_working_key_idx", 0)
-    ordered_keys = keys_list[last_working_key_idx:] + keys_list[:last_working_key_idx]
+    請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：
+    {{
+      "volume_price_volatility": "成交量與價格波動分析說明...",
+      "market_stage": "目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...",
+      "key_price_levels": "關鍵價格門檻與支撐壓力位...",
+      "signal_analysis": "技術指標 (RSI/MACD/KD) 訊號評估...",
+      "pattern_recognition": "K線圖表模式與型態識別...",
+      "trend_strength": "趨勢強度與動能綜合評估...",
+      "bull_bear_debate": "看多研究員 vs 看空研究員 辯論焦點說明...",
+      "trader_decision": "交易員最終買賣建議與推薦部位比例...",
+      "risk_management": "風控團隊與投資組合經理最終核准/否決評估、停損價與目標價設定..."
+    }}
+    """
+    prompt += '\n僅依提供數據判斷；未提供或未計算的指標須明確標示資料不足，不得捏造。'
+    failures = []
+    start_idx = int(st.session_state.get('last_working_key_idx', 0)) % len(keys_list)
+    indices = list(range(start_idx, len(keys_list))) + list(range(start_idx))
+    deadline = time.monotonic() + 120
+    for key_idx in indices:
+        if time.monotonic() >= deadline:
+            failures.append('timeout')
+            break
+        key = keys_list[key_idx]
+        fingerprint = hashlib.sha256(key.encode()).hexdigest()
+        try:
+            available = discover_gemini_models(key, fingerprint)
+        except GeminiCallError as exc:
+            failures.append(exc.category)
+            continue
+        if configured:
+            preferred = [m if m.startswith('models/') else 'models/' + m for m in configured]
+            candidates = [m for m in preferred if m in available]
+        else:
+            candidates = sorted(available, key=lambda m: (
+                'flash' not in m, any(w in m for w in ('preview', 'exp', 'latest')), m))[:3]
+        if not candidates:
+            failures.append('model')
+            continue
+        for model in candidates:
+            try:
+                result = gemini_request('POST', model + ':generateContent', key, deadline=deadline,
+                    json={'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
+                          'generationConfig': {'responseMimeType': 'application/json'}})
+                candidates_result = result.get('candidates', [])
+                parts = candidates_result[0].get('content', {}).get('parts', []) if candidates_result else []
+                text = ''.join(p.get('text', '') for p in parts if not p.get('thought', False))
+                parsed = clean_and_parse_json(text)
+                if not isinstance(parsed, dict) or not parsed:
+                    failures.append('invalid_response')
+                    continue
+                st.session_state['last_working_key_idx'] = key_idx
+                cached[cache_key] = (time.time(), parsed)
+                st.session_state['_agent_success_cache'] = dict(list(cached.items())[-20:])
+                st.session_state['_agent_last_model'] = model
+                return parsed, None
+            except GeminiCallError as exc:
+                failures.append(exc.category)
+                if exc.category == 'model':
+                    discover_gemini_models.clear()
+                if exc.category in ('auth', 'rate_limit', 'timeout'):
+                    break
+    labels = {'busy': '模型服務暫時繁忙', 'rate_limit': '請求頻率或額度限制',
+              'auth': '金鑰或專案權限問題', 'model': '無可用的指定模型',
+              'network': '網路連線失敗', 'timeout': '已達本次等待上限',
+              'invalid_response': '模型未回傳有效 JSON', 'request': '請求設定不被接受',
+              'model_list_incomplete': '模型清單未完整取得'}
+    reasons = '、'.join(dict.fromkeys(labels.get(x, '模型查詢失敗') for x in failures))
+    return None, 'AI 裁決暫時無法完成：' + (reasons or '未取得有效回應') + '。請稍後重試或檢查設定；此訊息不代表所有 API Key 均無效。'
 
-    for idx, clean_key in enumerate(ordered_keys):
-        masked_k = mask_api_key(clean_key)
-        for m in models_to_try:
-            # 針對 503 (Overloaded) 與 429 (Rate Limit) 進行最多 2 次退避重試
-            for attempt in range(2):
-                # 1. 嘗試 Python Client SDK
-                try:
-                    from google import genai
-                    client = genai.Client(api_key=clean_key)
-                    response = client.models.generate_content(model=m, contents=prompt)
-                    if response and response.text:
-                        parsed = clean_and_parse_json(response.text)
-                        st.session_state["last_working_key_idx"] = keys_list.index(clean_key)
-                        if parsed:
-                            return parsed, None
-                        return {"volume_price_volatility": response.text}, None
-                except Exception as e_sdk:
-                    err_s = str(e_sdk)
-                    if "503" in err_s or "UNAVAILABLE" in err_s or "429" in err_s:
-                        time.sleep(1.5 * (attempt + 1))
-                        continue
-                    logger.warning(f"Key ({masked_k}) Model ({m}) SDK Error: {err_s}")
-                    log_errs.append(f"Key ({masked_k}) [{m}]: SDK 連線失敗")
-
-                # 2. 嘗試 REST API 備援 (修復：使用 x-goog-api-key Header 避免 Key 寫入 URL)
-                try:
-                    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){m}:generateContent"
-                    headers = {
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": clean_key
-                    }
-                    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                    resp = requests.post(url, headers=headers, json=payload, timeout=12)
-                    
-                    if resp.status_code == 200:
-                        res_json = resp.json()
-                        if 'candidates' in res_json:
-                            txt = res_json['candidates'][0]['content']['parts'][0]['text']
-                            parsed = clean_and_parse_json(txt)
-                            st.session_state["last_working_key_idx"] = keys_list.index(clean_key)
-                            if parsed:
-                                return parsed, None
-                            return {"volume_price_volatility": txt}, None
-                    elif resp.status_code in [503, 429]:
-                        time.sleep(1.5 * (attempt + 1))
-                        continue
-                    else:
-                        logger.warning(f"Key ({masked_k}) Model ({m}) REST Status: {resp.status_code}")
-                        log_errs.append(f"Key ({masked_k}) [{m}]: REST HTTP {resp.status_code}")
-                except Exception as e_rest:
-                    logger.warning(f"Key ({masked_k}) Model ({m}) REST Error: {e_rest}")
-                    log_errs.append(f"Key ({masked_k}) [{m}]: REST 連線錯誤")
-                break
-
-    return None, "❌ AI 裁決暫時無法完成：目前 Gemini 模型服務繁忙或 API 配額受限，請稍後重試。"
 
 def render_trading_agents_cards(res):
     """將 TradingAgents 多 Agent 裁決結果渲染為深色卡片」"""
@@ -655,55 +733,43 @@ with st.sidebar:
     st.markdown("---")
     st.info("🔒 Gemini API Key 與 FinMind Token 已全數由系統密鑰庫 (Streamlit Secrets) 安全自動載入。")
     st.markdown("---")
-    start_date = st.date_input("開始日期", value=datetime.today() - timedelta(days=90))
-    end_date = st.date_input("結束日期", value=datetime.today())
+    start_date = st.date_input("開始日期", value=taipei_now() - timedelta(days=90))
+    end_date = st.date_input("結束日期", value=taipei_now())
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四大指數獨立區塊 (修正 UI 缺點：若資料源異常明確呈現「暫無數據」)
+# 9. 頂部四大指數獨立區塊（優化 3：僅在盤中交易時間 60 秒自動重新整理）
 # -----------------------------------------------------------------------------
 run_interval = 60 if is_taiwan_market_open() else None
 
 @st.fragment(run_every=run_interval)
 def render_market_ticker():
     market_data = fetch_realtime_market_data(finmind_token)
-    m1, m2, m3, m4 = st.columns(4)
-    
-    def render_taiwan_metric(col, title, d):
+    columns = st.columns(4)
+    for col, key, title in zip(columns, ('taiex', 'tpex', 'futures', 'tsmc'),
+                               ('加權指數 (TAIEX)', '櫃買指數 (TPEX)', '台指近月 (TX)', '台積電 (2330)')):
+        d = market_data.get(key)
         if d:
-            val = d["val"]
-            change = d["change"]
-            
-            if change > 0:
-                color = "#FF5252"
-                sign = "+"
-            elif change < 0:
-                color = "#00E676"
-                sign = ""
-            else:
-                color = "#FFFFFF"
-                sign = ""
-                
-            col.markdown(f"""
-                <div style="background-color: #1E222D; padding: 15px; border-radius: 8px; border: 1px solid {color};">
-                    <span style="color: #848E9C; font-size: 14px;">{title}</span><br>
-                    <span style="color: {color}; font-size: 26px; font-weight: bold;">{val:,.2f}</span><br>
-                    <span style="color: {color}; font-size: 15px; font-weight: bold;">{sign}{change:,.2f}</span>
-                </div>
-            """, unsafe_allow_html=True)
+            change = d.get('change')
+            color = '#FF5252' if change is not None and change > 0 else '#00E676' if change is not None and change < 0 else '#FFFFFF'
+            change_text = f'{change:+,.2f}' if change is not None else '漲跌資料未提供'
+            label = ' | '.join(str(d.get(k, '')) for k in ('date', 'time', 'source', 'contract', 'session') if d.get(k))
+            value = f"{d['val']:,.2f}"
         else:
-            # 修正：避免一直顯示「數據載入中…」，改為真實反映資料狀態
-            col.markdown(f"""
-                <div style="background-color: #1E222D; padding: 15px; border-radius: 8px; border: 1px solid #546E7A;">
-                    <span style="color: #848E9C; font-size: 14px;">{title}</span><br>
-                    <span style="color: #848E9C; font-size: 26px; font-weight: bold;">--</span><br>
-                    <span style="color: #E57373; font-size: 13px; font-weight: bold;">暫無數據 / 取得失敗</span>
-                </div>
-            """, unsafe_allow_html=True)
+            color, value, change_text = '#848E9C', '--', '資料取得失敗／暫無資料'
+            label = market_data.get('_errors', {}).get(key, '請稍後重新整理')
+        col.markdown(f'''
+            <div style="background-color:#1E222D;padding:15px;border-radius:8px;border:1px solid {color};">
+                <span style="color:#848E9C;font-size:14px;">{html.escape(title)}</span><br>
+                <span style="color:{color};font-size:26px;font-weight:bold;">{value}</span><br>
+                <span style="color:{color};font-size:15px;">{change_text}</span><br>
+                <span style="color:#848E9C;font-size:11px;">{html.escape(label)}</span>
+            </div>
+        ''', unsafe_allow_html=True)
+    st.caption('指數報價與日行情可能有延遲；請以資料日期、來源及契約為準。期貨同一交易日優先一般盤。')
+    if st.button('重新取得行情', key='refresh_market_quotes'):
+        fetch_realtime_market_data.clear()
+        st.rerun()
 
-    render_taiwan_metric(m1, "加權指數 (TAIEX)", market_data.get("taiex"))
-    render_taiwan_metric(m2, "櫃買指數 (TPEX)", market_data.get("tpex"))
-    render_taiwan_metric(m3, "台指近月 (TX)", market_data.get("futures"))
-    render_taiwan_metric(m4, "台積電 (2330)", market_data.get("tsmc"))
 
 render_market_ticker()
 st.markdown("---")

@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import requests
 import io
-import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -291,7 +290,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 多組 API Key 智慧輪替（兼容 AIzaSy 與 AQ. 憑證）
+# 6. 多組 API Key 智慧輪替（完美支援 AIzaSy 與 AQ 憑證，並自動適配最新穩定模型）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(raw_keys_input, prompt):
     keys_list = parse_api_keys(raw_keys_input)
@@ -299,34 +298,59 @@ def call_gemini_with_keys_rotation(raw_keys_input, prompt):
         return "⚠️ 尚未設定任何 Google Gemini API Key，請於左側設定欄位輸入。"
     
     error_log = []
+    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+    
     for idx, clean_key in enumerate(keys_list):
         key_masked = clean_key[:6] + "..." if len(clean_key) > 6 else "******"
+        success = False
+        res_text = ""
+        
+        # 方法 A：優先使用官方 google-genai SDK 進行連線
         try:
-            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-            headers = {"Content-Type": "application/json"}
-            
-            if clean_key.startswith("AQ."):
-                headers["Authorization"] = f"Bearer {clean_key}"
-            else:
-                url += f"?key={clean_key}"
+            from google import genai
+            client = genai.Client(api_key=clean_key)
+            for m in models_to_try:
+                try:
+                    response = client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                        config={"system_instruction": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}
+                    )
+                    if response and response.text:
+                        return response.text
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 方法 B：使用 REST API 備援連線（支援 AIzaSy 參數與 AQ Bearer 授權）
+        for m in models_to_try:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+                headers = {"Content-Type": "application/json"}
                 
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}]}
-            }
-            
-            resp = requests.post(url, headers=headers, json=payload, timeout=25)
-            if resp.status_code == 200:
-                return resp.json()['candidates'][0]['content']['parts'][0]['text']
-            else:
-                error_log.append(f"Key #{idx+1} ({key_masked}) 狀態碼 {resp.status_code}: {resp.text[:80]}")
-                continue
-        except Exception as e:
-            error_log.append(f"Key #{idx+1} ({key_masked}) 異常: {e}")
-            continue
+                if clean_key.startswith("AQ."):
+                    headers["Authorization"] = f"Bearer {clean_key}"
+                else:
+                    url += f"?key={clean_key}"
+                    
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}]}
+                }
+                
+                resp = requests.post(url, headers=headers, json=payload, timeout=25)
+                if resp.status_code == 200:
+                    return resp.json()['candidates'][0]['content']['parts'][0]['text']
+                else:
+                    res_text = f"狀態碼 {resp.status_code}"
+            except Exception as e:
+                res_text = f"異常: {e}"
+                
+        error_log.append(f"Key #{idx+1} ({key_masked}) {res_text}")
             
     detailed_reasons = " | ".join(error_log)
-    return f"❌ **所有設定的 API Key 均測試失敗**。\n詳細測試紀錄：\n{detailed_reasons}"
+    return f"❌ **所有設定的 API Key 均測試失敗**。\n詳細測試紀錄：\n{detailed_reasons}\n\n💡 **排查建議**：請確認 AQ. 憑證所屬的 Google Cloud 專案已在 GCP 控制台啟用 **Generative Language API**。"
 
 # -----------------------------------------------------------------------------
 # 7. 共用診斷渲染引擎
@@ -397,21 +421,37 @@ STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 active_gemini_keys = st.session_state.get("gemini_key") or default_gemini_key
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四塊指數看板（使用 st.empty 局部定時更新，不影響下方主畫面）
+# 9. 頂部四大指數獨立區塊（使用 @st.fragment 實現每 5 秒局部更新，絕不影響下半部畫面）
 # -----------------------------------------------------------------------------
-def render_taiyuan_metric(col, title, val, change):
-    if change > 0:
-        change_str = f"+{change:,.2f}"
-        delta_color = "normal"
-    elif change < 0:
-        change_str = f"{change:,.2f}"
-        delta_color = "inverse"
-    else:
-        change_str = "0.00"
-        delta_color = "off"
-    col.metric(title, f"{val:,.2f}", change_str, delta_color=delta_color)
+@st.fragment(run_every=5)
+def render_market_ticker():
+    market_data = fetch_realtime_market_data()
+    m1, m2, m3, m4 = st.columns(4)
+    
+    def render_single_metric(col, title, d):
+        if d:
+            val = d["val"]
+            change = d["change"]
+            if change > 0:
+                change_str = f"+{change:,.2f}"
+                delta_color = "normal"
+            elif change < 0:
+                change_str = f"{change:,.2f}"
+                delta_color = "inverse"
+            else:
+                change_str = "0.00"
+                delta_color = "off"
+            col.metric(title, f"{val:,.2f}", change_str, delta_color=delta_color)
+        else:
+            col.metric(title, "--", "0.00")
 
-market_placeholder = st.empty()
+    render_single_metric(m1, "加權指數 (TAIEX)", market_data.get("taiex"))
+    render_single_metric(m2, "櫃買指數 (TPEX)", market_data.get("tpex"))
+    render_single_metric(m3, "台指期近月 (TX)", market_data.get("futures"))
+    render_single_metric(m4, "台積電 (2330)", market_data.get("tsmc"))
+
+render_market_ticker()
+st.markdown("---")
 
 # -----------------------------------------------------------------------------
 # 10. 主頁面模式邏輯（完整呈現下半部所有選單與分析工具）
@@ -447,18 +487,3 @@ else:
 
     if st.button("🚀 啟動個股技術、籌碼與 AI 深度診斷"):
         render_diagnosis_section(stock_id, stock_name, start_date, end_date, st.session_state["finmind_token"], active_gemini_keys)
-
-# -----------------------------------------------------------------------------
-# 11. 局部背景更新迴圈（僅更新頂部看板，不破壞下方元件）
-# -----------------------------------------------------------------------------
-market_data = fetch_realtime_market_data()
-with market_placeholder.container():
-    m1, m2, m3, m4 = st.columns(4)
-    render_taiyuan_metric(m1, "加權指數 (TAIEX)", market_data["taiex"]["val"], market_data["taiex"]["change"])
-    render_taiyuan_metric(m2, "櫃買指數 (TPEX)", market_data["tpex"]["val"], market_data["tpex"]["change"])
-    render_taiyuan_metric(m3, "台指期近月 (TX)", market_data["futures"]["val"], market_data["futures"]["change"])
-    render_taiyuan_metric(m4, "台積電 (2330)", market_data["tsmc"]["val"], market_data["tsmc"]["change"])
-    st.markdown("---")
-
-time.sleep(5)
-st.rerun()

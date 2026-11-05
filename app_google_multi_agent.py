@@ -50,69 +50,78 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 # -----------------------------------------------------------------------------
-# 2. 四大指數與台積電即時行情（FinMind + 證交所 API 雙重強效抓取）
+# 2. 四大指數與台積電即時行情（修復 FinMind 欄位與代號對應 + 證交所 API 備援）
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=10)
 def fetch_realtime_market_data(api_token=""):
     data = {}
     today_str = datetime.today().strftime("%Y-%m-%d")
-    # 拉長回溯天數至 14 天，解決假期與非交易時段無數據問題
     start_str = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
     
-    # --- 方法 A: 使用 FinMind 抓取最新日成交與期貨 ---
+    # --- 1. FinMind 抓取 (修復 futures_id 與 TAIEX 代號) ---
     try:
         from FinMind.data import DataLoader
         fm = DataLoader()
         if api_token: fm.login_by_token(api_token.strip())
 
-        # 1. 加權指數 (代號 001)
-        df_taiex = fm.taiwan_stock_daily(stock_id="001", start_date=start_str, end_date=today_str)
-        if not df_taiex.empty:
-            val = float(df_taiex['close'].iloc[-1])
-            prev = float(df_taiex['close'].iloc[-2]) if len(df_taiex) > 1 else val
-            data["taiex"] = {"val": val, "change": val - prev, "name": "加權指數 (TAIEX)"}
+        # (1) 加權指數 (TAIEX / 001)
+        for sid in ["TAIEX", "001"]:
+            try:
+                df_taiex = fm.taiwan_stock_daily(stock_id=sid, start_date=start_str, end_date=today_str)
+                if not df_taiex.empty:
+                    val = float(df_taiex['close'].iloc[-1])
+                    prev = float(df_taiex['close'].iloc[-2]) if len(df_taiex) > 1 else val
+                    data["taiex"] = {"val": val, "change": val - prev, "name": "加權指數 (TAIEX)"}
+                    break
+            except Exception: pass
 
-        # 2. 櫃買指數 (代號 101)
-        df_tpex = fm.taiwan_stock_daily(stock_id="101", start_date=start_str, end_date=today_str)
-        if not df_tpex.empty:
-            val = float(df_tpex['close'].iloc[-1])
-            prev = float(df_tpex['close'].iloc[-2]) if len(df_tpex) > 1 else val
-            data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
+        # (2) 櫃買指數 (TPEX / 101)
+        for sid in ["TPEX", "101"]:
+            try:
+                df_tpex = fm.taiwan_stock_daily(stock_id=sid, start_date=start_str, end_date=today_str)
+                if not df_tpex.empty:
+                    val = float(df_tpex['close'].iloc[-1])
+                    prev = float(df_tpex['close'].iloc[-2]) if len(df_tpex) > 1 else val
+                    data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
+                    break
+            except Exception: pass
 
-        # 3. 台指期近月 (代號 TX)
+        # (3) 台指期近月 (修復 futures_id 欄位)
         df_futures = fm.taiwan_futures_daily(start_date=start_str, end_date=today_str)
         if not df_futures.empty:
-            df_tx = df_futures[df_futures["stock_id"] == "TX"].copy()
-            if not df_tx.empty:
-                latest_date = df_tx['date'].max()
-                df_tx_latest = df_tx[df_tx['date'] == latest_date]
-                if not df_tx_latest.empty:
-                    val = float(df_tx_latest['close'].iloc[0])
-                    prev = float(df_tx_latest['spread'].iloc[0]) if 'spread' in df_tx_latest.columns else 0.0
-                    data["futures"] = {"val": val, "change": prev, "name": "台指近月 (TX)"}
+            # FinMind 期貨合約代號欄位通常為 futures_id 或 stock_id
+            col_id = 'futures_id' if 'futures_id' in df_futures.columns else 'stock_id'
+            if col_id in df_futures.columns:
+                df_tx = df_futures[df_futures[col_id] == "TX"].copy()
+                if not df_tx.empty:
+                    latest_date = df_tx['date'].max()
+                    df_tx_latest = df_tx[df_tx['date'] == latest_date]
+                    if not df_tx_latest.empty:
+                        val = float(df_tx_latest['close'].iloc[0])
+                        prev = float(df_tx_latest['spread'].iloc[0]) if 'spread' in df_tx_latest.columns else 0.0
+                        data["futures"] = {"val": val, "change": prev, "name": "台指近月 (TX)"}
 
-        # 4. 台積電 (代號 2330)
+        # (4) 台積電 (2330)
         df_tsmc = fm.taiwan_stock_daily(stock_id="2330", start_date=start_str, end_date=today_str)
         if not df_tsmc.empty:
             val = float(df_tsmc['close'].iloc[-1])
             prev = float(df_tsmc['close'].iloc[-2]) if len(df_tsmc) > 1 else val
             data["tsmc"] = {"val": val, "change": val - prev, "name": "台積電 (2330)"}
+
     except Exception as e:
         print(f"FinMind Fetch Exception: {e}")
 
-    # --- 方法 B: 證交所 OpenAPI 備援補充 ---
-    if "taiex" not in data or "tsmc" not in data:
+    # --- 2. 證交所 OpenAPI 自動補全備援 ---
+    if "taiex" not in data:
         try:
-            url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-            resp = requests.get(url_twse, timeout=5)
-            if resp.status_code == 200:
-                for item in resp.json():
-                    sid = str(item.get("Code", "")).strip()
-                    if sid == "2330" and "tsmc" not in data:
-                        close_p = float(str(item.get("ClosingPrice", 0)).replace(",", "")) if item.get("ClosingPrice") else 0.0
-                        open_p = float(str(item.get("OpeningPrice", close_p)).replace(",", "")) if item.get("OpeningPrice") else close_p
-                        if close_p > 0:
-                            data["tsmc"] = {"val": close_p, "change": close_p - open_p, "name": "台積電 (2330)"}
+            url_fmtqik = "https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK"
+            resp = requests.get(url_fmtqik, timeout=5)
+            if resp.status_code == 200 and len(resp.json()) > 0:
+                latest = resp.json()[-1]
+                val = float(str(latest.get("INDEXTAIEX", 0)).replace(",", ""))
+                change = float(str(latest.get("Change", 0)).replace(",", ""))
+                if val > 0:
+                    data["taiex"] = {"val": val, "change": change, "name": "加權指數 (TAIEX)"}
         except Exception: pass
 
     return data
@@ -325,7 +334,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 正確使用 google-genai 2.x SDK 呼叫 Gemini（完美解決 404 與 AQ Key）
+# 6. 使用最新 Google Gemini 模型端點 (gemini-3.8-flash, gemini-2.5-flash)
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(prompt):
     raw_keys = get_secret("GEMINI_API_KEY", "")
@@ -335,11 +344,12 @@ def call_gemini_with_keys_rotation(prompt):
         return "⚠️ 系統未偵測到任何 Gemini API Key，請至 Streamlit Secrets 設定 `GEMINI_API_KEY`。"
     
     error_log = []
-    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+    # 對齊 Google 官方要求的最新 2026 模型代號
+    models_to_try = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-flash-latest']
     
     for idx, clean_key in enumerate(keys_list):
         for m in models_to_try:
-            # 1. 精準對齊環境中已安裝的 google-genai==2.34.0 官方 SDK 語法
+            # 1. 優先使用 google-genai 官方 SDK
             try:
                 from google import genai
                 client = genai.Client(api_key=clean_key)
@@ -350,7 +360,7 @@ def call_gemini_with_keys_rotation(prompt):
                 if response and response.text:
                     return response.text
             except Exception as e_genai:
-                # 2. 備援 REST API
+                # 2. 備援同步 REST API 呼叫
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={clean_key}"
                     headers = {"Content-Type": "application/json"}
@@ -361,9 +371,9 @@ def call_gemini_with_keys_rotation(prompt):
                         if 'candidates' in res_json:
                             return res_json['candidates'][0]['content']['parts'][0]['text']
                     else:
-                        error_log.append(f"Key #{idx+1} ({m}) -> SDK: {e_genai} | REST: HTTP {resp.status_code}")
+                        error_log.append(f"Key #{idx+1} ({m}) -> HTTP {resp.status_code}")
                 except Exception as e_rest:
-                    error_log.append(f"Key #{idx+1} ({m}) -> SDK: {e_genai} | REST: {e_rest}")
+                    error_log.append(f"Key #{idx+1} ({m}) -> {e_rest}")
             
     detailed_reasons = " | ".join(error_log)
     return f"❌ **所有 Secrets 中的 API Key 均測試失敗**。\n詳細測試紀錄：\n{detailed_reasons}"
@@ -416,7 +426,7 @@ with st.sidebar:
     end_date = st.date_input("結束日期", value=datetime.today())
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四大指數獨立區塊（每 5 秒自動重新整理，零預設假值）
+# 9. 頂部四大指數獨立區塊（每 5 秒自動重新整理）
 # -----------------------------------------------------------------------------
 @st.fragment(run_every=5)
 def render_market_ticker():

@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import pandas as pd
 import numpy as np
 import requests
@@ -52,8 +53,7 @@ def parse_api_keys(raw_input):
 def is_taiwan_market_open():
     """判斷當前是否處於台股一般交易時段 (08:45 - 13:45) 或期貨夜盤 (15:00 - 05:00)"""
     now = datetime.now()
-    # 周六(5)、周日(6) 不運作
-    if now.weekday() in [5, 6]:
+    if now.weekday() in [5, 6]: # 周六、周日休市
         return False
     
     t = now.time()
@@ -69,7 +69,7 @@ def is_taiwan_market_open():
     return False
 
 # -----------------------------------------------------------------------------
-# 2. 四大指數與台積電獨立抓取（強效雙重備援，徹底解除崩潰連鎖）
+# 2. 四大指數與台積電三重備援抓取（證交所/櫃買中心/期交所 官方 API 串接）
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=15)
 def fetch_realtime_market_data(api_token=""):
@@ -77,84 +77,122 @@ def fetch_realtime_market_data(api_token=""):
     today_str = datetime.today().strftime("%Y-%m-%d")
     start_str = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
     
-    from FinMind.data import DataLoader
-    fm = DataLoader()
-    if api_token: 
-        try: fm.login_by_token(api_token.strip())
-        except Exception: pass
-
-    # 1. 加權指數 (TAIEX) 獨立抓取
+    # 嘗試初始化 FinMind
+    fm = None
     try:
-        df_taiex = fm.taiwan_stock_daily(stock_id="TAIEX", start_date=start_str, end_date=today_str)
-        if df_taiex.empty:
-            df_taiex = fm.taiwan_stock_daily(stock_id="001", start_date=start_str, end_date=today_str)
-        if not df_taiex.empty:
-            val = float(df_taiex['close'].iloc[-1])
-            prev = float(df_taiex['close'].iloc[-2]) if len(df_taiex) > 1 else val
-            data["taiex"] = {"val": val, "change": val - prev, "name": "加權指數 (TAIEX)"}
-    except Exception:
+        from FinMind.data import DataLoader
+        fm = DataLoader()
+        if api_token: fm.login_by_token(api_token.strip())
+    except Exception: pass
+
+    # --- 1. 加權指數 (TAIEX) ---
+    if fm:
         try:
-            import yfinance as yf
-            ticker = yf.Ticker("^TWII")
-            hist = ticker.history(period="5d")
-            if not hist.empty:
-                val = float(hist['Close'].iloc[-1])
-                prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else val
+            df_taiex = fm.taiwan_stock_daily(stock_id="TAIEX", start_date=start_str, end_date=today_str)
+            if df_taiex.empty:
+                df_taiex = fm.taiwan_stock_daily(stock_id="001", start_date=start_str, end_date=today_str)
+            if not df_taiex.empty:
+                val = float(df_taiex['close'].iloc[-1])
+                prev = float(df_taiex['close'].iloc[-2]) if len(df_taiex) > 1 else val
                 data["taiex"] = {"val": val, "change": val - prev, "name": "加權指數 (TAIEX)"}
         except Exception: pass
 
-    # 2. 櫃買指數 (TPEX) 獨立抓取
-    try:
-        df_tpex = fm.taiwan_stock_daily(stock_id="TPEX", start_date=start_str, end_date=today_str)
-        if df_tpex.empty:
-            df_tpex = fm.taiwan_stock_daily(stock_id="101", start_date=start_str, end_date=today_str)
-        if not df_tpex.empty:
-            val = float(df_tpex['close'].iloc[-1])
-            prev = float(df_tpex['close'].iloc[-2]) if len(df_tpex) > 1 else val
-            data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
-    except Exception:
+    if "taiex" not in data:
         try:
-            import yfinance as yf
-            ticker = yf.Ticker("^TWOII")
-            hist = ticker.history(period="5d")
-            if not hist.empty:
-                val = float(hist['Close'].iloc[-1])
-                prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else val
+            url_fmtqik = "[https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK](https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK)"
+            resp = requests.get(url_fmtqik, timeout=5)
+            if resp.status_code == 200 and len(resp.json()) > 0:
+                latest = resp.json()[-1]
+                val = float(str(latest.get("INDEXTAIEX", 0)).replace(",", ""))
+                change = float(str(latest.get("Change", 0)).replace(",", ""))
+                if val > 0:
+                    data["taiex"] = {"val": val, "change": change, "name": "加權指數 (TAIEX)"}
+        except Exception: pass
+
+    # --- 2. 櫃買指數 (TPEX) ---
+    if fm:
+        try:
+            df_tpex = fm.taiwan_stock_daily(stock_id="TPEX", start_date=start_str, end_date=today_str)
+            if df_tpex.empty:
+                df_tpex = fm.taiwan_stock_daily(stock_id="101", start_date=start_str, end_date=today_str)
+            if not df_tpex.empty:
+                val = float(df_tpex['close'].iloc[-1])
+                prev = float(df_tpex['close'].iloc[-2]) if len(df_tpex) > 1 else val
                 data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
         except Exception: pass
 
-    # 3. 台指期近月 (TX) 獨立抓取
-    try:
-        df_futures = fm.taiwan_futures_daily(start_date=start_str, end_date=today_str)
-        if not df_futures.empty:
-            col_id = 'futures_id' if 'futures_id' in df_futures.columns else 'stock_id'
-            if col_id in df_futures.columns:
-                df_tx = df_futures[df_futures[col_id] == "TX"].copy()
-                if not df_tx.empty:
-                    latest_date = df_tx['date'].max()
-                    df_tx_latest = df_tx[df_tx['date'] == latest_date]
-                    if not df_tx_latest.empty:
-                        val = float(df_tx_latest['close'].iloc[0])
-                        prev = float(df_tx_latest['spread'].iloc[0]) if 'spread' in df_tx_latest.columns else 0.0
-                        data["futures"] = {"val": val, "change": prev, "name": "台指近月 (TX)"}
-    except Exception: pass
-
-    # 4. 台積電 (2330) 獨立抓取
-    try:
-        df_tsmc = fm.taiwan_stock_daily(stock_id="2330", start_date=start_str, end_date=today_str)
-        if not df_tsmc.empty:
-            val = float(df_tsmc['close'].iloc[-1])
-            prev = float(df_tsmc['close'].iloc[-2]) if len(df_tsmc) > 1 else val
-            data["tsmc"] = {"val": val, "change": val - prev, "name": "台積電 (2330)"}
-    except Exception:
+    # 櫃買中心 (TPEx) 官方 OpenAPI 備援
+    if "tpex" not in data:
         try:
-            import yfinance as yf
-            ticker = yf.Ticker("2330.TW")
-            hist = ticker.history(period="5d")
-            if not hist.empty:
-                val = float(hist['Close'].iloc[-1])
-                prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else val
+            url_tpex = "[https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes](https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes)"
+            resp = requests.get(url_tpex, timeout=5)
+            if resp.status_code == 200:
+                items = resp.json()
+                if isinstance(items, list) and len(items) > 0:
+                    for item in items:
+                        if item.get("Date") or item.get("Close"):
+                            close_v = float(str(item.get("Close", 0)).replace(",", ""))
+                            change_v = float(str(item.get("Change", 0)).replace(",", ""))
+                            if close_v > 0:
+                                data["tpex"] = {"val": close_v, "change": change_v, "name": "櫃買指數 (TPEX)"}
+                                break
+        except Exception: pass
+
+    # --- 3. 台指期近月 (TX) ---
+    if fm:
+        try:
+            df_futures = fm.taiwan_futures_daily(start_date=start_str, end_date=today_str)
+            if not df_futures.empty:
+                col_id = 'futures_id' if 'futures_id' in df_futures.columns else 'stock_id'
+                if col_id in df_futures.columns:
+                    df_tx = df_futures[df_futures[col_id] == "TX"].copy()
+                    if not df_tx.empty:
+                        latest_date = df_tx['date'].max()
+                        df_tx_latest = df_tx[df_tx['date'] == latest_date]
+                        if not df_tx_latest.empty:
+                            val = float(df_tx_latest['close'].iloc[0])
+                            prev = float(df_tx_latest['spread'].iloc[0]) if 'spread' in df_tx_latest.columns else 0.0
+                            data["futures"] = {"val": val, "change": prev, "name": "台指近月 (TX)"}
+        except Exception: pass
+
+    # 期交所 (TAIFEX) 官方 API 備援
+    if "futures" not in data:
+        try:
+            url_taifex = "[https://openapi.taifex.com.tw/v1/DailyMarketReport](https://openapi.taifex.com.tw/v1/DailyMarketReport)"
+            resp = requests.get(url_taifex, timeout=5)
+            if resp.status_code == 200:
+                raw_f = resp.json()
+                for row in raw_f:
+                    if str(row.get("MarketCode", "")).strip() in ["TX", "台指"] or "TX" in str(row.get("CommodityID", "")):
+                        close_p = float(str(row.get("ClosePrice", 0)).replace(",", ""))
+                        open_p = float(str(row.get("OpenPrice", close_p)).replace(",", ""))
+                        if close_p > 0:
+                            data["futures"] = {"val": close_p, "change": close_p - open_p, "name": "台指近月 (TX)"}
+                            break
+        except Exception: pass
+
+    # --- 4. 台積電 (2330) ---
+    if fm:
+        try:
+            df_tsmc = fm.taiwan_stock_daily(stock_id="2330", start_date=start_str, end_date=today_str)
+            if not df_tsmc.empty:
+                val = float(df_tsmc['close'].iloc[-1])
+                prev = float(df_tsmc['close'].iloc[-2]) if len(df_tsmc) > 1 else val
                 data["tsmc"] = {"val": val, "change": val - prev, "name": "台積電 (2330)"}
+        except Exception: pass
+
+    if "tsmc" not in data:
+        try:
+            url_twse = "[https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL](https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL)"
+            resp = requests.get(url_twse, timeout=5)
+            if resp.status_code == 200:
+                for item in resp.json():
+                    if str(item.get("Code", "")).strip() == "2330":
+                        close_p = float(str(item.get("ClosingPrice", 0)).replace(",", ""))
+                        open_p = float(str(item.get("OpeningPrice", close_p)).replace(",", ""))
+                        if close_p > 0:
+                            data["tsmc"] = {"val": close_p, "change": close_p - open_p, "name": "台積電 (2330)"}
+                            break
         except Exception: pass
 
     return data
@@ -163,7 +201,7 @@ def fetch_realtime_market_data(api_token=""):
 # 3. 全市場自動選股引擎
 # -----------------------------------------------------------------------------
 def run_market_screener(stock_dict, strategy_type):
-    url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    url_twse = "[https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL](https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL)"
     try:
         resp = requests.get(url_twse, timeout=10)
         if resp.status_code == 200:
@@ -244,7 +282,7 @@ def fetch_margin_history_cached(stock_id, start_date, end_date, api_token=""):
 
 @st.cache_data(ttl=86400)
 def get_norway_big_shareholders(stock_id):
-    url = f"https://norway.twsthr.info/StockHolders.aspx?stock={stock_id}"
+    url = f"[https://norway.twsthr.info/StockHolders.aspx?stock=](https://norway.twsthr.info/StockHolders.aspx?stock=){stock_id}"
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         if resp.status_code == 200:
@@ -367,8 +405,29 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. TradingAgents 多 Agent 模型對話與 JSON 格式化裁決引擎
+# 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎
 # -----------------------------------------------------------------------------
+def clean_and_parse_json(raw_text):
+    """強效 JSON 清洗與容錯解析，防止格式微瑕疵導致全盤連線失敗報錯"""
+    if not raw_text:
+        return None
+    txt = raw_text.strip()
+    if txt.startswith("```json"): txt = txt[7:]
+    if txt.startswith("```"): txt = txt[3:]
+    if txt.endswith("```"): txt = txt[:-3]
+    txt = txt.strip()
+    
+    try:
+        return json.loads(txt)
+    except Exception:
+        # 正則表達式抓取第一組完整 JSON {}
+        match = re.search(r'\{.*\}', txt, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception: pass
+    return None
+
 def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, chip_summary):
     raw_keys = get_secret("GEMINI_API_KEY", "")
     keys_list = parse_api_keys(raw_keys)
@@ -382,7 +441,7 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
 【技術面數據】：{tech_summary}
 【籌碼與大股東數據】：{chip_summary}
 
-請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown codeblock 說明），格式包含以下 Key：
+請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：
 {{
   "volume_price_volatility": "成交量與價格波動分析說明...",
   "market_stage": "目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...",
@@ -396,56 +455,53 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
 }}
 """
     models_to_try = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-flash-latest']
+    log_errs = []
     
     for idx, clean_key in enumerate(keys_list):
         for m in models_to_try:
+            # SDK 方式呼叫
             try:
                 from google import genai
                 client = genai.Client(api_key=clean_key)
-                response = client.models.generate_content(
-                    model=m,
-                    contents=prompt
-                )
+                response = client.models.generate_content(model=m, contents=prompt)
                 if response and response.text:
-                    txt = response.text.strip()
-                    if txt.startswith("```json"): txt = txt[7:]
-                    if txt.startswith("```"): txt = txt[3:]
-                    if txt.endswith("```"): txt = txt[:-3]
-                    try:
-                        res_json = json.loads(txt.strip())
-                        return res_json, None
-                    except Exception:
-                        return {"volume_price_volatility": txt}, None
-            except Exception:
-                try:
-                    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){m}:generateContent?key={clean_key}"
-                    headers = {"Content-Type": "application/json"}
-                    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                    resp = requests.post(url, headers=headers, json=payload, timeout=15)
-                    if resp.status_code == 200:
-                        res_json = resp.json()
-                        if 'candidates' in res_json:
-                            txt = res_json['candidates'][0]['content']['parts'][0]['text'].strip()
-                            if txt.startswith("```json"): txt = txt[7:]
-                            if txt.startswith("```"): txt = txt[3:]
-                            if txt.endswith("```"): txt = txt[:-3]
-                            try:
-                                parsed = json.loads(txt.strip())
-                                return parsed, None
-                            except Exception:
-                                return {"volume_price_volatility": txt}, None
-                except Exception: pass
+                    parsed = clean_and_parse_json(response.text)
+                    if parsed:
+                        return parsed, None
+                    # 若 JSON 解析失敗，平滑降級傳回純文字，絕不掛掉
+                    return {"volume_price_volatility": response.text}, None
+            except Exception as e_sdk:
+                log_errs.append(f"Key #{idx+1} ({m}) SDK Error: {e_sdk}")
 
-    return None, "❌ 所有 Secrets 中的 API Key 均連線失敗。"
+            # REST 備援方式呼叫
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={clean_key}"
+                headers = {"Content-Type": "application/json"}
+                payload = {"contents": [{"parts": [{"text": prompt}]}]}
+                resp = requests.post(url, headers=headers, json=payload, timeout=15)
+                if resp.status_code == 200:
+                    res_json = resp.json()
+                    if 'candidates' in res_json:
+                        txt = res_json['candidates'][0]['content']['parts'][0]['text']
+                        parsed = clean_and_parse_json(txt)
+                        if parsed:
+                            return parsed, None
+                        return {"volume_price_volatility": txt}, None
+                else:
+                    log_errs.append(f"Key #{idx+1} ({m}) REST HTTP {resp.status_code}")
+            except Exception as e_rest:
+                log_errs.append(f"Key #{idx+1} ({m}) REST Error: {e_rest}")
+
+    err_detail = " | ".join(log_errs[:3]) # 顯示前三條詳細紀錄
+    return None, f"❌ 所有 Secrets 中的 API Key 均連線失敗。\n測試日誌：{err_detail}"
 
 def render_trading_agents_cards(res):
-    """將 TradingAgents 多 Agent 裁決結果渲染為 image_a7c469.jpg 風格的深色卡片」"""
+    """將 TradingAgents 多 Agent 裁決結果渲染為深色卡片」"""
     if isinstance(res, str):
         st.info(res)
         return
 
     col1, col2 = st.columns(2)
-    
     card_style = """
         background-color: #1A1E29; 
         border: 1px solid #2A2E3D; 
@@ -456,65 +512,39 @@ def render_trading_agents_cards(res):
     """
     
     with col1:
-        # 卡片 1: 成交量和價格波動
         st.markdown(f"""
             <div style="{card_style}">
                 <div style="color: #FFB74D; font-weight: bold; font-size: 16px; margin-bottom: 8px;">⚡ 成交量和價格波動</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('volume_price_volatility', '數據載入中...')}</div>
+                <div style="font-size: 14px; line-height: 1.6;">{res.get('volume_price_volatility', '數據解析中...')}</div>
             </div>
-        """, unsafe_allow_html=True)
-        
-        # 卡片 2: 目前市場階段
-        st.markdown(f"""
             <div style="{card_style}">
                 <div style="color: #64B5F6; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🧭 目前市場階段</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('market_stage', '數據載入中...')}</div>
+                <div style="font-size: 14px; line-height: 1.6;">{res.get('market_stage', '數據解析中...')}</div>
             </div>
-        """, unsafe_allow_html=True)
-
-        # 卡片 3: 關鍵價格門檻
-        st.markdown(f"""
             <div style="{card_style}">
                 <div style="color: #81C784; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🚪 關鍵價格門檻</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('key_price_levels', '數據載入中...')}</div>
+                <div style="font-size: 14px; line-height: 1.6;">{res.get('key_price_levels', '數據解析中...')}</div>
             </div>
-        """, unsafe_allow_html=True)
-
-        # 卡片 4: 看多 vs 看空團隊辯論 (TradingAgents 特色)
-        st.markdown(f"""
             <div style="{card_style}">
                 <div style="color: #BA68C8; font-weight: bold; font-size: 16px; margin-bottom: 8px;">⚔️ 多空研究員正反辯論</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('bull_bear_debate', '數據載入中...')}</div>
+                <div style="font-size: 14px; line-height: 1.6;">{res.get('bull_bear_debate', '數據解析中...')}</div>
             </div>
         """, unsafe_allow_html=True)
 
     with col2:
-        # 卡片 5: 訊號分析
         st.markdown(f"""
             <div style="{card_style}">
                 <div style="color: #FF8A65; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🎯 訊號分析 (RSI/MACD)</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('signal_analysis', '數據載入中...')}</div>
+                <div style="font-size: 14px; line-height: 1.6;">{res.get('signal_analysis', '數據解析中...')}</div>
             </div>
-        """, unsafe_allow_html=True)
-
-        # 卡片 6: 圖表模式識別
-        st.markdown(f"""
             <div style="{card_style}">
                 <div style="color: #4DD0E1; font-weight: bold; font-size: 16px; margin-bottom: 8px;">📊 圖表模式識別</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('pattern_recognition', '數據載入中...')}</div>
+                <div style="font-size: 14px; line-height: 1.6;">{res.get('pattern_recognition', '數據解析中...')}</div>
             </div>
-        """, unsafe_allow_html=True)
-
-        # 卡片 7: 趨勢強度評估
-        st.markdown(f"""
             <div style="{card_style}">
                 <div style="color: #FFD54F; font-weight: bold; font-size: 16px; margin-bottom: 8px;">⚡ 趨勢強度評估</div>
-                <div style="font-size: 14px; line-height: 1.6;">{res.get('trend_strength', '數據載入中...')}</div>
+                <div style="font-size: 14px; line-height: 1.6;">{res.get('trend_strength', '數據解析中...')}</div>
             </div>
-        """, unsafe_allow_html=True)
-
-        # 卡片 8: 交易員與風控團隊最終裁決 (TradingAgents 特色)
-        st.markdown(f"""
             <div style="{card_style}; border: 1px solid #FF5252;">
                 <div style="color: #FF5252; font-weight: bold; font-size: 16px; margin-bottom: 8px;">🛡️ 風險管理與交易員裁決</div>
                 <div style="font-size: 14px; line-height: 1.6;">
@@ -548,7 +578,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
 
         st.markdown("---")
         st.markdown("## 🤖 TradingAgents 多 Agent 投資診斷會議與終極裁決")
-        with st.spinner("TradingAgents 團隊（技術員/多空研究員/交易員/風控經理）開會辯論中..."):
+        with st.spinner("TradingAgents 團隊（技術員/多空研究員/交易員/風控經理）連線分析中..."):
             latest = df_calc.iloc[-1]
             tech_info = f"收盤價:{latest['Close']}, 5MA:{latest['5MA']}, 20MA:{latest['20MA']}, 布林上軌:{latest['BB_Upper']}, 布林下軌:{latest['BB_Lower']}"
             chip_info = f"三大法人與融資資料長度: {len(chip_df)}天"
@@ -592,13 +622,13 @@ def render_market_ticker():
             change = d["change"]
             
             if change > 0:
-                color = "#FF5252"  # 紅色 (漲)
+                color = "#FF5252"
                 sign = "+"
             elif change < 0:
-                color = "#00E676"  # 綠色 (跌)
+                color = "#00E676"
                 sign = ""
             else:
-                color = "#FFFFFF"  # 白色 (平盤)
+                color = "#FFFFFF"
                 sign = ""
                 
             col.markdown(f"""

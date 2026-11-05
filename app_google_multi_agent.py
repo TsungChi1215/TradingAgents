@@ -53,7 +53,6 @@ def parse_api_keys(raw_input):
 def fetch_realtime_market_data():
     data = {}
     try:
-        # 台積電報價
         ticker_tsmc = yf.Ticker("2330.TW")
         todays_data = ticker_tsmc.history(period="2d")
         if not todays_data.empty:
@@ -62,7 +61,6 @@ def fetch_realtime_market_data():
             diff = p - y
             data["tsmc"] = {"val": p, "change": diff, "name": "台積電 (2330)"}
         
-        # 加權指數
         ticker_twii = yf.Ticker("^TWII")
         twii_data = ticker_twii.history(period="2d")
         if not twii_data.empty:
@@ -386,10 +384,14 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
 
 # -----------------------------------------------------------------------------
-# 8. Streamlit 主程式介面（側邊欄已完全移除文字輸入欄位）
+# 8. Streamlit 主程式介面與安全狀態初始化
 # -----------------------------------------------------------------------------
 finmind_token = get_secret("FINMIND_TOKEN", "")
 STOCK_DICT = get_all_taiwan_stock_info(finmind_token)
+
+# 確保 session_state 包含預設變數，避免 KeyError
+if "selected_stock_code" not in st.session_state:
+    st.session_state["selected_stock_code"] = "2356"
 
 with st.sidebar:
     st.markdown("### ⚡ 系統核心設定")
@@ -413,7 +415,6 @@ def render_market_ticker():
             val = d["val"]
             change = d["change"]
             
-            # 台股標準配色：漲紅、跌綠、平盤白
             if change > 0:
                 color = "#FF5252"  # 紅色
                 sign = "+"
@@ -468,7 +469,7 @@ if app_mode == "全市場自動選股版":
             
 else:
     filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
-    default_idx = next((i for i, opt in enumerate(filtered_options) if opt.startswith(st.session_state["selected_stock_code"])), 0)
+    default_idx = next((i for i, opt in enumerate(filtered_options) if opt.startswith(st.session_state.get("selected_stock_code", "2356"))), 0)
 
     selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options, index=default_idx)
     stock_id = selected_stock_raw.split(" ")[0]

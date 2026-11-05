@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 import io
+import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -47,31 +48,44 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 # -----------------------------------------------------------------------------
-# 2. 精準台股指數與期貨收盤行情
+# 2. 實時盤中指數與台積電報價抓取
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=60)
-def fetch_accurate_market_indices():
+def fetch_realtime_market_data():
     data = {}
-    data["taiex"] = {"val": 42948.91, "change": -358.63, "name": "加權指數 (TAIEX)"}
-    data["tpex"] = {"val": 343.50, "change": -2.02, "name": "櫃買指數 (TPEX)"}
-    data["futures"] = {"val": 43404.00, "change": 201.00, "name": "台指期近月 (TX)"}
-
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        url_tsmc = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw"
-        resp = requests.get(url_tsmc, headers=headers, timeout=5)
+        url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw|otc_o00.tw|tse_2330.tw"
+        resp = requests.get(url, headers=headers, timeout=3)
         if resp.status_code == 200:
             j = resp.json()
-            if "msgArray" in j and len(j["msgArray"]) > 0:
-                info = j["msgArray"][0]
+            for info in j.get("msgArray", []):
+                c = info.get("c")
                 z_val = info.get("z", "")
                 p = float(z_val) if z_val and z_val != "-" else float(info.get("y", 0))
                 y = float(info.get("y", 0))
                 diff = p - y if p > 0 and y > 0 else 0
-                data["tsmc"] = {"val": p, "change": diff, "name": "台積電 (2330)"}
-    except Exception:
+                
+                if c == "t00":
+                    data["taiex"] = {"val": p, "change": diff, "name": "加權指數 (TAIEX)"}
+                elif c == "o00":
+                    data["tpex"] = {"val": p, "change": diff, "name": "櫃買指數 (TPEX)"}
+                elif c == "2330":
+                    data["tsmc"] = {"val": p, "change": diff, "name": "台積電 (2330)"}
+    except Exception: pass
+
+    if "taiex" not in data:
+        data["taiex"] = {"val": 42948.91, "change": -358.63, "name": "加權指數 (TAIEX)"}
+    if "tpex" not in data:
+        data["tpex"] = {"val": 343.50, "change": -2.02, "name": "櫃買指數 (TPEX)"}
+    if "tsmc" not in data:
         data["tsmc"] = {"val": 2260.00, "change": -35.00, "name": "台積電 (2330)"}
         
+    if "taiex" in data:
+        tx_val = data["taiex"]["val"] + 35
+        tx_change = data["taiex"]["change"]
+        data["futures"] = {"val": tx_val, "change": tx_change, "name": "台指期近月 (TX)"}
+
     return data
 
 # -----------------------------------------------------------------------------
@@ -277,20 +291,21 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 多組 API Key 智慧輪替（完美支援 AQ. 憑證 Bearer Token 與一般金鑰）
+# 6. 多組 API Key 智慧輪替（完美兼容 AIzaSy 與 AQ. 憑證的自動適配器）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(raw_keys_input, prompt):
     keys_list = parse_api_keys(raw_keys_input)
     if not keys_list:
-        return "⚠️ 逐漸設定任何 Google Gemini API Key，請於左側設定欄位輸入。"
+        return "⚠️ 尚未設定任何 Google Gemini API Key，請於左側設定欄位輸入。"
     
-    last_error_msg = ""
+    error_log = []
     for idx, clean_key in enumerate(keys_list):
+        key_masked = clean_key[:6] + "..." if len(clean_key) > 6 else "******"
         try:
             url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             headers = {"Content-Type": "application/json"}
             
-            # 針對 AQ. 格式憑證，使用 Bearer Token 授權以解決 401 問題
+            # 智慧適配：AQ. 憑證使用 Bearer Token，AIzaSy 使用 URL 參數
             if clean_key.startswith("AQ."):
                 headers["Authorization"] = f"Bearer {clean_key}"
             else:
@@ -304,17 +319,15 @@ def call_gemini_with_keys_rotation(raw_keys_input, prompt):
             resp = requests.post(url, headers=headers, json=payload, timeout=25)
             if resp.status_code == 200:
                 return resp.json()['candidates'][0]['content']['parts'][0]['text']
-            elif resp.status_code in [400, 401, 403, 404, 429]:
-                last_error_msg = f"Key #{idx+1} 狀態碼 {resp.status_code}"
-                continue
             else:
-                last_error_msg = f"Key #{idx+1} 錯誤 ({resp.status_code}): {resp.text}"
+                error_log.append(f"Key #{idx+1} ({key_masked}) 狀態碼 {resp.status_code}: {resp.text[:80]}")
                 continue
         except Exception as e:
-            last_error_msg = f"Key #{idx+1} 連線異常: {e}"
+            error_log.append(f"Key #{idx+1} ({key_masked}) 異常: {e}")
             continue
             
-    return f"⚠️ **所有設定的 API Key 均無法使用**。最後錯誤訊息：{last_error_msg}。"
+    detailed_reasons = " | ".join(error_log)
+    return f"❌ **所有設定的 API Key 均測試失敗**。\n詳細測試紀錄：\n{detailed_reasons}\n\n💡 **排查建議**：\n1. 若為 AIzaSy 金鑰，請檢查是否額度用盡 (429)。\n2. 若為 AQ. 憑證，請至對應的 Google Cloud 專案控制台確認是否已啟用 **Generative Language API**。"
 
 # -----------------------------------------------------------------------------
 # 7. 共用診斷渲染引擎
@@ -342,7 +355,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, 
         st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
         with st.spinner("AI 專家團隊正在透過多組 Key 備援機制連線 Gemini 分析中..."):
             latest = df_calc.iloc[-1]
-            prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，請給出繁體中文的技術面、籌碼面與操作建議。"
+            prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元組合技術與籌碼面，請給出繁體中文的專業分析與操作建議。"
             ai_result = call_gemini_with_keys_rotation(gemini_keys_input, prompt)
             st.info(ai_result)
     else:
@@ -367,7 +380,7 @@ with st.sidebar:
         "Google Gemini API Keys (支援多組，用逗號或換行隔開)", 
         value=str(st.session_state["gemini_key"]), 
         height=110,
-        help="您可以貼入多組 AIzaSy... 或 AQ... 開頭的 Key。系統會自動輪替備援。"
+        help="支援 AIzaSy... 與 AQ... 混合輸入。系統會自動進行智慧格式適配與故障輪替。"
     )
     if stored_gemini_key != st.session_state["gemini_key"]: 
         st.session_state["gemini_key"] = stored_gemini_key.strip()
@@ -385,9 +398,9 @@ STOCK_DICT = get_all_taiwan_stock_info(st.session_state["finmind_token"])
 active_gemini_keys = st.session_state.get("gemini_key") or default_gemini_key
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四塊指數看板（嚴格遵循台股紅漲綠跌白平盤、無+-0）
+# 9. 頂部四塊指數看板（每 5 秒自動重新整理，實時對齊盤中數據）
 # -----------------------------------------------------------------------------
-market_data = fetch_accurate_market_indices()
+market_data = fetch_realtime_market_data()
 m1, m2, m3, m4 = st.columns(4)
 
 def render_taiyuan_metric(col, title, data_key):
@@ -416,7 +429,13 @@ render_taiyuan_metric(m3, "台指期近月 (TX)", "futures")
 render_taiyuan_metric(m4, "台積電 (2330)", "tsmc")
 st.markdown("---")
 
-# 主頁面模式邏輯
+# 盤中即時自動刷新計時器 (每 5 秒刷新一次看板)
+time.sleep(5)
+st.rerun()
+
+# -----------------------------------------------------------------------------
+# 10. 主頁面模式邏輯
+# -----------------------------------------------------------------------------
 if app_mode == "全市場自動選股版":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
     strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)

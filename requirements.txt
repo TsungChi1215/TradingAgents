@@ -5,8 +5,7 @@ requests
 plotly
 yfinance
 FinMind
-google-generativeai
+google-genai
 python-dotenv
 beautifulsoup4
 lxml
-

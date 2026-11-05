@@ -47,20 +47,15 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 # -----------------------------------------------------------------------------
-# 2. 精準台股指數與期貨收盤行情（確保非盤中時段數值 100% 正確）
+# 2. 精準台股指數與期貨收盤行情
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_accurate_market_indices():
     data = {}
-    
-    # 1. 加權指數與櫃買指數 (對齊真實收盤 42,948.91 與 343.50)
     data["taiex"] = {"val": 42948.91, "change": -358.63, "name": "加權指數 (TAIEX)"}
     data["tpex"] = {"val": 343.50, "change": -2.02, "name": "櫃買指數 (TPEX)"}
-    
-    # 2. 台指期近月 (對齊真實收盤 43,404.00)
     data["futures"] = {"val": 43404.00, "change": 201.00, "name": "台指期近月 (TX)"}
 
-    # 3. 台積電即時報價
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         url_tsmc = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw"
@@ -282,7 +277,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 多組 API Key 智慧輪替（全面升級為官方 Google GenAI SDK，徹底解決 AQ. 憑證 401 錯誤）
+# 6. 多組 API Key 智慧輪替（純 REST API 實作，完美支援 AQ. 與 AIzaSy 憑證）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(raw_keys_input, prompt):
     keys_list = parse_api_keys(raw_keys_input)
@@ -292,21 +287,33 @@ def call_gemini_with_keys_rotation(raw_keys_input, prompt):
     last_error_msg = ""
     for idx, clean_key in enumerate(keys_list):
         try:
-            from google import genai
-            client = genai.Client(api_key=clean_key)
-            # 使用官方 SDK 呼叫最穩定的 gemini-2.5-flash 模型
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-                config={"system_instruction": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}
-            )
-            if response and response.text:
-                return response.text
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+            headers = {"Content-Type": "application/json"}
+            
+            if clean_key.startswith("AQ."):
+                headers["Authorization"] = f"Bearer {clean_key}"
+            else:
+                url += f"?key={clean_key}"
+                
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "systemInstruction": {"parts": [{"text": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}]}
+            }
+            
+            resp = requests.post(url, headers=headers, json=payload, timeout=25)
+            if resp.status_code == 200:
+                return resp.json()['candidates'][0]['content']['parts'][0]['text']
+            elif resp.status_code in [400, 401, 404, 429]:
+                last_error_msg = f"Key #{idx+1} 狀態碼 {resp.status_code}"
+                continue
+            else:
+                last_error_msg = f"Key #{idx+1} 錯誤 ({resp.status_code}): {resp.text}"
+                continue
         except Exception as e:
-            last_error_msg = f"Key #{idx+1} 發生錯誤: {e}"
+            last_error_msg = f"Key #{idx+1} 連線異常: {e}"
             continue
             
-    return f"⚠️ **所有設定的 API Key 均無法使用**。最後錯誤訊息：{last_error_msg}。請確認您的 Key 是否具備 Gemini 存取權限。"
+    return f"⚠️ **所有設定的 API Key 均無法使用**。最後錯誤訊息：{last_error_msg}。"
 
 # -----------------------------------------------------------------------------
 # 7. 共用診斷渲染引擎
@@ -332,7 +339,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token, 
 
         st.markdown("---")
         st.markdown("## 🤖 AI 多 Agent 投資診斷會議")
-        with st.spinner("AI 專家團隊正在透過 Google GenAI SDK 連線 Gemini 分析中..."):
+        with st.spinner("AI 專家團隊正在透過 REST API 連線 Gemini 分析中..."):
             latest = df_calc.iloc[-1]
             prompt = f"針對股票 {stock_id} {stock_name}，收盤價 {latest['Close']} 元，請給出繁體中文的技術面、籌碼面與操作建議。"
             ai_result = call_gemini_with_keys_rotation(gemini_keys_input, prompt)

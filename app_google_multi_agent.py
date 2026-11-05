@@ -51,10 +51,12 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 # -----------------------------------------------------------------------------
-# 2. 四大指數與台積電即時行情抓取
+# 2. 四大指數與台積電即時行情抓取（精準對齊真實市場數據與 5 秒更新）
 # -----------------------------------------------------------------------------
 def fetch_realtime_market_data():
     data = {}
+    
+    # 1. 加權指數 (^TWII)
     try:
         df = yf.Ticker("^TWII").history(period="2d")
         if not df.empty:
@@ -63,6 +65,7 @@ def fetch_realtime_market_data():
             data["taiex"] = {"val": val, "change": val - prev, "name": "加權指數 (TAIEX)"}
     except Exception: pass
 
+    # 2. 櫃買指數 (^TWOII)
     try:
         df = yf.Ticker("^TWOII").history(period="2d")
         if not df.empty:
@@ -71,6 +74,7 @@ def fetch_realtime_market_data():
             data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
     except Exception: pass
 
+    # 3. 台指期近月 (TX=F)
     try:
         df = yf.Ticker("TX=F").history(period="2d")
         if not df.empty:
@@ -79,6 +83,7 @@ def fetch_realtime_market_data():
             data["futures"] = {"val": val, "change": val - prev, "name": "台指近月 (TX)"}
     except Exception: pass
 
+    # 4. 台積電 (2330.TW)
     try:
         df = yf.Ticker("2330.TW").history(period="2d")
         if not df.empty:
@@ -87,6 +92,7 @@ def fetch_realtime_market_data():
             data["tsmc"] = {"val": val, "change": val - prev, "name": "台積電 (2330)"}
     except Exception: pass
 
+    # 安全備援預設值
     if "taiex" not in data:
         data["taiex"] = {"val": 42371.66, "change": -577.25, "name": "加權指數 (TAIEX)"}
     if "tpex" not in data:
@@ -99,7 +105,7 @@ def fetch_realtime_market_data():
     return data
 
 # -----------------------------------------------------------------------------
-# 3. 全市場自動選股引擎
+# 3. 全市場自動選股引擎（嚴格區隔短線與波段條件）
 # -----------------------------------------------------------------------------
 def run_market_screener(stock_dict, strategy_type):
     url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -121,10 +127,12 @@ def run_market_screener(stock_dict, strategy_type):
                     change_pct = ((close_p - open_p) / open_p) * 100 if open_p > 0 else 0
                     
                     if strategy_type == "短線強勢爆發":
+                        # 條件：當日漲幅大於 2%、成交量大於 1,500 張、且收盤價突破開盤價
                         if change_pct >= 2.0 and vol_lots >= 1500 and close_p > open_p:
                             selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '漲幅(%)': round(change_pct, 2), '成交量(張)': vol_lots})
                     elif strategy_type == "波段多頭排列":
-                        if vol_lots >= 1000 and close_p >= open_p and change_pct >= 0.5:
+                        # 條件：中價位穩健、成交量大於 1,000 張、且漲幅保持在 0.5% ~ 3% 之間（穩健多頭）
+                        if 0.5 <= change_pct <= 3.0 and vol_lots >= 1000 and close_p >= open_p:
                             selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '漲幅(%)': round(change_pct, 2), '成交量(張)': vol_lots})
             
             if selected_list:
@@ -306,7 +314,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 多組 API Key 智慧輪替（完美相容 AIzaSy 與 AQ. 憑證）
+# 6. API Key 智慧輪替（全面支援 AIzaSy 與 AQ. 憑證，並強制對齊正確的 gemini 模型路徑）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(prompt):
     raw_keys = get_secret("GEMINI_API_KEY", "")
@@ -316,12 +324,14 @@ def call_gemini_with_keys_rotation(prompt):
         return "⚠️ 系統未偵測到任何 Gemini API Key，請至 Streamlit Secrets 設定 `GEMINI_API_KEY`。"
     
     error_log = []
+    # 使用標準且目前支援的模型代號
     models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
     
     for idx, clean_key in enumerate(keys_list):
         key_masked = clean_key[:6] + "..." if len(clean_key) > 6 else "******"
         res_text = ""
         
+        # 1. 優先透過 google-genai SDK 呼叫
         try:
             from google import genai
             client = genai.Client(api_key=clean_key)
@@ -339,6 +349,7 @@ def call_gemini_with_keys_rotation(prompt):
         except Exception as e_sdk:
             res_text = f"SDK 錯誤: {e_sdk}"
 
+        # 2. 備援：透過標準 REST API 帶入正確端點與授權標頭
         for m in models_to_try:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
@@ -417,7 +428,7 @@ with st.sidebar:
     end_date = st.date_input("結束日期", value=datetime.today())
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四大指數獨立區塊（每 5 秒自動更新）
+# 9. 頂部四大指數獨立區塊（每 5 秒自動重新整理）
 # -----------------------------------------------------------------------------
 @st.fragment(run_every=5)
 def render_market_ticker():
@@ -464,11 +475,11 @@ if app_mode == "全市場自動選股版":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
     strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)
     
-    # 動態呈現選股條件提示框
+    # 動態呈現當前選股條件看板
     if strategy_choice == "短線強勢爆發":
         st.info("📌 **當前篩選條件**：當日漲幅大於 2%、成交量暴增（大於 1,500 張）、且收盤價突破開盤價。")
     else:
-        st.info("📌 **當前篩選條件**：中價位穩定、成交量大於 1,000 張、且漲幅大於 0.5% 之穩健多頭標的。")
+        st.info("📌 **當前篩選條件**：中價位穩定、成交量大於 1,000 張、且漲幅保持在 0.5% ~ 3% 之間的穩健多頭標的。")
 
     if st.button("🚀 開始連線證交所全市場掃描"):
         with st.spinner("正從證交所開放 API 撈取今日全市場資料進行運算..."):

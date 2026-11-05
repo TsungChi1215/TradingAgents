@@ -376,29 +376,21 @@ def calculate_indicators(df_price):
     return df
 
 # -----------------------------------------------------------------------------
-# 5. Plotly 圖表繪製 (手機端行動最佳化版本)
+# 5. Plotly 圖表繪製 (手機端完美抗重疊與極致寬度最佳化)
 # -----------------------------------------------------------------------------
-def apply_dark_theme(fig, height=450, title=""):
+def apply_dark_theme(fig, height=520):
     fig.update_layout(
         template="plotly_dark",
         height=height,
-        margin=dict(l=10, r=10, t=65, b=35),
+        margin=dict(l=10, r=10, t=45, b=30),
         hovermode="x unified",
-        title=dict(
-            text=title,
-            font=dict(color="#00E676", size=14, family="sans-serif"),
-            x=0.0,
-            y=0.98,
-            xanchor="left",
-            yanchor="top"
-        ),
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.01,
+            y=1.02,
             xanchor="left",
             x=0,
-            font=dict(size=10, color="#CFD8DC"),
+            font=dict(size=10.5, color="#CFD8DC"),
             bgcolor="rgba(0,0,0,0)"
         ),
         autosize=True
@@ -420,7 +412,7 @@ def apply_dark_theme(fig, height=450, title=""):
     )
     return fig
 
-def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
+def plot_main_kline_chart(price_df, display_start_date):
     df_calc = calculate_indicators(price_df)
     df_price = df_calc[df_calc['Date'] >= display_start_date].copy()
     fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
@@ -438,7 +430,7 @@ def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
     fig.update_yaxes(title_text="", secondary_y=False)
     fig.update_yaxes(title_text="", range=[0, max_vol * 3.5], secondary_y=True, showgrid=False)
     fig.update_xaxes(rangeslider_visible=False)
-    return apply_dark_theme(fig, height=480, title=f"📈 {stock_id} {stock_name} 股價K線與布林通道")
+    return apply_dark_theme(fig, height=520)
 
 def plot_chip_chart(chip_df, display_start_date):
     fig = go.Figure()
@@ -459,7 +451,7 @@ def plot_chip_chart(chip_df, display_start_date):
                 colors = np.where(vals >= 0, '#FF5252', '#00E676')
                 fig.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=colors))
     fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360, title="🏛️ 三大法人每日淨買賣超 (張)")
+    return apply_dark_theme(fig, height=360)
 
 def plot_margin_chart(margin_df, display_start_date):
     fig = go.Figure()
@@ -473,15 +465,15 @@ def plot_margin_chart(margin_df, display_start_date):
             diff = (margin_sub[m_buy[0]] - margin_sub[m_sell[0]]) / 1000
             fig.add_trace(go.Bar(x=margin_sub[d_col], y=diff.round(0), name="融資增減(張)", marker_color=np.where(diff >= 0, '#FF5252', '#00E676')))
     fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360, title="💳 融資餘額每日增減變化 (張)")
+    return apply_dark_theme(fig, height=360)
 
-def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
+def plot_norway_pyramid_chart(norway_df):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     if not norway_df.empty:
         formatted_date = norway_df['Date'].astype(str).apply(lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d)==8 else d)
         fig.add_trace(go.Bar(x=formatted_date, y=norway_df['Total_People'], name="總股東人數(人)", marker_color='#546E7A', opacity=0.8), secondary_y=False)
         fig.add_trace(go.Scatter(x=formatted_date, y=norway_df['Big_Ratio'], name="大股東持股率(%)", mode="lines+markers", line=dict(color="#FF9100", width=2.5), marker=dict(size=4, color="#FFFFFF")), secondary_y=True)
-    return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 (股東人數 vs 大股東持股率)")
+    return apply_dark_theme(fig, height=380)
 
 # -----------------------------------------------------------------------------
 # 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎
@@ -758,10 +750,18 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     if not price_df.empty:
         df_calc = calculate_indicators(price_df)
         
-        st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_str))
-        st.plotly_chart(plot_chip_chart(chip_df, s_str))
-        st.plotly_chart(plot_margin_chart(margin_df, s_str))
-        st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name))
+        # 標題獨立顯示，完全避免 Plotly 內部標題與多行圖例重疊
+        st.markdown(f"### 📈 {stock_id} {stock_name} 股價 K 線與布林通道")
+        st.plotly_chart(plot_main_kline_chart(price_df, s_str), use_container_width=True)
+        
+        st.markdown("### 🏛️ 三大法人每日淨買賣超 (張 - 紅買綠賣)")
+        st.plotly_chart(plot_chip_chart(chip_df, s_str), use_container_width=True)
+        
+        st.markdown("### 💳 融資餘額每日增減變化 (張 - 紅增綠減)")
+        st.plotly_chart(plot_margin_chart(margin_df, s_str), use_container_width=True)
+        
+        st.markdown(f"### 🏛️ {stock_id} {stock_name} 神秘金字塔 (股東人數 vs 大股東持股率)")
+        st.plotly_chart(plot_norway_pyramid_chart(norway_df), use_container_width=True)
 
         st.markdown("---")
         st.markdown("## 🤖 TradingAgents 多 Agent 投資診斷會議與終極裁決")

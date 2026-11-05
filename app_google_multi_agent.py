@@ -51,48 +51,42 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 # -----------------------------------------------------------------------------
-# 2. 四大指數與台積電即時行情抓取（精準對齊台股實盤行情）
+# 2. 四大指數與台積電即時行情抓取
 # -----------------------------------------------------------------------------
 def fetch_realtime_market_data():
     data = {}
-    
-    # 1. 加權指數 (^TWII)
     try:
-        df_twii = yf.Ticker("^TWII").history(period="2d")
-        if not df_twii.empty:
-            val = float(df_twii['Close'].iloc[-1])
-            prev = float(df_twii['Close'].iloc[-2]) if len(df_twii) > 1 else val
+        df = yf.Ticker("^TWII").history(period="2d")
+        if not df.empty:
+            val = float(df['Close'].iloc[-1])
+            prev = float(df['Close'].iloc[-2]) if len(df) > 1 else val
             data["taiex"] = {"val": val, "change": val - prev, "name": "加權指數 (TAIEX)"}
     except Exception: pass
 
-    # 2. 櫃買指數 (^TWOII)
     try:
-        df_twoii = yf.Ticker("^TWOII").history(period="2d")
-        if not df_twoii.empty:
-            val = float(df_twoii['Close'].iloc[-1])
-            prev = float(df_twoii['Close'].iloc[-2]) if len(df_twoii) > 1 else val
+        df = yf.Ticker("^TWOII").history(period="2d")
+        if not df.empty:
+            val = float(df['Close'].iloc[-1])
+            prev = float(df['Close'].iloc[-2]) if len(df) > 1 else val
             data["tpex"] = {"val": val, "change": val - prev, "name": "櫃買指數 (TPEX)"}
     except Exception: pass
 
-    # 3. 台指期近月 (TX=F)
     try:
-        df_tx = yf.Ticker("TX=F").history(period="2d")
-        if not df_tx.empty:
-            val = float(df_tx['Close'].iloc[-1])
-            prev = float(df_tx['Close'].iloc[-2]) if len(df_tx) > 1 else val
+        df = yf.Ticker("TX=F").history(period="2d")
+        if not df.empty:
+            val = float(df['Close'].iloc[-1])
+            prev = float(df['Close'].iloc[-2]) if len(df) > 1 else val
             data["futures"] = {"val": val, "change": val - prev, "name": "台指近月 (TX)"}
     except Exception: pass
 
-    # 4. 台積電 (2330.TW)
     try:
-        df_tsmc = yf.Ticker("2330.TW").history(period="2d")
-        if not df_tsmc.empty:
-            val = float(df_tsmc['Close'].iloc[-1])
-            prev = float(df_tsmc['Close'].iloc[-2]) if len(df_tsmc) > 1 else val
+        df = yf.Ticker("2330.TW").history(period="2d")
+        if not df.empty:
+            val = float(df['Close'].iloc[-1])
+            prev = float(df['Close'].iloc[-2]) if len(df) > 1 else val
             data["tsmc"] = {"val": val, "change": val - prev, "name": "台積電 (2330)"}
     except Exception: pass
 
-    # 安全預備值
     if "taiex" not in data:
         data["taiex"] = {"val": 42371.66, "change": -577.25, "name": "加權指數 (TAIEX)"}
     if "tpex" not in data:
@@ -122,16 +116,21 @@ def run_market_screener(stock_dict, strategy_type):
                     vol = float(str(item.get('TradeVolume', 0)).replace(',', '')) if item.get('TradeVolume') else 0
                     vol_lots = int(vol / 1000)
                     
-                    if vol_lots < 500: continue
+                    if vol_lots < 800: continue
                     sname = stock_dict.get(sid, sid)
+                    change_pct = ((close_p - open_p) / open_p) * 100 if open_p > 0 else 0
                     
-                    if strategy_type == "短線強勢爆發" and close_p > open_p and vol_lots > 2000:
-                        selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '今日開盤': open_p, '成交量(張)': vol_lots})
-                    elif strategy_type == "波段多頭排列" and close_p > open_p:
-                        selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '今日開盤': open_p, '成交量(張)': vol_lots})
+                    if strategy_type == "短線強勢爆發":
+                        if change_pct >= 2.0 and vol_lots >= 1500 and close_p > open_p:
+                            selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '漲幅(%)': round(change_pct, 2), '成交量(張)': vol_lots})
+                    elif strategy_type == "波段多頭排列":
+                        if vol_lots >= 1000 and close_p >= open_p and change_pct >= 0.5:
+                            selected_list.append({'股票代碼': sid, '股票名稱': sname, '今日收盤': close_p, '漲幅(%)': round(change_pct, 2), '成交量(張)': vol_lots})
             
             if selected_list:
-                return pd.DataFrame(selected_list).sort_values(by='成交量(張)', ascending=False).head(30)
+                df_res = pd.DataFrame(selected_list)
+                sort_col = '漲幅(%)' if strategy_type == "短線強勢爆發" else '成交量(張)'
+                return df_res.sort_values(by=sort_col, ascending=False).head(30)
     except Exception: pass
     return pd.DataFrame()
 
@@ -307,7 +306,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. API Key 智慧輪替（正確區分 AIzaSy 標準 Key 與 AQ. 憑證的呼叫通道）
+# 6. 多組 API Key 智慧輪替（完美相容 AIzaSy 與 AQ. 憑證）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(prompt):
     raw_keys = get_secret("GEMINI_API_KEY", "")
@@ -323,20 +322,32 @@ def call_gemini_with_keys_rotation(prompt):
         key_masked = clean_key[:6] + "..." if len(clean_key) > 6 else "******"
         res_text = ""
         
-        # 針對不同類型的 Key 採用對應的正確請求方式
+        try:
+            from google import genai
+            client = genai.Client(api_key=clean_key)
+            for m in models_to_try:
+                try:
+                    response = client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                        config={"system_instruction": "你是一位專業的台灣股市分析師，請全程使用繁體中文回答。"}
+                    )
+                    if response and response.text:
+                        return response.text
+                except Exception:
+                    continue
+        except Exception as e_sdk:
+            res_text = f"SDK 錯誤: {e_sdk}"
+
         for m in models_to_try:
             try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+                headers = {"Content-Type": "application/json"}
+                
                 if clean_key.startswith("AQ."):
-                    # AQ. 憑證使用 Google Cloud Vertex AI / Bearer REST 授權通道
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
-                    headers = {
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {clean_key}"
-                    }
+                    headers["Authorization"] = f"Bearer {clean_key}"
                 else:
-                    # AIzaSy 憑證使用標準 API Key 參數
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={clean_key}"
-                    headers = {"Content-Type": "application/json"}
+                    url += f"?key={clean_key}"
                     
                 payload = {
                     "contents": [{"parts": [{"text": prompt}]}],
@@ -350,8 +361,8 @@ def call_gemini_with_keys_rotation(prompt):
                         return res_json['candidates'][0]['content']['parts'][0]['text']
                 else:
                     res_text = f"HTTP {resp.status_code}"
-            except Exception as e:
-                res_text = f"異常: {e}"
+            except Exception as e_rest:
+                res_text = f"REST 異常: {e_rest}"
                 
         error_log.append(f"Key #{idx+1} ({key_masked}) -> {res_text}")
             
@@ -406,7 +417,7 @@ with st.sidebar:
     end_date = st.date_input("結束日期", value=datetime.today())
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四大指數獨立區塊（每 5 秒局部刷新，嚴格套用台股紅漲綠跌白平盤配色）
+# 9. 頂部四大指數獨立區塊（每 5 秒自動更新）
 # -----------------------------------------------------------------------------
 @st.fragment(run_every=5)
 def render_market_ticker():
@@ -453,6 +464,12 @@ if app_mode == "全市場自動選股版":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
     strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)
     
+    # 動態呈現選股條件提示框
+    if strategy_choice == "短線強勢爆發":
+        st.info("📌 **當前篩選條件**：當日漲幅大於 2%、成交量暴增（大於 1,500 張）、且收盤價突破開盤價。")
+    else:
+        st.info("📌 **當前篩選條件**：中價位穩定、成交量大於 1,000 張、且漲幅大於 0.5% 之穩健多頭標的。")
+
     if st.button("🚀 開始連線證交所全市場掃描"):
         with st.spinner("正從證交所開放 API 撈取今日全市場資料進行運算..."):
             st.session_state["screener_res"] = run_market_screener(STOCK_DICT, strategy_choice)

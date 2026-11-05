@@ -50,13 +50,12 @@ def parse_api_keys(raw_input):
     return [p for p in parts if p]
 
 # -----------------------------------------------------------------------------
-# 2. 四大指數與台積電即時行情抓取（全面改用 FinMind API）
+# 2. 四大指數與台積電即時行情抓取（零預設假數字、純即時 FinMind 抓取）
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=300)
 def fetch_realtime_market_data(api_token=""):
     data = {}
     today_str = datetime.today().strftime("%Y-%m-%d")
-    start_str = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+    start_str = (datetime.today() - timedelta(days=10)).strftime("%Y-%m-%d")
     
     try:
         from FinMind.data import DataLoader
@@ -82,7 +81,6 @@ def fetch_realtime_market_data(api_token=""):
         if not df_futures.empty:
             df_tx = df_futures[df_futures["stock_id"] == "TX"].copy()
             if not df_tx.empty:
-                # 取得最新日期的近月合約
                 latest_date = df_tx['date'].max()
                 df_tx_latest = df_tx[df_tx['date'] == latest_date]
                 if not df_tx_latest.empty:
@@ -97,18 +95,8 @@ def fetch_realtime_market_data(api_token=""):
             prev = float(df_tsmc['close'].iloc[-2]) if len(df_tsmc) > 1 else val
             data["tsmc"] = {"val": val, "change": val - prev, "name": "台積電 (2330)"}
             
-    except Exception: 
-        pass
-
-    # 安全備援預設值
-    if "taiex" not in data:
-        data["taiex"] = {"val": 22386.42, "change": -562.49, "name": "加權指數 (TAIEX)"}
-    if "tpex" not in data:
-        data["tpex"] = {"val": 259.65, "change": -3.85, "name": "櫃買指數 (TPEX)"}
-    if "futures" not in data:
-        data["futures"] = {"val": 22431.42, "change": -562.49, "name": "台指近月 (TX)"}
-    if "tsmc" not in data:
-        data["tsmc"] = {"val": 2265.00, "change": 5.00, "name": "台積電 (2330)"}
+    except Exception as e: 
+        print(f"Fetch Market Data Error: {e}")
 
     return data
 
@@ -320,7 +308,7 @@ def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
     return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
 
 # -----------------------------------------------------------------------------
-# 6. 純同步 REST API 呼叫 Gemini（避免非同步執行緒衝突）
+# 6. 純同步 REST API 呼叫 Gemini（完美支援 gemini-1.5-flash / gemini-1.5-pro）
 # -----------------------------------------------------------------------------
 def call_gemini_with_keys_rotation(prompt):
     raw_keys = get_secret("GEMINI_API_KEY", "")
@@ -330,11 +318,9 @@ def call_gemini_with_keys_rotation(prompt):
         return "⚠️ 系統未偵測到任何 Gemini API Key，請至 Streamlit Secrets 設定 `GEMINI_API_KEY`。"
     
     error_log = []
-    models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
     
     for idx, clean_key in enumerate(keys_list):
-        key_masked = clean_key[:6] + "..." if len(clean_key) > 6 else "******"
-        
         for m in models_to_try:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={clean_key}"
@@ -405,7 +391,7 @@ with st.sidebar:
     end_date = st.date_input("結束日期", value=datetime.today())
 
 # -----------------------------------------------------------------------------
-# 9. 頂部四大指數獨立區塊（採用 FinMind 即時查詢）
+# 9. 頂部四大指數獨立區塊（每 5 秒自動重新整理，零預設假值）
 # -----------------------------------------------------------------------------
 @st.fragment(run_every=5)
 def render_market_ticker():
@@ -435,7 +421,13 @@ def render_market_ticker():
                 </div>
             """, unsafe_allow_html=True)
         else:
-            col.metric(title, "--", "0.00")
+            col.markdown(f"""
+                <div style="background-color: #1E222D; padding: 15px; border-radius: 8px; border: 1px solid #848E9C;">
+                    <span style="color: #848E9C; font-size: 14px;">{title}</span><br>
+                    <span style="color: #848E9C; font-size: 26px; font-weight: bold;">--</span><br>
+                    <span style="color: #848E9C; font-size: 15px; font-weight: bold;">等待即時數據...</span>
+                </div>
+            """, unsafe_allow_html=True)
 
     render_taiwan_metric(m1, "加權指數 (TAIEX)", market_data.get("taiex"))
     render_taiwan_metric(m2, "櫃買指數 (TPEX)", market_data.get("tpex"))

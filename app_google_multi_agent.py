@@ -59,8 +59,22 @@ st.markdown("""
     .tk-chg { font-size: 14px; font-weight: bold; }
     .tk-note { color: #848E9C; font-size: 12px; margin: 6px 0 2px 0; line-height: 1.5; }
     /* 行情區塊更新時不變暗（Streamlit 以 data-stale 標記更新中的元素） */
-    div[data-stale="true"]:has(.tk-grid), div[data-stale="true"]:has(.tk-note), div[data-stale="true"]:has(.st-key-refresh_market_quotes) { opacity: 1 !important; transition: none !important; }
-    .tk-meta { color: #848E9C; font-size: 11px; line-height: 1.4; margin-top: 2px; word-break: break-all; }
+    div[data-stale="true"]:has(.tk-grid), div[data-stale="true"]:has(.tk-note), div[data-stale="true"]:has(.sr-box),
+    div[data-stale="true"]:has(.st-key-refresh_market_quotes), div[data-stale="true"]:has(.st-key-sector_rank_dir) { opacity: 1 !important; transition: none !important; }
+    .tk-card.wide { grid-column: 1 / -1; }
+    .tk-chg small { font-weight: normal; opacity: .9; }
+    .lm-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 14px; }
+    .lm-row b { font-size: 18px; }
+    .lm-name { color: #E0E3EB; min-width: 2.5em; }
+    .sr-box { background-color: #1E222D; border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+    .sr-head { color: #E0E3EB; font-size: 15px; font-weight: bold; }
+    .sr-row { display: grid; grid-template-columns: 1.4em minmax(4.5em, 6.5em) 1fr 4.6em; align-items: center; gap: 6px; margin-top: 7px; font-size: 13px; }
+    .sr-rank { color: #848E9C; text-align: right; }
+    .sr-name { color: #E0E3EB; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sr-bar { background: #2A2E39; height: 10px; border-radius: 5px; overflow: hidden; }
+    .sr-fill { height: 100%; border-radius: 5px; }
+    .sr-pct { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; }
+    .tk-meta { color: #848E9C; font-size: 11px; line-height: 1.4; margin-top: 2px; overflow-wrap: anywhere; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -186,7 +200,7 @@ def select_tx_near_month(rows, official=False):
 
 
 # --- 即時行情來源（多來源並行抓取，取「資料時間最新」者；任一來源失敗不影響其他來源） ---
-TICKER_REFRESH_SECONDS = 60      # 頂部四大指數的自動更新間隔（秒）
+TICKER_REFRESH_SECONDS = 60      # 頂部指數／漲跌停家數／類股排行的自動更新間隔（秒）
 QUOTE_MAX_AGE_OPEN = 20          # 盤中：資料超過 20 秒就在背景重新抓取
 QUOTE_MAX_AGE_CLOSED = 600       # 非交易時段：10 分鐘才重抓一次
 TX_SYMBOL = re.compile(r'^TXF([A-L])(\d)-([FM])$')   # 例：TXFK6-F = 2026/11 台指期（日盤）
@@ -301,6 +315,69 @@ def rt_yahoo():
     return out
 
 
+LIMIT_STOCK = re.compile(r'^[1-9]\d{3}[A-Z]?\.TWO?$')   # 一般股票代號（排除 ETF、權證、ETN 等）
+
+
+def rt_breadth():
+    """上市／上櫃的漲停、跌停家數（Yahoo 股市漲跌幅排行；每頁最多 100 檔，漲停／跌停必定排在最前面）。"""
+    def one(exchange, kind):
+        sort = '-changePercent' if kind == 'up' else 'changePercent'
+        url = ('https://tw.stock.yahoo.com/_td-stock/api/resource/StockServices.rank;'
+               f'exchange={exchange};limit=100;offset=0;period=1D;rankId=change-{kind};sortBy={sort}')
+        payload = rt_request('GET', url)
+        rows = payload.get('list') or []
+        flag = 'limitUp' if kind == 'up' else 'limitDown'
+        stocks = [r for r in rows if LIMIT_STOCK.match(str(r.get('symbol', '')))]
+        count = sum(1 for r in stocks if r.get(flag))
+        truncated = len(rows) >= 100 and bool(rows[-1].get(flag))   # 100 檔全是漲停／跌停 → 實際家數可能更多
+        return count, truncated, payload.get('rankTime')
+
+    jobs = {(ex, kind): (ex, kind) for ex in ('TAI', 'TWO') for kind in ('up', 'down')}
+    out, stamps = {}, []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {k: pool.submit(one, *k) for k in jobs}
+        for k, f in futures.items():
+            count, truncated, stamp = f.result(timeout=12)
+            out[k] = (count, truncated)
+            if stamp:
+                stamps.append(stamp)
+    stamp = max(stamps) if stamps else ''
+    result = {'source': 'Yahoo 股市', 'date': stamp[:10], 'time': stamp[11:19], 'ts': stamp}
+    for label, ex in (('listed', 'TAI'), ('otc', 'TWO')):
+        result[label] = {'up': out[(ex, 'up')][0], 'down': out[(ex, 'down')][0],
+                         'up_more': out[(ex, 'up')][1], 'down_more': out[(ex, 'down')][1]}
+    return {'breadth': result}
+
+
+# 上市類股指數（鉅亨網）：TSE04~TSE43 之中扣除「加權／不含金融／不含電子／化學生技醫療／不含金融電子」等彙總指數，
+# 再加上 TWSE 主題類指數（綠能環保、數位雲端、運動休閒、居家生活）
+# 04 化學、05 生技醫療、15~20 水泥/食品/塑膠/紡織/電機/電器電纜、22~33 玻璃…其他、35 油電燃氣、36~43 電子各次類股
+SECTOR_CODES = [f'TWS:TSE{n:02d}:INDEX' for n in (4, 5, *range(15, 21), *range(22, 34), *range(35, 44))] + \
+               [f'TWS:IX{n:04d}:INDEX' for n in (185, 186, 187, 188)]
+
+
+def rt_sectors():
+    payload = rt_request('GET', 'https://ws.api.cnyes.com/ws/api/v1/quote/quotes/' + ','.join(SECTOR_CODES),
+                         params={'column': 'K,G'})
+    rows, stamps = [], []
+    for item in payload.get('data') or []:
+        pct, price, stamp = as_number(item.get('56')), as_number(item.get('6')), as_number(item.get('200007'))
+        name = re.sub(r'\s+', '', str(item.get('200009') or ''))
+        name = re.sub(r'(類指數|股價指數|類股)$', '', name) or name
+        name = {'電子': '電子工業'}.get(name, name)
+        if pct is None or not price or not name:
+            continue
+        rows.append({'name': name, 'pct': pct, 'price': price, 'change': as_number(item.get('11'))})
+        if stamp:
+            stamps.append(stamp)
+    if not rows:
+        raise ValueError('no sector quotes')
+    dt = datetime.fromtimestamp(max(stamps), TAIPEI) if stamps else None
+    return {'sectors': {'rows': rows, 'source': '鉅亨網 類股指數',
+                        'date': dt.strftime('%Y-%m-%d') if dt else '', 'time': dt.strftime('%H:%M:%S') if dt else ''}}
+
+
+
 RT_PRIORITY = {   # 同一時間時的來源優先順序；實際會先比較資料時間，取最新者
     'taiex': ('twse', 'taifex', 'cnyes', 'yahoo'),
     'tpex': ('twse', 'cnyes'),
@@ -316,7 +393,8 @@ def collect_market_quotes(api_token=''):
     today_str = now.strftime('%Y-%m-%d')
     start_str = (now - timedelta(days=14)).strftime('%Y-%m-%d')
 
-    workers = {'twse': rt_twse_mis, 'taifex': rt_taifex_mis, 'cnyes': rt_cnyes, 'yahoo': rt_yahoo}
+    workers = {'twse': rt_twse_mis, 'taifex': rt_taifex_mis, 'cnyes': rt_cnyes, 'yahoo': rt_yahoo,
+               'breadth': rt_breadth, 'sectors': rt_sectors}
     results = {}
     with ThreadPoolExecutor(max_workers=len(workers)) as pool:
         futures = {name: pool.submit(fn) for name, fn in workers.items()}
@@ -330,6 +408,13 @@ def collect_market_quotes(api_token=''):
         candidates = [results[name].get(key) for name in order if results.get(name, {}).get(key)]
         if candidates:
             data[key] = max(candidates, key=lambda r: r.get('ts') or '')   # 時間最新者；同時間取優先順序較前者
+
+    for name, key, message in (('breadth', 'breadth', '漲停／跌停家數暫時無法取得'),
+                               ('sectors', 'sectors', '類股排行暫時無法取得')):
+        if results.get(name, {}).get(key):
+            data[key] = results[name][key]
+        else:
+            errors[key] = message
 
     # --- 以下為日行情備援：只有即時來源全部取不到時才會用到 ---
     if 'taiex' not in data:
@@ -1306,7 +1391,13 @@ def render_market_ticker():
         if d:
             change = d.get('change')
             color = '#FF5252' if change is not None and change > 0 else '#00E676' if change is not None and change < 0 else '#FFFFFF'
-            change_text = f'{change:+,.2f}' if change is not None else '漲跌資料未提供'
+            prev_close = d['val'] - change if change is not None else None
+            if change is None:
+                change_text = '漲跌資料未提供'
+            elif prev_close:
+                change_text = f'{change:+,.2f} <small>({change / prev_close * 100:+.2f}%)</small>'
+            else:
+                change_text = f'{change:+,.2f}'
             label = ' | '.join(str(d.get(k, '')) for k in ('date', 'time', 'source', 'contract', 'session') if d.get(k))
             value = f"{d['val']:,.2f}"
         else:
@@ -1320,7 +1411,53 @@ def render_market_ticker():
             f'<div class="tk-meta">{html.escape(label)}</div>'
             f'</div>'
         )
+
+    # 第五張卡片：上市／上櫃漲停、跌停家數（紅漲綠跌）
+    br = market_data.get('breadth')
+    if br:
+        def _n(side, kind):
+            more = br[side].get(f'{kind}_more')
+            return f"{br[side][kind]}{'+' if more else ''}"
+        rows_html = ''.join(
+            f'<div class="lm-row"><span class="lm-name">{name}</span>'
+            f'<span>漲停 <b style="color:#FF5252;">{_n(side, "up")}</b></span>'
+            f'<span>跌停 <b style="color:#00E676;">{_n(side, "down")}</b></span></div>'
+            for side, name in (('listed', '上市'), ('otc', '上櫃')))
+        label = ' | '.join(str(br.get(k, '')) for k in ('date', 'time', 'source') if br.get(k))
+        cards.append(f'<div class="tk-card wide" style="border:1px solid #848E9C;">'
+                     f'<div class="tk-title">漲停／跌停家數（一般股票，不含 ETF）</div>{rows_html}'
+                     f'<div class="tk-meta">{html.escape(label)}</div></div>')
+    else:
+        cards.append('<div class="tk-card wide" style="border:1px solid #848E9C;">'
+                     '<div class="tk-title">漲停／跌停家數</div><div class="tk-val" style="color:#848E9C;">--</div>'
+                     f'<div class="tk-meta">{html.escape(market_data.get("_errors", {}).get("breadth", "請稍後重新整理"))}</div></div>')
     st.markdown(f'<div class="tk-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+    # 上市類股漲跌幅排行（前 10 名）
+    sec = market_data.get('sectors')
+    sector_dir = st.session_state.get('sector_rank_dir', '強勢前 10')
+    if sec:
+        ranked = sorted(sec['rows'], key=lambda r: r['pct'], reverse=(sector_dir == '強勢前 10'))[:10]
+        peak = max(abs(r['pct']) for r in sec['rows']) or 1
+        bars = ''
+        for i, r in enumerate(ranked, 1):
+            c = '#FF5252' if r['pct'] > 0 else '#00E676' if r['pct'] < 0 else '#FFFFFF'
+            bars += (f'<div class="sr-row"><span class="sr-rank">{i}</span>'
+                     f'<span class="sr-name">{html.escape(r["name"])}</span>'
+                     f'<div class="sr-bar"><div class="sr-fill" style="width:{max(abs(r["pct"]) / peak * 100, 3):.0f}%;background:{c};"></div></div>'
+                     f'<span class="sr-pct" style="color:{c};">{r["pct"]:+.2f}%</span></div>')
+        label = ' | '.join(str(sec.get(k, '')) for k in ('date', 'time', 'source') if sec.get(k))
+        total = len(SECTOR_CODES)
+        coverage = (f'已涵蓋全部 {total} 個上市類股' if len(sec['rows']) >= total
+                    else f'僅取得 {len(sec["rows"])}／{total} 個類股，其餘暫無資料')
+        label = f'{label} | {coverage}'
+        st.markdown(f'<div class="sr-box"><div class="sr-head">上市類股漲跌幅排行 {html.escape(sector_dir)}</div>{bars}'
+                    f'<div class="tk-meta">{html.escape(label)}</div></div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="sr-box"><div class="sr-head">上市類股漲跌幅排行</div>'
+                    f'<div class="tk-meta">{html.escape(market_data.get("_errors", {}).get("sectors", "請稍後重新整理"))}</div></div>',
+                    unsafe_allow_html=True)
+    st.radio('排行方向', ['強勢前 10', '弱勢前 10'], horizontal=True, key='sector_rank_dir', label_visibility='collapsed')
 
     note_text = ''
     if fetched_ts:

@@ -14,6 +14,8 @@ import time
 import random
 import hashlib
 import html
+import math
+import inspect
 
 # -----------------------------------------------------------------------------
 # 1. 系統設定與金鑰解析
@@ -22,7 +24,7 @@ st.set_page_config(
     page_title="TradingAgents - 專業金融量化選股終端",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"
 )
 
 # 注入行動端滿版 CSS：自動偵測手機螢幕並把左右邊界壓縮至極致
@@ -43,7 +45,17 @@ st.markdown("""
         div[data-testid="stPlotlyChart"] > div {
             width: 100% !important;
         }
+        .stButton > button { width: 100%; }
+        h2 { font-size: 1.3rem !important; }
     }
+    .block-container { padding-bottom: 4rem; }
+    /* 頂部四大指數：手機 2x2、桌面 1x4 */
+    .tk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+    .tk-card { background-color: #1E222D; padding: 12px 14px; border-radius: 8px; }
+    .tk-title { color: #848E9C; font-size: 13px; }
+    .tk-val { font-size: clamp(20px, 5.4vw, 26px); font-weight: bold; line-height: 1.3; }
+    .tk-chg { font-size: 14px; font-weight: bold; }
+    .tk-meta { color: #848E9C; font-size: 11px; line-height: 1.4; margin-top: 2px; word-break: break-all; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -399,78 +411,318 @@ def calculate_indicators(df_price):
     return df
 
 # -----------------------------------------------------------------------------
-# 5. Plotly 圖表繪製
+# 5. Plotly 圖表繪製（行動裝置友善版）
+#    設計原則：
+#    (1) 圖例移到圖表上方橫排，不再佔用右側寬度
+#    (2) K 線與成交量分成上下兩個子圖，不再疊在同一個座標內
+#    (3) 預設只顯示近 40 個交易日，每根 K 棒/柱體才有足夠的寬度
+#    (4) 三大法人拆成外資/投信/自營商三個獨立子圖，各自使用適合的縱軸刻度
+#    (5) 神秘金字塔拆成上下兩個子圖，使用高對比色，並只標示最新一點
+#    (6) 關閉圖表拖曳/縮放，避免手指上下捲動頁面時被圖表攔截
 # -----------------------------------------------------------------------------
-def apply_dark_theme(fig, height=450, title=""):
-    fig.update_layout(
-        template="plotly_dark", height=height, margin=dict(l=25, r=25, t=45, b=25),
-        hovermode="x unified", title=dict(text=title, font=dict(color="#00E676", size=15))
+C_UP = "#FF5252"        # 台股慣例：紅漲
+C_DOWN = "#00E676"      # 台股慣例：綠跌
+C_TEXT = "#E6E9F0"
+C_MUTED = "#9AA4B5"
+C_GRID = "#262C3A"
+C_BG = "#0E1117"        # 與 Streamlit 深色主題底色一致；即使切到淺色主題圖表也維持可讀
+C_TITLE = "#00E676"
+
+PLOT_CONFIG = {
+    "displayModeBar": False,   # 隱藏右上角工具列（先前會蓋住標題）
+    "scrollZoom": False,
+    "doubleClick": False,
+    "displaylogo": False,
+}
+
+def show_chart(fig):
+    """相容新舊版 Streamlit 的圖表顯示函式。"""
+    params = inspect.signature(st.plotly_chart).parameters
+    kwargs = {"config": PLOT_CONFIG}
+    if "width" in params:
+        kwargs["width"] = "stretch"
+    else:
+        kwargs["use_container_width"] = True
+    if "theme" in params:
+        kwargs["theme"] = None   # 不讓 Streamlit 主題覆蓋我們指定的顏色
+    st.plotly_chart(fig, **kwargs)
+
+def chart_title(text):
+    """圖表標題改用頁面文字顯示，避免與 Plotly 內部工具列或圖例重疊。"""
+    st.markdown(
+        f"<div style='color:{C_TITLE};font-weight:700;font-size:1.05rem;"
+        f"margin:1.4rem 0 0.2rem 0;line-height:1.4;'>{text}</div>",
+        unsafe_allow_html=True,
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#232836", type='category')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#232836")
+
+def _axis_ticks(dates, max_ticks=5):
+    """類別軸只標示少數幾個日期，並固定包含最新日期，標籤橫向顯示不旋轉。"""
+    n = len(dates)
+    if n == 0:
+        return [], []
+    step = max(1, math.ceil(n / max_ticks))
+    idx = list(range(n - 1, -1, -step))[::-1]
+    try:
+        span = (pd.to_datetime(dates[-1]) - pd.to_datetime(dates[0])).days
+    except Exception:
+        span = 0
+    fmt = "%y/%m" if span > 200 else "%m/%d"
+    vals, text = [], []
+    for i in idx:
+        vals.append(dates[i])
+        try:
+            text.append(pd.to_datetime(dates[i]).strftime(fmt))
+        except Exception:
+            text.append(str(dates[i]))
+    return vals, text
+
+def _base_layout(fig, dates, height, top_margin=28):
+    vals, text = _axis_ticks(dates)
+    fig.update_layout(
+        template="plotly_dark",
+        height=height,
+        margin=dict(l=56, r=16, t=top_margin, b=34),
+        paper_bgcolor=C_BG,
+        plot_bgcolor=C_BG,
+        font=dict(size=12, color=C_TEXT),
+        hovermode="x unified",
+        hoverlabel=dict(font_size=11),
+        dragmode=False,
+        bargap=0.18,
+        showlegend=False,
+    )
+    fig.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=list(dates),
+        tickmode="array",
+        tickvals=vals,
+        ticktext=text,
+        tickangle=0,
+        tickfont=dict(size=11),
+        showgrid=False,
+        fixedrange=True,
+        rangeslider_visible=False,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridwidth=1,
+        gridcolor=C_GRID,
+        zeroline=True,
+        zerolinecolor="#3A4258",
+        fixedrange=True,
+        automargin=True,
+        tickfont=dict(size=11),
+    )
     return fig
 
-def plot_main_kline_chart(price_df, stock_id, stock_name, display_start_date):
+def _style_subplot_titles(fig):
+    """子圖標題靠左、小字、淡色。"""
+    for ann in fig.layout.annotations:
+        ann.update(x=0, xanchor="left", xref="paper", yshift=8,
+                   font=dict(size=12, color=C_MUTED))
+
+def _empty_fig(msg, height=160):
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark", height=height,
+        paper_bgcolor=C_BG, plot_bgcolor=C_BG,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        annotations=[dict(text=msg, x=0.5, y=0.5, xref="paper", yref="paper",
+                          showarrow=False, font=dict(size=13, color=C_MUTED))],
+    )
+    return fig
+
+def prepare_price_view(price_df, display_start_date, n_bars=40):
+    """計算指標（用完整歷史計算，避免 MA/布林在區間起點出現空值），再裁切成要顯示的區間。"""
     df_calc = calculate_indicators(price_df)
-    df_price = df_calc[df_calc['Date'] >= display_start_date].copy()
-    fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
-    
-    fig.add_trace(go.Candlestick(x=df_price['Date'], open=df_price['Open'], high=df_price['High'], low=df_price['Low'], close=df_price['Close'], name="K線", increasing_line_color='#FF5252', decreasing_line_color='#00E676'), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['5MA'], name="5MA", line=dict(color="#FFD600", width=1.5)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['20MA'], name="20MA(月線)", line=dict(color="#AA00FF", width=2.0)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Upper'], name="布林上軌", line=dict(color="#FF9100", width=1.5, dash="dot")), secondary_y=False)
-    fig.add_trace(go.Scatter(x=df_price['Date'], y=df_price['BB_Lower'], name="布林下軌", line=dict(color="#FF9100", width=1.5, dash="dot")), secondary_y=False)
-    
-    vol_colors = ['rgba(255, 82, 82, 0.45)' if df_price['Close'].iloc[i] >= df_price['Open'].iloc[i] else 'rgba(0, 230, 118, 0.45)' for i in range(len(df_price))]
-    fig.add_trace(go.Bar(x=df_price['Date'], y=df_price['Volume_張'], name="成交張數", marker_color=vol_colors), secondary_y=True)
-    
-    max_vol = df_price['Volume_張'].max() if not df_price.empty else 10000
-    fig.update_yaxes(title_text="價格 (元)", secondary_y=False)
-    fig.update_yaxes(title_text="成交量 (張)", range=[0, max_vol * 3.5], secondary_y=True, showgrid=False)
-    fig.update_xaxes(rangeslider_visible=False)
-    return apply_dark_theme(fig, height=500, title=f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
+    df_calc["Date"] = df_calc["Date"].astype(str).str[:10]
+    view = df_calc[df_calc["Date"] >= display_start_date].copy()
+    if n_bars and n_bars > 0:
+        view = view.tail(n_bars)
+    return view.reset_index(drop=True)
 
-def plot_chip_chart(chip_df, display_start_date):
-    fig = go.Figure()
-    if not chip_df.empty:
-        d_col = 'date' if 'date' in chip_df.columns else chip_df.columns[0]
-        chip_sub = chip_df[chip_df[d_col] >= display_start_date].copy()
-        
-        if 'buy' in chip_sub.columns and 'sell' in chip_sub.columns:
-            chip_sub['net_buy'] = chip_sub['buy'] - chip_sub['sell']
-        else:
-            chip_sub['net_buy'] = chip_sub.get('buy_sell', chip_sub.iloc[:, -1])
-            
-        categories = [('Foreign', '外資', '#2962FF'), ('Trust', '投信', '#FF9100'), ('Dealer', '自營商', '#E040FB')]
-        for key, name_zh, color in categories:
-            sub = chip_sub[chip_sub['name'].astype(str).str.contains(key, case=False, na=False)].groupby(d_col)['net_buy'].sum() / 1000
-            if not sub.empty:
-                vals = sub.round(0)
-                colors = np.where(vals >= 0, '#FF5252', '#00E676')
-                fig.add_trace(go.Bar(x=sub.index, y=vals, name=f"{name_zh}(張)", marker_color=colors))
-    fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360, title="🏛️ 三大法人每日淨買賣超 (張 - 紅買綠賣)")
+def _fmt_signed(v, unit=""):
+    return f"{v:+,.0f}{unit}"
 
-def plot_margin_chart(margin_df, display_start_date):
-    fig = go.Figure()
-    if not margin_df.empty:
-        d_col = 'date' if 'date' in margin_df.columns else margin_df.columns[0]
-        margin_sub = margin_df[margin_df[d_col] >= display_start_date].copy()
-        m_buy = [c for c in margin_sub.columns if 'MarginPurchaseBuy' in c]
-        m_sell = [c for c in margin_sub.columns if 'MarginPurchaseSell' in c]
-        
-        if m_buy and m_sell:
-            diff = (margin_sub[m_buy[0]] - margin_sub[m_sell[0]]) / 1000
-            fig.add_trace(go.Bar(x=margin_sub[d_col], y=diff.round(0), name="融資增減(張)", marker_color=np.where(diff >= 0, '#FF5252', '#00E676')))
-    fig.update_layout(barmode='group')
-    return apply_dark_theme(fig, height=360, title="💳 融資餘額每日增減變化 (張 - 紅增綠減)")
+def plot_main_kline_chart(df_view, show_bb=True):
+    if df_view.empty:
+        return _empty_fig("沒有可顯示的 K 線資料")
+    dates = df_view["Date"].tolist()
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.76, 0.24], vertical_spacing=0.035,
+    )
 
-def plot_norway_pyramid_chart(norway_df, stock_id, stock_name):
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    if not norway_df.empty:
-        fig.add_trace(go.Bar(x=norway_df['Date'], y=norway_df['Total_People'], name="總股東人數(人)", marker_color='#546E7A', opacity=0.8), secondary_y=False)
-        fig.add_trace(go.Scatter(x=norway_df['Date'], y=norway_df['Big_Ratio'], name="大股東持股率(%)", mode="lines+markers", line=dict(color="#FF9100", width=2.5), marker=dict(size=5, color="#FFFFFF")), secondary_y=True)
-    return apply_dark_theme(fig, height=380, title=f"🏛️ {stock_id} {stock_name} 神秘金字塔 - 總股東人數 vs 大股東持股率")
+    fig.add_trace(go.Candlestick(
+        x=dates, open=df_view["Open"], high=df_view["High"],
+        low=df_view["Low"], close=df_view["Close"], name="K線",
+        increasing=dict(line=dict(color=C_UP, width=1.4), fillcolor=C_UP),
+        decreasing=dict(line=dict(color=C_DOWN, width=1.4), fillcolor=C_DOWN),
+        whiskerwidth=0.5,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=df_view["5MA"], name="5MA", mode="lines",
+                             line=dict(color="#FFD600", width=1.6)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=df_view["20MA"], name="20MA(月線)", mode="lines",
+                             line=dict(color="#C77DFF", width=2.0)), row=1, col=1)
+    if show_bb:
+        fig.add_trace(go.Scatter(x=dates, y=df_view["BB_Upper"], name="布林通道", mode="lines",
+                                 line=dict(color="#FF9100", width=1.1, dash="dot"),
+                                 legendgroup="bb", hoverinfo="skip"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=df_view["BB_Lower"], name="布林下軌", mode="lines",
+                                 line=dict(color="#FF9100", width=1.1, dash="dot"),
+                                 legendgroup="bb", showlegend=False, hoverinfo="skip"), row=1, col=1)
+
+    vol_colors = [C_UP if c >= o else C_DOWN for c, o in zip(df_view["Close"], df_view["Open"])]
+    fig.add_trace(go.Bar(x=dates, y=df_view["Volume_張"], name="成交張數",
+                         marker_color=vol_colors, marker_opacity=0.75, marker_line_width=0,
+                         showlegend=False), row=2, col=1)
+
+    # 價格軸範圍：以 K 棒與均線為主；布林通道超出時於邊緣截斷，避免把 K 棒壓扁
+    lo = float(np.nanmin([df_view["Low"].min(), df_view["5MA"].min(), df_view["20MA"].min()]))
+    hi = float(np.nanmax([df_view["High"].max(), df_view["5MA"].max(), df_view["20MA"].max()]))
+    span = max(hi - lo, 1e-6)
+    if show_bb:
+        bb_lo, bb_hi = df_view["BB_Lower"].min(), df_view["BB_Upper"].max()
+        if pd.notna(bb_lo): lo = min(lo, max(float(bb_lo), lo - 0.15 * span))
+        if pd.notna(bb_hi): hi = max(hi, min(float(bb_hi), hi + 0.15 * span))
+    pad = (hi - lo) * 0.04
+    fig.update_yaxes(range=[lo - pad, hi + pad], row=1, col=1)
+    fig.update_yaxes(tickformat="~s", showgrid=False, row=2, col=1)
+
+    _base_layout(fig, dates, height=560, top_margin=44)
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(orientation="h", x=0, xanchor="left", y=1.0, yanchor="bottom",
+                    font=dict(size=11), bgcolor=C_BG,
+                    itemsizing="constant", tracegroupgap=0),
+    )
+    fig.add_annotation(x=0, y=1, xref="paper", yref="y2 domain", text="成交量(張)",
+                       showarrow=False, xanchor="left", yanchor="bottom",
+                       font=dict(size=11, color=C_MUTED))
+    return fig
+
+def _chip_series(chip_df, dates):
+    """回傳 {'外資': Series, '投信': Series, '自營商': Series}，單位：張，並對齊 K 線日期。"""
+    d = chip_df.copy()
+    d_col = "date" if "date" in d.columns else d.columns[0]
+    d[d_col] = d[d_col].astype(str).str[:10]
+    if "buy" in d.columns and "sell" in d.columns:
+        d["net_buy"] = d["buy"] - d["sell"]
+    else:
+        d["net_buy"] = d.get("buy_sell", d.iloc[:, -1])
+    name = d["name"].astype(str)
+    # 外資 = Foreign_Investor + Foreign_Dealer_Self；自營商 = Dealer_self + Dealer_Hedging（不含外資自營商，避免重複計入）
+    masks = {
+        "外資": name.str.contains("Foreign", case=False, na=False),
+        "投信": name.str.contains("Trust", case=False, na=False),
+        "自營商": name.str.contains("Dealer", case=False, na=False) & ~name.str.contains("Foreign", case=False, na=False),
+    }
+    out = {}
+    for label, m in masks.items():
+        s = d[m].groupby(d_col)["net_buy"].sum() / 1000.0
+        out[label] = s.reindex(dates).round(0)
+    return out
+
+def plot_chip_chart(chip_df, dates):
+    if chip_df.empty or not dates:
+        return _empty_fig("尚無三大法人資料")
+    series = _chip_series(chip_df, dates)
+    titles = []
+    for label, s in series.items():
+        total = float(np.nansum(s.values))
+        titles.append(f"{label}　區間累計 {_fmt_signed(total, ' 張')}")
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.11,
+                        subplot_titles=titles)
+    for i, (label, s) in enumerate(series.items(), start=1):
+        vals = s.values
+        colors = [C_UP if (pd.notna(v) and v >= 0) else C_DOWN for v in vals]
+        fig.add_trace(go.Bar(x=dates, y=vals, name=f"{label}(張)", marker_color=colors,
+                             showlegend=False), row=i, col=1)
+        fig.update_yaxes(tickformat="~s", row=i, col=1)
+    fig.update_traces(marker_line_width=0, selector=dict(type="bar"))
+    _base_layout(fig, dates, height=520, top_margin=46)
+    _style_subplot_titles(fig)
+    return fig
+
+def plot_margin_chart(margin_df, dates):
+    if margin_df.empty or not dates:
+        return _empty_fig("尚無融資融券資料")
+    d = margin_df.copy()
+    d_col = "date" if "date" in d.columns else d.columns[0]
+    d[d_col] = d[d_col].astype(str).str[:10]
+    # FinMind 融資欄位本身已是「張」，不需再除以 1000
+    if "MarginPurchaseTodayBalance" in d.columns and "MarginPurchaseYesterdayBalance" in d.columns:
+        diff = d["MarginPurchaseTodayBalance"] - d["MarginPurchaseYesterdayBalance"]
+    else:
+        m_buy = [c for c in d.columns if "MarginPurchaseBuy" in c]
+        m_sell = [c for c in d.columns if "MarginPurchaseSell" in c]
+        if not (m_buy and m_sell):
+            return _empty_fig("融資欄位不完整，無法繪圖")
+        diff = d[m_buy[0]] - d[m_sell[0]]
+        if "MarginPurchaseCashRepayment" in d.columns:
+            diff = diff - d["MarginPurchaseCashRepayment"]
+    s = pd.Series(diff.values, index=d[d_col].values).groupby(level=0).last().reindex(dates)
+    total = float(np.nansum(s.values))
+    fig = make_subplots(rows=1, cols=1,
+                        subplot_titles=[f"融資增減　區間累計 {_fmt_signed(total, ' 張')}"])
+    colors = [C_UP if (pd.notna(v) and v >= 0) else C_DOWN for v in s.values]
+    fig.add_trace(go.Bar(x=dates, y=s.values, name="融資增減(張)", marker_color=colors,
+                         showlegend=False), row=1, col=1)
+    fig.update_yaxes(tickformat="~s")
+    fig.update_traces(marker_line_width=0, selector=dict(type="bar"))
+    _base_layout(fig, dates, height=300, top_margin=46)
+    _style_subplot_titles(fig)
+    return fig
+
+def plot_norway_pyramid_chart(norway_df, weeks=26):
+    if norway_df is None or norway_df.empty:
+        return _empty_fig("尚無股東結構資料（神秘金字塔）")
+    df = norway_df.copy()
+    df["_dt"] = pd.to_datetime(df["Date"].astype(str), format="%Y%m%d", errors="coerce")
+    df = df.dropna(subset=["_dt"]).sort_values("_dt")
+    if weeks and weeks > 0:
+        df = df.tail(weeks)
+    if df.empty:
+        return _empty_fig("尚無股東結構資料（神秘金字塔）")
+    dates = df["_dt"].dt.strftime("%Y-%m-%d").tolist()
+    ratio = df["Big_Ratio"].astype(float).values
+    people = df["Total_People"].astype(float).values
+
+    def _delta(arr):
+        return arr[-1] - arr[-2] if len(arr) > 1 else 0.0
+
+    t1 = f"大股東持股率 (%)　最新 {ratio[-1]:.2f}%（較前週 {_delta(ratio):+.2f}）"
+    t2 = f"總股東人數 (人)　最新 {people[-1]:,.0f}（較前週 {_delta(people):+,.0f}）"
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
+                        row_heights=[0.5, 0.5], subplot_titles=[t1, t2])
+
+    # 上：大股東持股率（獨立縱軸、只在最新一點放大標記，避免滿屏圓點）
+    sizes = [0] * (len(dates) - 1) + [9]
+    fig.add_trace(go.Scatter(
+        x=dates, y=ratio, name="大股東持股率(%)", mode="lines+markers",
+        line=dict(color="#FFB300", width=2.6),
+        marker=dict(size=sizes, color="#FFB300", line=dict(color="#FFFFFF", width=2)),
+        showlegend=False), row=1, col=1)
+    r_lo, r_hi = float(np.nanmin(ratio)), float(np.nanmax(ratio))
+    r_pad = max((r_hi - r_lo) * 0.25, 0.1)
+    fig.update_yaxes(range=[r_lo - r_pad, r_hi + r_pad], tickformat=".1f", row=1, col=1)
+
+    # 下：總股東人數（高對比亮藍色長條，縱軸不從 0 起算以凸顯變化）
+    fig.add_trace(go.Bar(
+        x=dates, y=people, name="總股東人數(人)", marker_color="#4FC3F7",
+        marker_line_width=0, opacity=0.95,
+        showlegend=False), row=2, col=1)
+    p_lo, p_hi = float(np.nanmin(people)), float(np.nanmax(people))
+    p_span = max(p_hi - p_lo, p_hi * 0.01, 1.0)
+    fig.update_yaxes(range=[p_lo - p_span * 0.8, p_hi + p_span * 0.15],
+                     tickformat=",.0f", row=2, col=1)
+
+    _base_layout(fig, dates, height=520, top_margin=46)
+    fig.update_layout(bargap=0.3)
+    _style_subplot_titles(fig)
+    return fig
 
 # -----------------------------------------------------------------------------
 # 6. 強效連線容錯 + 平滑降級的 TradingAgents LLM 裁決引擎
@@ -731,41 +983,80 @@ def render_trading_agents_cards(res):
     """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 7. 共用診斷渲染引擎
+# 7. 共用診斷渲染引擎（行動裝置友善版）
 # -----------------------------------------------------------------------------
+VIEW_OPTIONS = {"近 20 日": 20, "近 40 日": 40, "近 60 日": 60, "選定區間全部": 0}
+WEEK_OPTIONS = {"13 週": 13, "26 週": 26, "52 週": 52}
+
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
         s_str = start_date.strftime("%Y-%m-%d")
         e_str = end_date.strftime("%Y-%m-%d")
         b_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
-        
+
         price_df = fetch_stock_history_cached(stock_id, b_str, e_str, token)
         chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
         margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
         norway_df = get_norway_big_shareholders(stock_id)
 
-    if not price_df.empty:
-        df_calc = calculate_indicators(price_df)
-        
-        st.plotly_chart(plot_main_kline_chart(price_df, stock_id, stock_name, s_str))
-        st.plotly_chart(plot_chip_chart(chip_df, s_str))
-        st.plotly_chart(plot_margin_chart(margin_df, s_str))
-        st.plotly_chart(plot_norway_pyramid_chart(norway_df, stock_id, stock_name))
-
-        st.markdown("---")
-        st.markdown("## 🤖 TradingAgents 多 Agent 投資診斷會議與終極裁決")
-        with st.spinner("TradingAgents 團隊（技術員/多空研究員/交易員/風控經理）連線分析中..."):
-            latest = df_calc.iloc[-1]
-            tech_info = f"收盤價:{latest['Close']}, 5MA:{latest['5MA']}, 20MA:{latest['20MA']}, 布林上軌:{latest['BB_Upper']}, 布林下軌:{latest['BB_Lower']}"
-            chip_info = f"三大法人與融資資料長度: {len(chip_df)}天"
-            
-            ai_res, err = call_trading_agents_team(stock_id, stock_name, latest['Close'], tech_info, chip_info)
-            if err:
-                st.error(err)
-            else:
-                render_trading_agents_cards(ai_res)
-    else:
+    if price_df.empty:
         st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
+        return
+
+    st.markdown(f"#### 📊 {stock_id} {stock_name}")
+
+    # --- 圖表顯示設定（手機上一眼可調整；預設 40 日，K 棒與柱體寬度最舒適） ---
+    view_label = st.radio("圖表顯示區間", list(VIEW_OPTIONS.keys()), index=1,
+                          horizontal=True, key="view_days_radio")
+    show_bb = st.checkbox("顯示布林通道", value=True, key="show_bb_checkbox")
+    n_bars = VIEW_OPTIONS[view_label]
+
+    df_view = prepare_price_view(price_df, s_str, n_bars)
+    if df_view.empty:
+        st.warning("所選日期區間內沒有交易資料，請調整左側的開始/結束日期。")
+        return
+    dates = df_view["Date"].tolist()
+    last = df_view.iloc[-1]
+    prev_close = df_view["Close"].iloc[-2] if len(df_view) > 1 else last["Close"]
+    chg = last["Close"] - prev_close
+    chg_color = C_UP if chg > 0 else (C_DOWN if chg < 0 else "#FFFFFF")
+    st.markdown(
+        f"<div style='color:{C_MUTED};font-size:0.85rem;line-height:1.6;'>"
+        f"{dates[0]} ～ {dates[-1]}（{len(dates)} 個交易日）　最新收盤 "
+        f"<b style='color:{chg_color};font-size:1rem;'>{last['Close']:,.2f}</b> "
+        f"<span style='color:{chg_color};'>{chg:+,.2f}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    chart_title(f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
+    show_chart(plot_main_kline_chart(df_view, show_bb=show_bb))
+
+    chart_title("🏛️ 三大法人每日淨買賣超 (張 · 紅買綠賣)")
+    st.caption("三家法人各自使用獨立縱軸，投信、自營商的小額買賣也能看得清楚。")
+    show_chart(plot_chip_chart(chip_df, dates))
+
+    chart_title("💳 融資餘額每日增減 (張 · 紅增綠減)")
+    show_chart(plot_margin_chart(margin_df, dates))
+
+    chart_title(f"🔺 {stock_id} {stock_name} 神秘金字塔：大股東持股率 vs 總股東人數")
+    week_label = st.radio("股東結構顯示週數", list(WEEK_OPTIONS.keys()), index=1,
+                          horizontal=True, key="pyramid_weeks_radio")
+    show_chart(plot_norway_pyramid_chart(norway_df, WEEK_OPTIONS[week_label]))
+    st.caption("總股東人數縱軸不從 0 起算，用以凸顯增減趨勢；請以標題列的最新數字為準。")
+
+    st.markdown("---")
+    st.markdown("## 🤖 TradingAgents 多 Agent 投資診斷會議與終極裁決")
+    with st.spinner("TradingAgents 團隊（技術員/多空研究員/交易員/風控經理）連線分析中..."):
+        df_calc = calculate_indicators(price_df)
+        latest = df_calc.iloc[-1]
+        tech_info = f"收盤價:{latest['Close']}, 5MA:{latest['5MA']}, 20MA:{latest['20MA']}, 布林上軌:{latest['BB_Upper']}, 布林下軌:{latest['BB_Lower']}"
+        chip_info = f"三大法人與融資資料長度: {len(chip_df)}天"
+
+        ai_res, err = call_trading_agents_team(stock_id, stock_name, latest['Close'], tech_info, chip_info)
+        if err:
+            st.error(err)
+        else:
+            render_trading_agents_cards(ai_res)
 
 # -----------------------------------------------------------------------------
 # 8. Streamlit 主程式介面
@@ -790,9 +1081,9 @@ run_interval = 60 if is_taiwan_market_open() else None
 @st.fragment(run_every=run_interval)
 def render_market_ticker():
     market_data = fetch_realtime_market_data(finmind_token)
-    columns = st.columns(4)
-    for col, key, title in zip(columns, ('taiex', 'tpex', 'futures', 'tsmc'),
-                               ('加權指數 (TAIEX)', '櫃買指數 (TPEX)', '台指近月 (TX)', '台積電 (2330)')):
+    cards = []
+    for key, title in (('taiex', '加權指數 (TAIEX)'), ('tpex', '櫃買指數 (TPEX)'),
+                       ('futures', '台指近月 (TX)'), ('tsmc', '台積電 (2330)')):
         d = market_data.get(key)
         if d:
             change = d.get('change')
@@ -803,14 +1094,15 @@ def render_market_ticker():
         else:
             color, value, change_text = '#848E9C', '--', '資料取得失敗／暫無資料'
             label = market_data.get('_errors', {}).get(key, '請稍後重新整理')
-        col.markdown(f'''
-            <div style="background-color:#1E222D;padding:15px;border-radius:8px;border:1px solid {color};">
-                <span style="color:#848E9C;font-size:14px;">{html.escape(title)}</span><br>
-                <span style="color:{color};font-size:26px;font-weight:bold;">{value}</span><br>
-                <span style="color:{color};font-size:15px;">{change_text}</span><br>
-                <span style="color:#848E9C;font-size:11px;">{html.escape(label)}</span>
-            </div>
-        ''', unsafe_allow_html=True)
+        cards.append(
+            f'<div class="tk-card" style="border:1px solid {color};">'
+            f'<div class="tk-title">{html.escape(title)}</div>'
+            f'<div class="tk-val" style="color:{color};">{value}</div>'
+            f'<div class="tk-chg" style="color:{color};">{change_text}</div>'
+            f'<div class="tk-meta">{html.escape(label)}</div>'
+            f'</div>'
+        )
+    st.markdown(f'<div class="tk-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
     st.caption('指數報價與日行情可能有延遲；請以資料日期、來源及契約為準。期貨同一交易日優先一般盤。')
     if st.button('重新取得行情', key='refresh_market_quotes'):
         fetch_realtime_market_data.clear()
@@ -847,7 +1139,7 @@ if app_mode == "全市場自動選股版":
         if st.button("🚀 啟動此檔個股深度分析"):
             sid = sel.split(" ")[0]
             sname = sel.split(" ")[1]
-            render_diagnosis_section(sid, sname, start_date, end_date, finmind_token)
+            st.session_state["diag_req"] = {"mode": app_mode, "id": sid, "name": sname}
             
 else:
     filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
@@ -862,4 +1154,9 @@ else:
     stock_name = STOCK_DICT.get(stock_id, "")
 
     if st.button("🚀 啟動個股技術、籌碼與 AI 深度診斷"):
-        render_diagnosis_section(stock_id, stock_name, start_date, end_date, finmind_token)
+        st.session_state["diag_req"] = {"mode": app_mode, "id": stock_id, "name": stock_name}
+
+# 診斷結果以 session_state 保存：調整顯示區間／布林通道／週數時圖表不會消失
+_req = st.session_state.get("diag_req")
+if _req and _req.get("mode") == app_mode:
+    render_diagnosis_section(_req["id"], _req["name"], start_date, end_date, finmind_token)

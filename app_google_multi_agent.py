@@ -936,15 +936,39 @@ def plot_chip_chart(chip_df, dates):
         titles.append(f"{label}　區間累計 {_fmt_signed(total, ' 張')}")
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.11,
                         subplot_titles=titles)
+
+    def _fmt_net(v):
+        if pd.isna(v):
+            return "<span style='color:#848E9C'>--</span>"
+        col = C_UP if v > 0 else (C_DOWN if v < 0 else "#FFFFFF")
+        return f"<span style='color:{col}'>{v:+,.0f} 張</span>"
+
+    # 每一天一段說明文字：三大法人同時列出；三個子圖共用，點任何一格都看得到全部
+    hover_texts = []
+    for k in range(len(dates)):
+        vals = [series[lb].iloc[k] for lb in series]
+        total = float(np.nansum(vals)) if not all(pd.isna(vals)) else float("nan")
+        lines = [f"<b>{lb}</b>　{_fmt_net(series[lb].iloc[k])}" for lb in series]
+        lines.append(f"<b>合計</b>　{_fmt_net(total)}")
+        hover_texts.append("<br>".join(lines))
+
     for i, (label, s) in enumerate(series.items(), start=1):
         vals = s.values
         colors = [C_UP if (pd.notna(v) and v >= 0) else C_DOWN for v in vals]
         fig.add_trace(go.Bar(x=dates, y=vals, name=f"{label}(張)", marker_color=colors,
-                             showlegend=False), row=i, col=1)
+                             showlegend=False, hoverinfo="skip"), row=i, col=1)
+        # 透明的說明框專用圖層（避免說明框出現單一顏色的圖例方塊）
+        fig.add_trace(go.Scatter(x=dates, y=vals, mode="markers", name="", showlegend=False,
+                                 marker=dict(size=14, opacity=0),
+                                 hovertext=hover_texts, hovertemplate="%{hovertext}<extra></extra>"),
+                      row=i, col=1)
         fig.update_yaxes(tickformat="~s", row=i, col=1)
     fig.update_traces(marker_line_width=0, selector=dict(type="bar"))
     _base_layout(fig, dates, height=520, top_margin=46)
     _style_subplot_titles(fig)
+    fig.update_layout(hoverlabel=dict(font_size=12, bgcolor="#1B2130", bordercolor="#3A4258", align="left"))
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikethickness=1, spikedash="dot", spikecolor="#9AA4B5")
     return fig
 
 def plot_margin_chart(margin_df, dates):
@@ -999,13 +1023,31 @@ def plot_norway_pyramid_chart(norway_df, weeks=26):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
                         row_heights=[0.5, 0.5], subplot_titles=[t1, t2])
 
+    # 說明文字：兩個子圖共用，點任何一格都同時看到大股東持股率與總股東人數（含較前週變化）
+    hover_texts = []
+    for k in range(len(dates)):
+        dr = ratio[k] - ratio[k - 1] if k > 0 else None
+        dp = people[k] - people[k - 1] if k > 0 else None
+        def _chg(d, fmt):
+            if d is None:
+                return ""
+            col = C_UP if d > 0 else (C_DOWN if d < 0 else "#FFFFFF")
+            return f"　<span style='color:{col}'>({format(d, fmt)})</span>"
+        hover_texts.append(
+            f"<b>大股東持股率</b>　{ratio[k]:.2f}%{_chg(dr, '+.2f')}<br>"
+            f"<b>總股東人數</b>　{people[k]:,.0f} 人{_chg(dp, '+,.0f')}"
+        )
+
     # 上：大股東持股率（獨立縱軸、只在最新一點放大標記，避免滿屏圓點）
     sizes = [0] * (len(dates) - 1) + [9]
     fig.add_trace(go.Scatter(
         x=dates, y=ratio, name="大股東持股率(%)", mode="lines+markers",
         line=dict(color="#FFB300", width=2.6),
         marker=dict(size=sizes, color="#FFB300", line=dict(color="#FFFFFF", width=2)),
-        showlegend=False), row=1, col=1)
+        showlegend=False, hoverinfo="skip"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=ratio, mode="markers", name="", showlegend=False,
+                             marker=dict(size=14, opacity=0),
+                             hovertext=hover_texts, hovertemplate="%{hovertext}<extra></extra>"), row=1, col=1)
     r_lo, r_hi = float(np.nanmin(ratio)), float(np.nanmax(ratio))
     r_pad = max((r_hi - r_lo) * 0.25, 0.1)
     fig.update_yaxes(range=[r_lo - r_pad, r_hi + r_pad], tickformat=".1f", row=1, col=1)
@@ -1013,15 +1055,21 @@ def plot_norway_pyramid_chart(norway_df, weeks=26):
     # 下：總股東人數（高對比亮藍色長條，縱軸不從 0 起算以凸顯變化）
     fig.add_trace(go.Bar(
         x=dates, y=people, name="總股東人數(人)", marker_color="#4FC3F7",
-        marker_line_width=0, opacity=0.95,
-        showlegend=False), row=2, col=1)
+        marker_line_width=0, opacity=0.95, textposition="none",
+        showlegend=False, hoverinfo="skip"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=people, mode="markers", name="", showlegend=False,
+                             marker=dict(size=14, opacity=0),
+                             hovertext=hover_texts, hovertemplate="%{hovertext}<extra></extra>"), row=2, col=1)
     p_lo, p_hi = float(np.nanmin(people)), float(np.nanmax(people))
     p_span = max(p_hi - p_lo, p_hi * 0.01, 1.0)
     fig.update_yaxes(range=[p_lo - p_span * 0.8, p_hi + p_span * 0.15],
                      tickformat=",.0f", row=2, col=1)
 
     _base_layout(fig, dates, height=520, top_margin=46)
-    fig.update_layout(bargap=0.3)
+    fig.update_layout(bargap=0.3,
+                      hoverlabel=dict(font_size=12, bgcolor="#1B2130", bordercolor="#3A4258", align="left"))
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikethickness=1, spikedash="dot", spikecolor="#9AA4B5")
     _style_subplot_titles(fig)
     return fig
 

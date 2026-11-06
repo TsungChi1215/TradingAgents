@@ -61,6 +61,7 @@ st.markdown("""
     /* 行情區塊更新時不變暗（Streamlit 以 data-stale 標記更新中的元素） */
     div[data-stale="true"]:has(.tk-grid), div[data-stale="true"]:has(.tk-note), div[data-stale="true"]:has(.sr-box),
     div[data-stale="true"]:has(.st-key-refresh_market_quotes), div[data-stale="true"]:has(.st-key-sector_rank_dir) { opacity: 1 !important; transition: none !important; }
+    div[data-testid="stElementContainer"]:has(> iframe[height="0"]), div[data-testid="stElementContainer"]:has(iframe[height="0"]) { display: none; }
     .tk-card.wide { grid-column: 1 / -1; }
     .tk-chg small { font-weight: normal; opacity: .9; }
     .lm-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 14px; }
@@ -1467,6 +1468,54 @@ def render_market_ticker():
     st.markdown(f'<div class="tk-note">{note_text}</div>', unsafe_allow_html=True)
     st.button('重新取得行情', key='refresh_market_quotes')
 
+
+# -----------------------------------------------------------------------------
+# 手機觸控「滑過即顯示」：Plotly 預設只有點擊才會在觸控裝置顯示說明框。
+# 這段腳本讓手指在圖表上水平滑動時，持續顯示游標所在日期的數值（垂直滑動仍可正常捲動頁面）。
+# 腳本只安裝一次，之後新產生的圖表也會自動套用。
+# -----------------------------------------------------------------------------
+TOUCH_HOVER_JS = r"""
+(function () {
+  var P;
+  try { P = window.parent; void P.document.body; } catch (e) { P = window; }
+  var D = P.document;
+  if (P.__plotlyTouchHover) { return; }
+  P.__plotlyTouchHover = true;
+
+  // 圖表上：垂直滑動仍可捲動頁面；水平滑動交給圖表顯示數值
+  var style = D.createElement('style');
+  style.textContent =
+    'div[data-testid="stPlotlyChart"], div[data-testid="stPlotlyChart"] .js-plotly-plot,' +
+    'div[data-testid="stPlotlyChart"] .plotly .nsewdrag, div[data-testid="stPlotlyChart"] .plotly .draglayer,' +
+    'div[data-testid="stPlotlyChart"] .plotly .main-svg { touch-action: pan-y !important; }';
+  D.head.appendChild(style);
+
+  function show(ev) {
+    var t = ev.touches && ev.touches[0];
+    if (!t) { return; }
+    var el = D.elementFromPoint(t.clientX, t.clientY);
+    if (!el || !el.closest || !el.closest('.js-plotly-plot')) { return; }
+    el.dispatchEvent(new P.MouseEvent('mousemove', {
+      bubbles: true, cancelable: true, view: P,
+      clientX: t.clientX, clientY: t.clientY, screenX: t.screenX, screenY: t.screenY
+    }));
+  }
+  function start(ev) {
+    var tg = ev.target;
+    if (tg && tg.closest && tg.closest('.js-plotly-plot')) {
+      ev.stopPropagation();   // 不讓 Plotly 進入「拖曳」狀態，否則拖曳期間它不會顯示說明框
+    }
+    show(ev);
+  }
+  D.addEventListener('touchstart', start, { passive: true, capture: true });
+  D.addEventListener('touchmove', show, { passive: true, capture: true });
+})();
+"""
+try:
+    import streamlit.components.v1 as _components
+    _components.html("<script>" + TOUCH_HOVER_JS + "</script>", height=0)
+except Exception as exc:
+    safe_log("touch hover script", exc)
 
 render_market_ticker()
 st.markdown("---")

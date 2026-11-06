@@ -14,6 +14,8 @@ import time
 import random
 import hashlib
 import html
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import math
 import inspect
 
@@ -55,6 +57,9 @@ st.markdown("""
     .tk-title { color: #848E9C; font-size: 13px; }
     .tk-val { font-size: clamp(20px, 5.4vw, 26px); font-weight: bold; line-height: 1.3; }
     .tk-chg { font-size: 14px; font-weight: bold; }
+    .tk-note { color: #848E9C; font-size: 12px; margin: 6px 0 2px 0; line-height: 1.5; }
+    /* 行情區塊更新時不變暗（Streamlit 以 data-stale 標記更新中的元素） */
+    div[data-stale="true"]:has(.tk-grid), div[data-stale="true"]:has(.tk-note), div[data-stale="true"]:has(.st-key-refresh_market_quotes) { opacity: 1 !important; transition: none !important; }
     .tk-meta { color: #848E9C; font-size: 11px; line-height: 1.4; margin-top: 2px; word-break: break-all; }
     </style>
 """, unsafe_allow_html=True)
@@ -180,25 +185,153 @@ def select_tx_near_month(rows, official=False):
                         first_field(row, 'Date', 'date'), contract=month, session=session)
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_realtime_market_data(api_token=''):
+# --- 即時行情來源（多來源並行抓取，取「資料時間最新」者；任一來源失敗不影響其他來源） ---
+TICKER_REFRESH_SECONDS = 60      # 頂部四大指數的自動更新間隔（秒）
+QUOTE_MAX_AGE_OPEN = 20          # 盤中：資料超過 20 秒就在背景重新抓取
+QUOTE_MAX_AGE_CLOSED = 600       # 非交易時段：10 分鐘才重抓一次
+TX_SYMBOL = re.compile(r'^TXF([A-L])(\d)-([FM])$')   # 例：TXFK6-F = 2026/11 台指期（日盤）
+
+
+def rt_request(method, url, **kwargs):
+    response = requests.request(method, url, timeout=(3, 6),
+                                headers={'User-Agent': 'Mozilla/5.0'}, **kwargs)
+    response.raise_for_status()
+    return response.json()
+
+
+def rt_record(value, change, source, dt=None, **extra):
+    return quote_record(value, change, source,
+                        dt.strftime('%Y-%m-%d') if dt else '',
+                        time=dt.strftime('%H:%M:%S') if dt else '',
+                        ts=dt.isoformat() if dt else '', **extra)
+
+
+def parse_taipei_dt(date_text, time_text):
+    try:
+        return datetime.strptime(f'{date_text}{time_text}', '%Y%m%d%H%M%S').replace(tzinfo=TAIPEI)
+    except (ValueError, TypeError):
+        return None
+
+
+def rt_twse_mis():
+    payload = rt_request('GET', 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp',
+                         params={'ex_ch': 'tse_t00.tw|otc_o00.tw|tse_2330.tw', 'json': '1',
+                                 'delay': '0', '_': int(time.time() * 1000)})
+    out = {}
+    for row in payload.get('msgArray', []):
+        key = {'t00': 'taiex', 'o00': 'tpex', '2330': 'tsmc'}.get(str(row.get('ch', '')).split('.')[0])
+        price, prev = as_number(row.get('z')), as_number(row.get('y'))
+        if not key or price is None or price <= 0:
+            continue
+        tlong = as_number(row.get('tlong'))
+        dt = datetime.fromtimestamp(tlong / 1000, TAIPEI) if tlong else None
+        out[key] = rt_record(price, price - prev if prev else None, 'TWSE MIS 即時', dt)
+    return out
+
+
+def rt_taifex_mis():
+    """期交所 MIS：同時取得日盤(MarketType=0)與夜盤(MarketType=1)，台指期近月取資料時間較新的一個。"""
+    out, parsed, spot = {}, [], None
+    now = taipei_now()
+    for market in ('0', '1'):
+        try:
+            payload = rt_request('POST', 'https://mis.taifex.com.tw/futures/api/getQuoteList',
+                                 json={'MarketType': market, 'SymbolType': 'F', 'KindID': '1',
+                                       'CID': 'TXF', 'ExpireMonth': '', 'RowSize': '全部',
+                                       'PageNo': '', 'SortColumn': '', 'AscDesc': 'A'})
+        except Exception as exc:
+            safe_log(f'TAIFEX MIS market {market}', exc)
+            continue
+        for q in (payload.get('RtData') or {}).get('QuoteList') or []:
+            sid = str(q.get('SymbolID', ''))
+            dt = parse_taipei_dt(q.get('CDate'), q.get('CTime'))
+            price = as_number(q.get('CLastPrice'))
+            if sid == 'TXF-S' and price and price > 0:     # 臺指現貨 = 加權指數即時值
+                if spot is None or (dt and (spot[0] is None or dt > spot[0])):
+                    spot = (dt, price, as_number(q.get('CDiff')))
+            m = TX_SYMBOL.match(sid)
+            if not m:
+                continue
+            month = 'ABCDEFGHIJKL'.index(m.group(1)) + 1
+            year = now.year - now.year % 10 + int(m.group(2))
+            if year < now.year - 1:
+                year += 10
+            parsed.append(dict(month_key=year * 100 + month, dt=dt, price=price,
+                               diff=as_number(q.get('CDiff')),
+                               session='一般盤' if m.group(3) == 'F' else '盤後'))
+    if parsed:
+        near = min(p['month_key'] for p in parsed)          # 先決定近月，再看有沒有有效報價
+        pool = [p for p in parsed if p['month_key'] == near and p['price'] and p['price'] > 0]
+        if pool:
+            best = max(pool, key=lambda p: p['dt'].isoformat() if p['dt'] else '')
+            out['futures'] = rt_record(best['price'], best['diff'], 'TAIFEX MIS 即時', best['dt'],
+                                       contract=str(near), session=best['session'])
+    if spot:
+        out['taiex'] = rt_record(spot[1], spot[2], 'TAIFEX MIS 現貨', spot[0])
+    return out
+
+
+def rt_cnyes():
+    payload = rt_request('GET', 'https://ws.api.cnyes.com/ws/api/v1/quote/quotes/'
+                                'TWS:2330:STOCK,TWS:TSE01:INDEX,TWS:OTC01:INDEX',
+                         params={'column': 'K,G'})
+    mapping = {'TWS:2330:STOCK': 'tsmc', 'TWS:TSE01:INDEX': 'taiex', 'TWS:OTC01:INDEX': 'tpex'}
+    out = {}
+    for item in payload.get('data') or []:
+        key, price, stamp = mapping.get(item.get('0')), as_number(item.get('6')), as_number(item.get('200007'))
+        if key and price and price > 0:
+            dt = datetime.fromtimestamp(stamp, TAIPEI) if stamp else None
+            out[key] = rt_record(price, as_number(item.get('11')), '鉅亨網 即時', dt)
+    return out
+
+
+def rt_yahoo():
+    out = {}
+    for key, symbol in (('tsmc', '2330.TW'), ('taiex', '%5ETWII')):
+        try:
+            meta = rt_request('GET', f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}',
+                              params={'interval': '1m', 'range': '1d'})['chart']['result'][0]['meta']
+            price, prev = as_number(meta.get('regularMarketPrice')), as_number(meta.get('chartPreviousClose'))
+            stamp = as_number(meta.get('regularMarketTime'))
+            if price and price > 0:
+                dt = datetime.fromtimestamp(stamp, TAIPEI) if stamp else None
+                out[key] = rt_record(price, price - prev if prev else None, 'Yahoo 即時', dt)
+        except Exception as exc:
+            safe_log(f'Yahoo {symbol}', exc)
+    return out
+
+
+RT_PRIORITY = {   # 同一時間時的來源優先順序；實際會先比較資料時間，取最新者
+    'taiex': ('twse', 'taifex', 'cnyes', 'yahoo'),
+    'tpex': ('twse', 'cnyes'),
+    'futures': ('taifex',),
+    'tsmc': ('twse', 'cnyes', 'yahoo'),
+}
+
+
+def collect_market_quotes(api_token=''):
+    """純資料函式（不呼叫任何 st.*），可安全地在背景執行緒中執行。"""
     data, errors = {}, {}
     now = taipei_now()
     today_str = now.strftime('%Y-%m-%d')
     start_str = (now - timedelta(days=14)).strftime('%Y-%m-%d')
-    try:
-        payload = market_json('https://mis.twse.com.tw/stock/api/getStockInfo.jsp',
-                              params={'ex_ch': 'tse_t00.tw|otc_o00.tw', 'json': '1', 'delay': '0'})
-        for row in payload.get('msgArray', []):
-            key = {'t00': 'taiex', 'o00': 'tpex'}.get(str(row.get('ch', '')).split('.')[0])
-            if not key:
-                continue
-            value, previous = as_number(row.get('z')), as_number(row.get('y'))
-            if value is not None and value > 0:
-                data[key] = quote_record(value, value - previous if previous else None,
-                                         'TWSE MIS 指數報價', row.get('d', ''), time=row.get('t', ''))
-    except Exception as exc:
-        safe_log('official index quotes', exc)
+
+    workers = {'twse': rt_twse_mis, 'taifex': rt_taifex_mis, 'cnyes': rt_cnyes, 'yahoo': rt_yahoo}
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+        futures = {name: pool.submit(fn) for name, fn in workers.items()}
+        for name, future in futures.items():
+            try:
+                results[name] = future.result(timeout=12)
+            except Exception as exc:
+                safe_log(f'realtime source {name}', exc)
+                results[name] = {}
+    for key, order in RT_PRIORITY.items():
+        candidates = [results[name].get(key) for name in order if results.get(name, {}).get(key)]
+        if candidates:
+            data[key] = max(candidates, key=lambda r: r.get('ts') or '')   # 時間最新者；同時間取優先順序較前者
+
+    # --- 以下為日行情備援：只有即時來源全部取不到時才會用到 ---
     if 'taiex' not in data:
         try:
             rows = market_json('https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK')
@@ -229,32 +362,34 @@ def fetch_realtime_market_data(api_token=''):
         except Exception as exc:
             errors['tpex'] = '櫃買指數來源暫時無法取得有效資料'
             safe_log('TPEx index', exc)
-    fm = None
-    try:
-        from FinMind.data import DataLoader
-        fm = DataLoader()
-        if api_token:
-            fm.login_by_token(str(api_token).strip())
-    except Exception as exc:
-        safe_log('FinMind initialization', exc)
-    if fm is not None:
+    if 'futures' not in data or 'tsmc' not in data:
+        fm = None
         try:
-            frame = fm.taiwan_futures_daily(futures_id='TX', start_date=start_str, end_date=today_str)
-            data['futures'] = select_tx_near_month(frame.to_dict('records'))
+            from FinMind.data import DataLoader
+            fm = DataLoader()
+            if api_token:
+                fm.login_by_token(str(api_token).strip())
         except Exception as exc:
-            safe_log('FinMind TX', exc)
-        try:
-            frame = fm.taiwan_stock_daily(stock_id='2330', start_date=start_str, end_date=today_str)
-            frame = frame.copy()
-            frame['close'] = pd.to_numeric(frame['close'], errors='coerce')
-            frame = frame[frame['close'] > 0].sort_values('date')
-            row = frame.iloc[-1]
-            change = as_number(row.get('spread'))
-            if change is None and len(frame) > 1:
-                change = float(row['close']) - float(frame.iloc[-2]['close'])
-            data['tsmc'] = quote_record(row['close'], change, 'FinMind 日行情', row['date'])
-        except Exception as exc:
-            safe_log('FinMind 2330', exc)
+            safe_log('FinMind initialization', exc)
+        if fm is not None and 'futures' not in data:
+            try:
+                frame = fm.taiwan_futures_daily(futures_id='TX', start_date=start_str, end_date=today_str)
+                data['futures'] = select_tx_near_month(frame.to_dict('records'))
+            except Exception as exc:
+                safe_log('FinMind TX', exc)
+        if fm is not None and 'tsmc' not in data:
+            try:
+                frame = fm.taiwan_stock_daily(stock_id='2330', start_date=start_str, end_date=today_str)
+                frame = frame.copy()
+                frame['close'] = pd.to_numeric(frame['close'], errors='coerce')
+                frame = frame[frame['close'] > 0].sort_values('date')
+                row = frame.iloc[-1]
+                change = as_number(row.get('spread'))
+                if change is None and len(frame) > 1:
+                    change = float(row['close']) - float(frame.iloc[-2]['close'])
+                data['tsmc'] = quote_record(row['close'], change, 'FinMind 日行情', row['date'])
+            except Exception as exc:
+                safe_log('FinMind 2330', exc)
     if 'futures' not in data:
         try:
             rows = market_json('https://openapi.taifex.com.tw/v1/DailyMarketReportFut')
@@ -274,6 +409,45 @@ def fetch_realtime_market_data(api_token=''):
     data['_errors'] = errors
     data['_fetched_at'] = now.isoformat()
     return data
+
+
+# --- 行情資料倉：背景更新 + 立即回傳舊資料（stale-while-revalidate） ---
+# 畫面區塊只讀取資料倉，不會被網路請求拖住；因此自動更新時 Streamlit 的「執行中」狀態極短，
+# 不會讓整個畫面變暗。多位使用者共用同一份資料，也不會重複向外部來源發請求。
+@st.cache_resource
+def _quote_store():
+    return {'lock': threading.Lock(), 'data': None, 'ts': 0.0, 'thread': None}
+
+
+def _refresh_quote_store(store, api_token):
+    try:
+        data = collect_market_quotes(api_token)
+    except Exception as exc:
+        safe_log('collect_market_quotes', exc)
+        return
+    with store['lock']:
+        store['data'], store['ts'] = data, time.time()
+
+
+def fetch_realtime_market_data(api_token='', force=False):
+    store = _quote_store()
+    max_age = QUOTE_MAX_AGE_OPEN if is_taiwan_market_open() else QUOTE_MAX_AGE_CLOSED
+    thread = store['thread']
+    running = thread is not None and thread.is_alive()
+    if store['data'] is None or force:
+        # 第一次載入或使用者按「重新取得行情」：同步等待結果
+        if not running:
+            thread = threading.Thread(target=_refresh_quote_store, args=(store, api_token), daemon=True)
+            store['thread'] = thread
+            thread.start()
+        thread.join(timeout=25)
+    elif time.time() - store['ts'] > max_age:
+        if not running:
+            thread = threading.Thread(target=_refresh_quote_store, args=(store, api_token), daemon=True)
+            store['thread'] = thread
+            thread.start()
+        thread.join(timeout=2.5)    # 最多等 2.5 秒；沒抓完就先顯示舊資料，下一輪再更新
+    return dict(store['data'] or {}), store['ts']
 
 
 # -----------------------------------------------------------------------------
@@ -546,6 +720,27 @@ def prepare_price_view(price_df, display_start_date, n_bars=40):
 def _fmt_signed(v, unit=""):
     return f"{v:+,.0f}{unit}"
 
+def _kline_hover_texts(df_view):
+    """每一天一段說明文字：日期由 hover 標題顯示，內容含 OHLC、漲跌、成交量與均線。"""
+    texts = []
+    closes = df_view["Close"].tolist()
+    for i, r in enumerate(df_view.itertuples(index=False)):
+        prev = closes[i - 1] if i > 0 else None
+        if prev:
+            chg = r.Close - prev
+            pct = chg / prev * 100
+            col = C_UP if chg > 0 else (C_DOWN if chg < 0 else "#FFFFFF")
+            chg_txt = f"<span style='color:{col}'>{chg:+.2f} ({pct:+.2f}%)</span>"
+        else:
+            col = C_UP if r.Close >= r.Open else C_DOWN
+            chg_txt = ""
+        texts.append(
+            f"<b>收 <span style='color:{col}'>{r.Close:,.2f}</span></b> {chg_txt}<br>"
+            f"開 {r.Open:,.2f}　高 {r.High:,.2f}　低 {r.Low:,.2f}<br>"
+            f"<b>成交量 {r.Volume_張:,.0f} 張</b>"
+        )
+    return texts
+
 def plot_main_kline_chart(df_view, show_bb=True):
     if df_view.empty:
         return _empty_fig("沒有可顯示的 K 線資料")
@@ -555,17 +750,28 @@ def plot_main_kline_chart(df_view, show_bb=True):
         row_heights=[0.76, 0.24], vertical_spacing=0.035,
     )
 
+    hover_texts = _kline_hover_texts(df_view)
+    # 均線數值附在說明框最後一行
+    for i in range(len(hover_texts)):
+        parts = []
+        for col, label in (("5MA", "5MA"), ("20MA", "20MA")):
+            v = df_view[col].iloc[i]
+            if pd.notna(v):
+                parts.append(f"{label} {v:,.2f}")
+        if parts:
+            hover_texts[i] += "<br>" + "　".join(parts)
+
     fig.add_trace(go.Candlestick(
         x=dates, open=df_view["Open"], high=df_view["High"],
         low=df_view["Low"], close=df_view["Close"], name="K線",
         increasing=dict(line=dict(color=C_UP, width=1.4), fillcolor=C_UP),
         decreasing=dict(line=dict(color=C_DOWN, width=1.4), fillcolor=C_DOWN),
-        whiskerwidth=0.5,
+        whiskerwidth=0.5, hoverinfo="skip",
     ), row=1, col=1)
     fig.add_trace(go.Scatter(x=dates, y=df_view["5MA"], name="5MA", mode="lines",
-                             line=dict(color="#FFD600", width=1.6)), row=1, col=1)
+                             line=dict(color="#FFD600", width=1.6), hoverinfo="skip"), row=1, col=1)
     fig.add_trace(go.Scatter(x=dates, y=df_view["20MA"], name="20MA(月線)", mode="lines",
-                             line=dict(color="#C77DFF", width=2.0)), row=1, col=1)
+                             line=dict(color="#C77DFF", width=2.0), hoverinfo="skip"), row=1, col=1)
     if show_bb:
         fig.add_trace(go.Scatter(x=dates, y=df_view["BB_Upper"], name="布林通道", mode="lines",
                                  line=dict(color="#FF9100", width=1.1, dash="dot"),
@@ -577,7 +783,12 @@ def plot_main_kline_chart(df_view, show_bb=True):
     vol_colors = [C_UP if c >= o else C_DOWN for c, o in zip(df_view["Close"], df_view["Open"])]
     fig.add_trace(go.Bar(x=dates, y=df_view["Volume_張"], name="成交張數",
                          marker_color=vol_colors, marker_opacity=0.75, marker_line_width=0,
-                         showlegend=False), row=2, col=1)
+                         showlegend=False, textposition="none",
+                         hovertext=hover_texts, hovertemplate="%{hovertext}<extra></extra>"), row=2, col=1)
+    # 透明的「說明框專用」圖層：點選 K 棒區任何位置，都會顯示當天完整資訊（含成交量）
+    fig.add_trace(go.Scatter(x=dates, y=df_view["Close"], mode="markers", name="",
+                             marker=dict(size=14, opacity=0), showlegend=False,
+                             hovertext=hover_texts, hovertemplate="%{hovertext}<extra></extra>"), row=1, col=1)
 
     # 價格軸範圍：以 K 棒與均線為主；布林通道超出時於邊緣截斷，避免把 K 棒壓扁
     lo = float(np.nanmin([df_view["Low"].min(), df_view["5MA"].min(), df_view["20MA"].min()]))
@@ -597,7 +808,11 @@ def plot_main_kline_chart(df_view, show_bb=True):
         legend=dict(orientation="h", x=0, xanchor="left", y=1.0, yanchor="bottom",
                     font=dict(size=11), bgcolor=C_BG,
                     itemsizing="constant", tracegroupgap=0),
+        hoverlabel=dict(font_size=12, bgcolor="#1B2130", bordercolor="#3A4258", align="left"),
     )
+    # 貫穿 K 線與成交量兩個子圖的垂直指示線，讓上下兩格能對齊
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikethickness=1, spikedash="dot", spikecolor="#9AA4B5")
     fig.add_annotation(x=0, y=1, xref="paper", yref="y2 domain", text="成交量(張)",
                        showarrow=False, xanchor="left", yanchor="bottom",
                        font=dict(size=11, color=C_MUTED))
@@ -1076,11 +1291,14 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 # 9. 頂部四大指數獨立區塊（僅在盤中交易時間 60 秒自動重新整理）
 # -----------------------------------------------------------------------------
-run_interval = 60 if is_taiwan_market_open() else None
-
-@st.fragment(run_every=run_interval)
+# 固定每 TICKER_REFRESH_SECONDS 秒執行一次（先前僅在「載入頁面當下」為盤中時才會自動更新；
+# 改為固定間隔後，頁面在開盤前就開著也會在 08:45 後自動開始更新，非盤中則只讀快取、不對外請求）
+@st.fragment(run_every=TICKER_REFRESH_SECONDS)
 def render_market_ticker():
-    market_data = fetch_realtime_market_data(finmind_token)
+    # 先取資料、最後才畫出元件：取資料期間畫面上維持上一次的內容，不會清空或閃爍
+    refresh_clicked = bool(st.session_state.get('refresh_market_quotes', False))
+    market_data, fetched_ts = fetch_realtime_market_data(finmind_token, force=refresh_clicked)
+
     cards = []
     for key, title in (('taiex', '加權指數 (TAIEX)'), ('tpex', '櫃買指數 (TPEX)'),
                        ('futures', '台指近月 (TX)'), ('tsmc', '台積電 (2330)')):
@@ -1103,10 +1321,14 @@ def render_market_ticker():
             f'</div>'
         )
     st.markdown(f'<div class="tk-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
-    st.caption('指數報價與日行情可能有延遲；請以資料日期、來源及契約為準。期貨同一交易日優先一般盤。')
-    if st.button('重新取得行情', key='refresh_market_quotes'):
-        fetch_realtime_market_data.clear()
-        st.rerun()
+
+    note_text = ''
+    if fetched_ts:
+        updated = datetime.fromtimestamp(fetched_ts, TAIPEI).strftime('%H:%M:%S')
+        mode = f'盤中每 {TICKER_REFRESH_SECONDS} 秒自動更新' if is_taiwan_market_open() else '目前非交易時段，不頻繁更新'
+        note_text = f'行情最後抓取 {updated}｜{mode}｜各卡片最下方為該筆資料的時間與來源'
+    st.markdown(f'<div class="tk-note">{note_text}</div>', unsafe_allow_html=True)
+    st.button('重新取得行情', key='refresh_market_quotes')
 
 
 render_market_ticker()

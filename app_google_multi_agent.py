@@ -840,7 +840,8 @@ def plot_main_kline_chart(df_view, show_bb=True):
     # 均線數值附在說明框最後一行
     for i in range(len(hover_texts)):
         parts = []
-        for col, label in (("5MA", "5MA"), ("20MA", "20MA")):
+        for col, label in (("5MA", "5MA"), ("20MA", "20MA"),
+                           ("BB_Upper", "布林上軌"), ("BB_Lower", "布林下軌")):
             v = df_view[col].iloc[i]
             if pd.notna(v):
                 parts.append(f"{label} {v:,.2f}")
@@ -1226,6 +1227,75 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
     return None, 'AI 裁決暫時無法完成：' + (reasons or '未取得有效回應') + '。請稍後重試或檢查設定；此訊息不代表所有 API Key 均無效。'
 
 
+def _max_drawdown(equity_curve):
+      """由逐筆交易權益曲線計算最大回撤百分比。"""
+      if not equity_curve:
+          return 0.0
+      arr = np.asarray(equity_curve, dtype=float)
+      peaks = np.maximum.accumulate(arr)
+      drawdowns = np.where(peaks > 0, arr / peaks - 1.0, 0.0)
+      return float(drawdowns.min() * 100)
+
+def run_verdict_backtest(price_df, end_date, holding_days=20):
+      """以可重現、無前視偏誤的技術裁決規則做 1/3/5/10 年走勢回測。
+
+      訊號規則：當日收盤後若 5MA > 20MA、收盤 > 20MA，且收盤尚未突破布林上軌，
+      則在下一交易日開盤買進，持有 20 個交易日後於收盤賣出。訊號採不重疊交易，
+      勝率為扣除單邊 0.1425% 手續費（買賣各一次）及賣出 0.3% 證交稅後仍獲利的比例。
+      """
+      df = calculate_indicators(price_df).copy()
+      df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+      for c in ("Open", "Close", "5MA", "20MA", "BB_Upper", "BB_Lower"):
+          df[c] = pd.to_numeric(df[c], errors="coerce")
+      df = df.dropna(subset=["Date", "Open", "Close", "5MA", "20MA", "BB_Upper"]).sort_values("Date").reset_index(drop=True)
+      if df.empty:
+          return []
+      signal = ((df["5MA"] > df["20MA"]) & (df["Close"] > df["20MA"]) &
+                (df["Close"] <= df["BB_Upper"]))
+      end_ts = pd.Timestamp(end_date)
+      round_trip_cost = 0.001425 * 2 + 0.003
+      results = []
+      for years in (1, 3, 5, 10):
+          start_ts = end_ts - pd.DateOffset(years=years)
+          trades, equity, i = [], 1.0, 0
+          while i < len(df) - holding_days - 1:
+              if df.loc[i, "Date"] >= start_ts and signal.iloc[i]:
+                  entry_i, exit_i = i + 1, i + holding_days
+                  entry, exit_ = df.loc[entry_i, "Open"], df.loc[exit_i, "Close"]
+                  if pd.notna(entry) and entry > 0 and pd.notna(exit_):
+                      net_ret = exit_ / entry - 1.0 - round_trip_cost
+                      trades.append(float(net_ret))
+                      equity *= 1.0 + net_ret
+                      i = exit_i + 1
+                      continue
+              i += 1
+          wins = sum(r > 0 for r in trades)
+          results.append({
+              "期間": f"{years} 年", "交易次數": len(trades),
+              "勝率": wins / len(trades) * 100 if trades else np.nan,
+              "平均報酬": np.mean(trades) * 100 if trades else np.nan,
+              "累積報酬": (equity - 1.0) * 100 if trades else np.nan,
+              "最大回撤": _max_drawdown(np.cumprod([1.0 + r for r in trades]).tolist()) if trades else np.nan,
+          })
+      return results
+
+def render_verdict_backtest(results):
+    st.markdown("### 🧪 終極裁決歷史回測（1／3／5／10 年）")
+    st.caption("規則採逐日可取得資料計算，下一交易日才進場，避免前視偏誤。持有 20 個交易日，交易不重疊；成本假設為買賣手續費各 0.1425% 加賣出證交稅 0.3%。這是技術裁決規則回測，不是對 AI 文字的事後擬合。")
+    if not results or all(r["交易次數"] == 0 for r in results):
+        st.warning("目前歷史資料不足，無法產生有效回測交易。")
+        return
+    cols = st.columns(4)
+    for col, row in zip(cols, results):
+        win = "--" if pd.isna(row["勝率"]) else f'{row["勝率"]:.1f}%'
+        avg = "--" if pd.isna(row["平均報酬"]) else f'{row["平均報酬"]:+.2f}%'
+        with col:
+            st.metric(row["期間"], win, f'{row["交易次數"]} 筆｜均報酬 {avg}')
+    table = pd.DataFrame(results).copy()
+    for c in ("勝率", "平均報酬", "累積報酬", "最大回撤"):
+        table[c] = table[c].map(lambda v: "--" if pd.isna(v) else f"{v:+.2f}%" if c != "勝率" else f"{v:.2f}%")
+    st.dataframe(table, hide_index=True, use_container_width=True)
+
 def render_trading_agents_cards(res):
     """將 TradingAgents 多 Agent 裁決結果改為由上而下、先結論後說明的單欄立體流式排版"""
     if isinstance(res, str):
@@ -1347,6 +1417,8 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
         margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
         norway_df = get_norway_big_shareholders(stock_id)
+        backtest_start = (end_date - timedelta(days=3653 + 120)).strftime("%Y-%m-%d")
+        backtest_df = fetch_stock_history_cached(stock_id, backtest_start, e_str, token)
 
     if price_df.empty:
         st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
@@ -1406,6 +1478,13 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
             st.error(err)
         else:
             render_trading_agents_cards(ai_res)
+    st.markdown("---")
+    render_verdict_backtest(run_verdict_backtest(backtest_df, end_date))
+    st.markdown("---")
+    if st.button("🔄 重新輸入股票", key=f"restart_stock_{stock_id}", use_container_width=True):
+        st.session_state.pop("diag_req", None)
+        st.session_state["scroll_to_stock_selector"] = True
+        st.rerun()
 
 # -----------------------------------------------------------------------------
 # 8. Streamlit 主程式介面
@@ -1568,6 +1647,33 @@ except Exception as exc:
 render_market_ticker()
 st.markdown("---")
 
+# 股票選擇器操作強化：點入後直接清空搜尋文字，重新分析時自動捲回選擇器。
+STOCK_SELECTOR_JS = r"""
+  (function () {
+    var P; try { P = window.parent; void P.document.body; } catch (e) { P = window; }
+    var D = P.document;
+    function enhance() {
+      var labels = Array.from(D.querySelectorAll('label'));
+      var label = labels.find(function(x) { return (x.innerText || '').indexOf('請選擇或搜尋股票') >= 0; });
+      if (!label) return;
+      var root = label.closest('[data-testid="stSelectbox"]') || label.parentElement;
+      var input = root && root.querySelector('input');
+      if (!input || input.dataset.clearStockOnFocus) return;
+      input.dataset.clearStockOnFocus = '1';
+      input.addEventListener('focus', function () {
+        input.value = '';
+        input.dispatchEvent(new P.Event('input', {bubbles: true}));
+      });
+    }
+    enhance();
+    new P.MutationObserver(enhance).observe(D.body, {childList: true, subtree: true});
+  })();
+  """
+try:
+    _components.html("<script>" + STOCK_SELECTOR_JS + "</script>", height=0)
+except Exception as exc:
+    safe_log("stock selector helper", exc)
+
 # -----------------------------------------------------------------------------
 # 10. 主頁面模式邏輯
 # -----------------------------------------------------------------------------
@@ -1598,6 +1704,17 @@ if app_mode == "全市場自動選股版":
             st.session_state["diag_req"] = {"mode": app_mode, "id": sid, "name": sname}
             
 else:
+    st.markdown('<div id="stock-selector-anchor"></div>', unsafe_allow_html=True)
+    if st.session_state.pop("scroll_to_stock_selector", False):
+        try:
+            _components.html("""<script>
+              (function(){var P=window.parent,D=P.document;setTimeout(function(){
+                var el=D.getElementById('stock-selector-anchor');
+                if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}
+              },200);})();
+              </script>""", height=0)
+        except Exception as exc:
+            safe_log("scroll to stock selector", exc)
     filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
     default_idx = next((i for i, opt in enumerate(filtered_options) if opt.startswith(st.session_state.get("selected_stock_code", "2356"))), 0)
 

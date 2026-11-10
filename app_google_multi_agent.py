@@ -856,16 +856,20 @@ def _read_price_db(stock_id, start_date, end_date):
         with sqlite3.connect(PRICE_DB, timeout=5) as conn:
             rows = pd.read_sql_query(
                 """SELECT trade_date AS date, open, high AS max, low AS min,
-                          close, volume AS Trading_Volume, source
+                          close, volume AS Trading_Volume, source, updated_at
                    FROM daily_prices
                    WHERE stock_id=? AND trade_date BETWEEN ? AND ?
                    ORDER BY trade_date""",
                 conn, params=(str(stock_id), start_date, end_date))
         if len(rows) >= 6:
-            src = rows["source"].dropna().iloc[-1] if "source" in rows and not rows["source"].dropna().empty else "本地快取"
-            rows = rows.drop(columns=["source"], errors="ignore")
-            rows.attrs["source"] = f"本地快取（原始來源：{src}）"
-            return _normalize_price_df(rows)
+            src = rows["source"].dropna().iloc[-1] if not rows["source"].dropna().empty else "未知來源"
+            updated = rows["updated_at"].dropna().iloc[-1] if not rows["updated_at"].dropna().empty else None
+            normalized = _normalize_price_df(rows.drop(columns=["source", "updated_at"], errors="ignore"))
+            normalized.attrs["source"] = f"本地快取（原始來源：{src}）"
+            normalized.attrs["original_source"] = src
+            normalized.attrs["cache_updated_at"] = updated
+            normalized.attrs["cache_status"] = "讀取本地快取"
+            return normalized
     except Exception as exc:
         safe_log("read price sqlite", exc)
     return pd.DataFrame()
@@ -935,38 +939,229 @@ def _fetch_price_yahoo_symbol(symbol, start_date, end_date):
         return pd.DataFrame(), f"Yahoo Finance {symbol} {type(exc).__name__}: {exc}"
 
 
+# 臺灣證券交易所官方年度開休市資料。API 暫時失效時，仍以週末及已知年度休市日備援。
+TWSE_HOLIDAY_API = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
+KNOWN_TWSE_HOLIDAYS = {
+    2026: {
+        "2026-01-01", "2026-02-12", "2026-02-13", "2026-02-16", "2026-02-17",
+        "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-27", "2026-04-03",
+        "2026-04-06", "2026-05-01", "2026-06-19", "2026-09-25", "2026-09-28",
+        "2026-10-09", "2026-10-26", "2026-12-25",
+    }
+}
+
+
+def _parse_twse_calendar_date(value, default_year=None):
+    """Parse Gregorian or ROC date strings returned by TWSE."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # Gregorian date.
+    m = re.search(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", text)
+    if m:
+        try: return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+        except ValueError: return None
+    # ROC year, e.g. 115/02/12.
+    m = re.search(r"(?<!\d)(\d{2,3})[./-](\d{1,2})[./-](\d{1,2})(?!\d)", text)
+    if m:
+        try: return datetime(int(m.group(1)) + 1911, int(m.group(2)), int(m.group(3))).date()
+        except ValueError: return None
+    # Month/day only, when the queried year is known.
+    m = re.search(r"(?<!\d)(\d{1,2})[./-](\d{1,2})(?!\d)", text)
+    if m and default_year:
+        try: return datetime(int(default_year), int(m.group(1)), int(m.group(2))).date()
+        except ValueError: return None
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_twse_holidays(year):
+    """Return TWSE non-trading weekdays for a year and the calendar source."""
+    holidays = set()
+    source = "週末判斷"
+    try:
+        r = requests.get(TWSE_HOLIDAY_API, headers={"User-Agent": "Mozilla/5.0"}, timeout=(3, 10))
+        r.raise_for_status()
+        rows = r.json()
+        for row in rows if isinstance(rows, list) else []:
+            # The official endpoint has changed field names over time, so inspect all values.
+            row_text = " ".join(str(v) for v in row.values()) if isinstance(row, dict) else str(row)
+            d = _parse_twse_calendar_date(row_text, year)
+            if d and d.year == int(year):
+                # Official schedule contains market closure / no-trading rows.
+                holidays.add(d)
+        if holidays:
+            source = "臺灣證券交易所開休市資料"
+    except Exception as exc:
+        safe_log("TWSE holiday calendar", exc)
+
+    if not holidays and int(year) in KNOWN_TWSE_HOLIDAYS:
+        holidays = {pd.Timestamp(x).date() for x in KNOWN_TWSE_HOLIDAYS[int(year)]}
+        source = f"內建 {year} 年證交所休市表"
+    return holidays, source
+
+
+def is_twse_trading_day(value):
+    d = pd.Timestamp(value).date()
+    if d.weekday() >= 5:
+        return False
+    holidays, _ = get_twse_holidays(d.year)
+    return d not in holidays
+
+
+def previous_twse_trading_day(value, include_current=True):
+    d = pd.Timestamp(value).date()
+    if not include_current:
+        d -= timedelta(days=1)
+    for _ in range(370):
+        if is_twse_trading_day(d):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+
+def expected_latest_trading_day(requested_end):
+    """Latest completed TWSE session expected for a query, in Taipei time.
+
+    Today is considered complete after 13:45. The 15-minute buffer allows daily data
+    providers to finish publishing OHLCV. Weekends and official market holidays roll
+    back to the previous trading day.
+    """
+    requested = pd.Timestamp(requested_end).date()
+    now = taipei_now()
+    today = now.date()
+    if requested > today:
+        requested = today
+    if requested < today:
+        return previous_twse_trading_day(requested, include_current=True)
+    if not is_twse_trading_day(today):
+        return previous_twse_trading_day(today, include_current=False)
+    market_data_ready = now.hour > 13 or (now.hour == 13 and now.minute >= 45)
+    return today if market_data_ready else previous_twse_trading_day(today, include_current=False)
+
+
+def _merge_price_frames(local, fresh, start_date, end_date, source):
+    frames = [x for x in (local, fresh) if x is not None and not x.empty]
+    if not frames:
+        return pd.DataFrame()
+    merged = _normalize_price_df(pd.concat(frames, ignore_index=True))
+    begin = pd.Timestamp(start_date)
+    finish = pd.Timestamp(end_date)
+    merged = merged[(merged["date"] >= begin) & (merged["date"] <= finish)].reset_index(drop=True)
+    merged.attrs["source"] = source
+    return merged
+
+
+def _format_taipei_time(value):
+    if not value:
+        return "無紀錄"
+    try:
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("Asia/Taipei").tz_localize(None)
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+def _friendly_market_error(message):
+    text = str(message or "")
+    low = text.lower()
+    if "429" in low or "upper limit" in low or "too many requests" in low:
+        return "資料來源目前已達查詢次數上限，請稍後再試。"
+    if "401" in low or "403" in low or "unauthorized" in low or "forbidden" in low:
+        return "資料來源拒絕存取，可能是權限、Token 或服務限制。"
+    if "timeout" in low or "timed out" in low:
+        return "連線逾時，資料來源回應時間過長。"
+    if "connection" in low or "network" in low or "dns" in low:
+        return "網路連線失敗，暫時無法連到資料來源。"
+    if "empty" in low or "空資料" in text or "少於" in text or "無 " in text:
+        return "資料來源已回應，但沒有提供指定日期的行情。"
+    return text
+
+
 def fetch_stock_history_cached(stock_id, start_date, end_date, api_token=""):
-    """Local DB -> FinMind -> Yahoo .TW/.TWO, and never persist a failed response."""
+
+    """Trading-calendar-aware Local DB -> FinMind -> Yahoo fallback.
+
+    A local cache is returned only when it reaches the latest completed TWSE trading
+    day. Otherwise the function fetches and merges fresh rows instead of silently
+    accepting data from the previous day.
+    """
+    requested_end = pd.Timestamp(end_date).date()
+    expected = expected_latest_trading_day(requested_end)
     local = _read_price_db(stock_id, start_date, end_date)
-    # Only trust local cache when it reaches close to the requested recent date.
-    if not local.empty:
-        latest = pd.to_datetime(local["date"]).max().date()
-        requested = pd.Timestamp(end_date).date()
-        if (requested - latest).days <= 7:
-            return local
+    local_latest = None if local.empty else pd.to_datetime(local["date"], errors="coerce").max().date()
+    if local_latest and local_latest >= expected:
+        local.attrs["expected_latest_date"] = expected.strftime("%Y-%m-%d")
+        local.attrs["calendar_status"] = "資料已更新至應有的最近交易日"
+        local.attrs["cache_status"] = "使用快取，未重新連線"
+        local.attrs["last_update_time"] = local.attrs.get("cache_updated_at")
+        local.attrs["fetch_attempt_time"] = None
+        return local
 
     errors = []
-    for attempt in range(2):
-        df, err = _fetch_price_finmind(stock_id, start_date, end_date, api_token)
-        if not df.empty:
-            _write_price_db(stock_id, df, "FinMind")
-            return df
-        errors.append(err)
-        if attempt == 0:
-            time.sleep(1.2)
+    fetch_attempt_time = taipei_now().isoformat(timespec="seconds")
+    fresh = pd.DataFrame()
+    fresh_source = None
+    # Add one day because some providers interpret end_date as exclusive. Results are
+    # filtered back to the user-selected end date before returning.
+    provider_end = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    fetch_start = start_date
+    if local_latest:
+        fetch_start = max(pd.Timestamp(start_date), pd.Timestamp(local_latest) - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
 
-    # Automatically try listed then OTC suffix, so an incomplete stock master does not break fallback.
-    for suffix in ("TW", "TWO"):
-        symbol = f"{stock_id}.{suffix}"
-        df, err = _fetch_price_yahoo_symbol(symbol, start_date, end_date)
+    for attempt in range(2):
+        df, err = _fetch_price_finmind(stock_id, fetch_start, provider_end, api_token)
         if not df.empty:
-            _write_price_db(stock_id, df, f"Yahoo Finance {symbol}")
-            return df
-        errors.append(err)
+            fresh, fresh_source = df, "FinMind"
+            break
+        if err: errors.append(err)
+        if attempt == 0: time.sleep(1.0)
+
+    if fresh.empty:
+        for suffix in ("TW", "TWO"):
+            symbol = f"{stock_id}.{suffix}"
+            df, err = _fetch_price_yahoo_symbol(symbol, fetch_start, end_date)
+            if not df.empty:
+                fresh, fresh_source = df, f"Yahoo Finance {symbol}"
+                break
+            if err: errors.append(err)
+
+    if not fresh.empty:
+        combined = _merge_price_frames(local, fresh, start_date, end_date, fresh_source)
+        _write_price_db(stock_id, combined, fresh_source)
+        latest = pd.to_datetime(combined["date"], errors="coerce").max().date()
+        combined.attrs["expected_latest_date"] = expected.strftime("%Y-%m-%d")
+        combined.attrs["calendar_status"] = (
+            "資料已更新至應有的最近交易日" if latest >= expected
+            else f"已重新向資料來源查詢，但最新資料仍只到 {latest:%Y-%m-%d}"
+        )
+        combined.attrs["errors"] = errors
+        combined.attrs["source"] = fresh_source
+        combined.attrs["original_source"] = fresh_source
+        combined.attrs["cache_status"] = "已連線更新並寫入快取"
+        combined.attrs["last_update_time"] = fetch_attempt_time
+        combined.attrs["fetch_attempt_time"] = fetch_attempt_time
+        return combined
+
+    # If online providers fail, retain usable local history but clearly mark it stale.
+    if not local.empty:
+        local.attrs["expected_latest_date"] = expected.strftime("%Y-%m-%d")
+        local.attrs["calendar_status"] = f"外部資料暫時無法更新，目前顯示至 {local_latest:%Y-%m-%d}"
+        local.attrs["errors"] = errors
+        local.attrs["cache_status"] = "外部更新失敗，暫時使用舊快取"
+        local.attrs["last_update_time"] = local.attrs.get("cache_updated_at")
+        local.attrs["fetch_attempt_time"] = fetch_attempt_time
+        return local
 
     failed = pd.DataFrame()
-    failed.attrs["errors"] = [x for x in errors if x]
+    failed.attrs["errors"] = errors
     failed.attrs["source"] = "全部來源失敗"
+    failed.attrs["expected_latest_date"] = expected.strftime("%Y-%m-%d")
+    failed.attrs["cache_status"] = "無可用快取，外部資料來源也失敗"
+    failed.attrs["last_update_time"] = None
+    failed.attrs["fetch_attempt_time"] = fetch_attempt_time
     return failed
 
 
@@ -1861,7 +2056,7 @@ def render_trading_agents_cards(res):
     """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 7. 共用診斷渲染引擎（行動裝置友善版）
+# 7. 共用個股分析顯示區（行動裝置友善版）
 # -----------------------------------------------------------------------------
 VIEW_OPTIONS = {"近 20 日": 20, "近 40 日": 40, "近 60 日": 60, "選定區間全部": 0}
 WEEK_OPTIONS = {"13 週": 13, "26 週": 26, "52 週": 52}
@@ -2287,13 +2482,16 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         backtest_df = fetch_stock_history_cached(stock_id, backtest_start, e_str, token)
 
     if price_df.empty:
-        st.error(f"❌ 無法取得 {stock_id} {stock_name} 的歷史 K 線資料。FinMind 與 Yahoo Finance 備援均未成功。")
+        st.error(f"❌ 無法取得 {stock_id} {stock_name} 的歷史行情。")
+        st.warning("FinMind 與 Yahoo Finance 都未能提供可用資料，且本機沒有可使用的快取。請稍後重試，或檢查 Token、網路連線與股票代碼。")
+        st.caption(f"查詢期間：{b_str} 至 {e_str}｜應有最近交易日：{price_df.attrs.get('expected_latest_date', '--')}｜最後嘗試更新：{_format_taipei_time(price_df.attrs.get('fetch_attempt_time'))}")
         errors = price_df.attrs.get("errors", [])
         if errors:
-            with st.expander("查看資料來源錯誤", expanded=True):
-                for message in errors:
-                    st.code(message)
-        st.info(f"查詢期間：{b_str} 至 {e_str}｜FinMind Token：{'已設定' if token else '未設定'}")
+            with st.expander("查看失敗原因", expanded=True):
+                for i, message in enumerate(errors, 1):
+                    st.write(f"{i}. {_friendly_market_error(message)}")
+                    st.caption(str(message))
+        st.info(f"FinMind Token：{'已設定' if token else '未設定'}")
         if st.button("🧹 清除價格快取並重試", key=f"clear_price_cache_{stock_id}"):
             try:
                 if os.path.exists(PRICE_DB):
@@ -2306,7 +2504,57 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     st.markdown(f"#### 📊 {stock_id} {stock_name}")
     source = price_df.attrs.get("source", "未知來源")
     latest_data_date = pd.to_datetime(price_df["date"], errors="coerce").max()
-    st.caption(f"歷史行情來源：{source}｜最新資料日：{latest_data_date:%Y-%m-%d}")
+    expected_date_text = price_df.attrs.get("expected_latest_date", expected_latest_trading_day(end_date).strftime("%Y-%m-%d"))
+    calendar_status = price_df.attrs.get("calendar_status", "")
+    cache_status = price_df.attrs.get("cache_status", "未知")
+    last_update_time = _format_taipei_time(price_df.attrs.get("last_update_time") or price_df.attrs.get("cache_updated_at"))
+    fetch_attempt_time = _format_taipei_time(price_df.attrs.get("fetch_attempt_time"))
+    _, calendar_source = get_twse_holidays(pd.Timestamp(end_date).year)
+
+    status_cols = st.columns(2)
+    with status_cols[0]:
+        st.markdown(f"**行情來源**：{source}")
+        st.markdown(f"**快取狀態**：{cache_status}")
+        st.markdown(f"**行情更新時間**：{last_update_time}")
+    with status_cols[1]:
+        st.markdown(f"**查詢截止日**：{end_date:%Y-%m-%d}")
+        st.markdown(f"**應有最近交易日**：{expected_date_text}")
+        st.markdown(f"**目前最新資料**：{latest_data_date:%Y-%m-%d}")
+
+    if price_df.attrs.get("fetch_attempt_time"):
+        st.caption(f"最近一次向外部來源查詢：{fetch_attempt_time}｜交易日判斷：{calendar_source}")
+    else:
+        st.caption(f"本次直接使用有效快取，未重新連線｜交易日判斷：{calendar_source}")
+
+    if latest_data_date.date() < pd.Timestamp(expected_date_text).date():
+        st.warning(f"行情資料尚未更新到應有的最近交易日。{calendar_status}。目前圖表可繼續使用，但可能缺少最新一個交易日。")
+        errors = price_df.attrs.get("errors", [])
+        if errors:
+            with st.expander("查看行情更新失敗原因", expanded=True):
+                for i, message in enumerate(errors, 1):
+                    st.write(f"{i}. {_friendly_market_error(message)}")
+                    st.caption(str(message))
+    else:
+        st.success("行情已更新至應有的最近交易日。")
+        errors = price_df.attrs.get("errors", [])
+        if errors:
+            with st.expander("查看備援來源切換紀錄", expanded=False):
+                st.caption("主要來源曾失敗，但系統已透過其他來源取得完整行情。")
+                for i, message in enumerate(errors, 1):
+                    st.write(f"{i}. {_friendly_market_error(message)}")
+
+    if st.session_state.pop(f"price_refresh_done_{stock_id}", False):
+        st.success("已清除這檔股票的舊快取，並重新取得行情。")
+    if st.button("🔄 重新取得這檔股票的最新行情", key=f"refresh_latest_price_{stock_id}", use_container_width=True):
+        try:
+            _init_price_db()
+            with sqlite3.connect(PRICE_DB, timeout=10) as conn:
+                conn.execute("DELETE FROM daily_prices WHERE stock_id=?", (str(stock_id),))
+        except Exception as exc:
+            safe_log("clear one stock price cache", exc)
+        st.session_state[f"price_refresh_done_{stock_id}"] = True
+        st.session_state.pop("diag_req", None)
+        st.rerun()
 
     # --- 圖表顯示設定（手機上一眼可調整；預設 40 日，K 棒與柱體寬度最舒適） ---
     view_label = st.radio("圖表顯示區間", list(VIEW_OPTIONS.keys()), index=1,
@@ -2338,7 +2586,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     if chip_df.empty:
         st.warning("三大法人資料目前暫時無法取得。個股價格、K線與回測仍可正常使用；籌碼裁決將標示為資料不足，不會當成負分。")
         if st.session_state.get("show_data_diagnostics", False) and chip_df.attrs.get("errors"):
-            with st.expander("三大法人資料診斷"):
+            with st.expander("查看三大法人資料狀態"):
                 for message in chip_df.attrs["errors"]:
                     st.code(message)
     else:
@@ -2350,7 +2598,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     if margin_df.empty:
         st.warning("融資融券資料目前暫時無法取得。個股價格、K線與回測仍可正常使用；籌碼裁決將標示為資料不足，不會當成負分。")
         if st.session_state.get("show_data_diagnostics", False) and margin_df.attrs.get("errors"):
-            with st.expander("融資融券資料診斷"):
+            with st.expander("查看融資融券資料狀態"):
                 for message in margin_df.attrs["errors"]:
                     st.code(message)
     else:
@@ -2364,8 +2612,8 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     st.caption("總股東人數縱軸不從 0 起算，用以凸顯增減趨勢；請以標題列的最新數字為準。")
 
     st.markdown("---")
-    st.markdown("## 🤖 AI 綜合投資分析與建議")
-    with st.spinner("TradingAgents 團隊（技術員/多空研究員/交易員/風控經理）連線分析中..."):
+    st.markdown("## 🤖 AI 投資分析與建議")
+    with st.spinner("AI 正在整理技術走勢、籌碼資料與投資建議，請稍候..."):
         df_calc = calculate_indicators(price_df)
         latest = df_calc.iloc[-1]
         tech_info = f"收盤價:{latest['Close']}, 5MA:{latest['5MA']}, 20MA:{latest['20MA']}, 布林上軌:{latest['BB_Upper']}, 布林下軌:{latest['BB_Lower']}"
@@ -2413,7 +2661,7 @@ def clear_strategy_results():
 
 with st.sidebar:
     st.markdown("### ⚡ 系統核心設定")
-    app_mode = st.selectbox("選擇系統執行模式：", ["單股與多 Agent 診斷版", "全市場自動選股版"], index=0,
+    app_mode = st.selectbox("選擇功能：", ["個股分析", "全市場選股"], index=0,
                             key="app_mode_select", on_change=clear_current_analysis)
     st.markdown("---")
     st.info("🔒 Gemini API Key 與 FinMind Token 已全數由系統密鑰庫 (Streamlit Secrets) 安全自動載入。")
@@ -2699,7 +2947,7 @@ def render_market_strategy_backtest(table, strategy_name, meta):
 # -----------------------------------------------------------------------------
 # 10. 主頁面模式邏輯
 # -----------------------------------------------------------------------------
-if app_mode == "全市場自動選股版":
+if app_mode == "全市場選股":
     st.markdown("## 🔍 全市場選股")
     strategy_choice = st.radio(
         "選擇選股方式：",
@@ -2815,10 +3063,10 @@ else:
     stock_id = st.session_state["selected_stock_code"]
     stock_name = STOCK_DICT.get(stock_id, "")
 
-    if st.button("🚀 啟動個股技術、籌碼與 AI 深度診斷"):
+    if st.button("🚀 開始分析這檔股票"):
         st.session_state["diag_req"] = {"mode": app_mode, "id": stock_id, "name": stock_name}
 
-# 診斷結果以 session_state 保存：調整顯示區間／布林通道／週數時圖表不會消失
+# 個股分析結果以 session_state 保存：調整顯示區間／布林通道／週數時圖表不會消失
 _req = st.session_state.get("diag_req")
 if _req and _req.get("mode") == app_mode:
     render_diagnosis_section(_req["id"], _req["name"], start_date, end_date, finmind_token)

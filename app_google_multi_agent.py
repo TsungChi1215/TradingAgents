@@ -643,6 +643,54 @@ def _bounded_parallel(items, worker, max_workers, timeout_seconds):
     return results, timed_out
 
 
+def _percentile_score(series, higher_is_better=True):
+    values = pd.to_numeric(series, errors="coerce")
+    if values.notna().sum() <= 1:
+        return pd.Series(50.0, index=series.index)
+    score = values.rank(pct=True, method="average") * 100
+    return score if higher_is_better else 100 - score
+
+
+def add_strategy_composite_score(df, strategy_name):
+    """Add transparent 0-100 composite score, rank, and selection rationale."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if strategy_name == "飆風向上":
+        components = {
+            "月線斜率": (_percentile_score(out["月線斜率(%)"]), 0.40),
+            "主力5日": (_percentile_score(out["主力5日"]), 0.25),
+            "主力10日": (_percentile_score(out["主力10日"]), 0.20),
+            "成交量": (_percentile_score(out["成交量(張)"]), 0.15),
+        }
+        rationale = lambda r: (f"月線斜率 {r['月線斜率(%)']:.2f}%；主力5日 {r['主力5日']:,.0f}；"
+                               f"主力10日 {r['主力10日']:,.0f}；成交量 {r['成交量(張)']:,.0f} 張")
+    elif strategy_name == "短線強勢爆發":
+        components = {
+            "當日漲幅": (_percentile_score(out["漲幅(%)"]), 0.50),
+            "成交量": (_percentile_score(out["成交量(張)"]), 0.30),
+            "紅K實體": (_percentile_score(out["漲幅(%)"]), 0.20),
+        }
+        rationale = lambda r: f"當日漲幅 {r['漲幅(%)']:.2f}%；成交量 {r['成交量(張)']:,.0f} 張；收盤高於開盤"
+    else:
+        # Prefer strength near the upper half of the required 0.5%-3% band while rewarding liquidity.
+        trend_quality = 100 - (pd.to_numeric(out["漲幅(%)"], errors="coerce") - 2.0).abs().rank(pct=True) * 100
+        components = {
+            "成交量": (_percentile_score(out["成交量(張)"]), 0.50),
+            "波段漲幅品質": (trend_quality.fillna(50), 0.35),
+            "當日漲幅": (_percentile_score(out["漲幅(%)"]), 0.15),
+        }
+        rationale = lambda r: f"成交量 {r['成交量(張)']:,.0f} 張；當日漲幅 {r['漲幅(%)']:.2f}%；紅K且位於波段條件區間"
+    score = pd.Series(0.0, index=out.index)
+    for _, (component, weight) in components.items():
+        score += component.fillna(0) * weight
+    out["綜合分數"] = score.round(1)
+    out = out.sort_values(["綜合分數", "成交量(張)"], ascending=False).reset_index(drop=True)
+    out["策略排名"] = np.arange(1, len(out) + 1)
+    out["選股依據"] = out.apply(rationale, axis=1)
+    return out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def run_market_screener(stock_dict, strategy_type):
     """Time-boxed market scan. It always returns within about 80 seconds with status metadata."""
@@ -685,7 +733,9 @@ def run_market_screener(stock_dict, strategy_type):
 
     if strategy_type in ("短線強勢爆發", "波段多頭排列"):
         sort_col = "漲幅(%)" if strategy_type == "短線強勢爆發" else "成交量(張)"
-        result = pd.DataFrame(base).sort_values(sort_col, ascending=False).head(30) if base else pd.DataFrame()
+        result = pd.DataFrame(base) if base else pd.DataFrame()
+        if not result.empty:
+            result = add_strategy_composite_score(result, strategy_type).head(30)
         condition_name = "舊版短線強勢條件" if strategy_type == "短線強勢爆發" else "波段多頭條件"
         result.attrs["scan_status"] = {
             "ok": True,
@@ -736,8 +786,8 @@ def run_market_screener(stock_dict, strategy_type):
     final = [x for x in final if x]
     elapsed = round(time.monotonic() - started, 1)
     if final:
-        result = pd.DataFrame(final).sort_values(["月線斜率(%)", "主力5日"], ascending=False).head(20)
-        result.attrs["scan_status"] = {"ok": True, "message": f"掃描完成，耗時 {elapsed} 秒。",
+        result = add_strategy_composite_score(pd.DataFrame(final), "飆風向上").head(20)
+        result.attrs["scan_status"] = {"ok": True, "message": f"掃描完成，耗時 {elapsed} 秒；結果已依策略綜合分數排序。",
             "counts": {"成交量初篩": base_total, "價格深查": len(base), "月線通過": len(stage1),
                        "籌碼通過": len(stage2), "集保通過": len(result)}, "timeouts": timeout1 + timeout2 + timeout3}
         return result
@@ -2183,6 +2233,116 @@ except Exception as exc:
 render_market_ticker()
 st.markdown("---")
 
+def _strategy_signal_frame(price_df, strategy_name, chip_df=None, margin_df=None):
+    df = calculate_indicators(price_df).copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for c in ("Open", "High", "Low", "Close", "Trading_Volume", "20MA"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["VolumeLots"] = df.get("Trading_Volume", 0) / 1000
+    df["DayChange"] = np.where(df["Open"] > 0, (df["Close"] / df["Open"] - 1) * 100, np.nan)
+    df["MA20Slope5"] = (df["20MA"] / df["20MA"].shift(5) - 1) * 100
+    if strategy_name == "短線強勢爆發":
+        df["Signal"] = (df["DayChange"] >= 2.0) & (df["VolumeLots"] >= 1500) & (df["Close"] > df["Open"])
+    elif strategy_name == "波段多頭排列":
+        df["Signal"] = (df["VolumeLots"] >= 1000) & df["DayChange"].between(0.5, 3.0) & (df["Close"] >= df["Open"])
+    else:
+        # 飆風向上歷史訊號：價格條件完整；籌碼資料能取得時再疊加 1/5/10 日及融資下降。
+        signal = (df["VolumeLots"] > 1000) & (df["MA20Slope5"] > 1.0)
+        if chip_df is not None and not chip_df.empty:
+            c = chip_df.copy()
+            dc = "date" if "date" in c.columns else "Date"
+            c["Date"] = pd.to_datetime(c[dc], errors="coerce")
+            if "buy" in c.columns and "sell" in c.columns:
+                c["net"] = pd.to_numeric(c["buy"], errors="coerce").fillna(0) - pd.to_numeric(c["sell"], errors="coerce").fillna(0)
+            else:
+                c["net"] = _num_series(c, ["buy_sell", "net_buy_sell", "NetBuySell"]).fillna(0)
+            daily = c.groupby("Date")["net"].sum().sort_index()
+            chip = pd.DataFrame({"Chip1": daily, "Chip5": daily.rolling(5).sum(), "Chip10": daily.rolling(10).sum()})
+            df = df.merge(chip, left_on="Date", right_index=True, how="left")
+            signal &= (df["Chip1"] > 0) & (df["Chip5"] > 0) & (df["Chip10"] > 0)
+        if margin_df is not None and not margin_df.empty:
+            m = margin_df.copy(); dc = "date" if "date" in m.columns else "Date"
+            m["Date"] = pd.to_datetime(m[dc], errors="coerce")
+            bal = _num_series(m, ["MarginPurchaseTodayBalance", "MarginPurchaseBalance", "margin_purchase_today_balance"])
+            m["MarginBalance"] = bal
+            mm = m.groupby("Date")["MarginBalance"].last().sort_index()
+            df = df.merge(mm.rename("MarginBalance"), left_on="Date", right_index=True, how="left")
+            signal &= df["MarginBalance"] < df["MarginBalance"].shift(5)
+        df["Signal"] = signal.fillna(False)
+    return df.sort_values("Date").reset_index(drop=True)
+
+
+def _backtest_strategy_stock(stock_id, strategy_name, start_date, end_date, token, holding_days):
+    price = fetch_stock_history_cached(stock_id, start_date, end_date, token)
+    if price.empty:
+        return []
+    chip = margin = pd.DataFrame()
+    if strategy_name == "飆風向上":
+        chip = fetch_chip_history_cached(stock_id, start_date, end_date, token)
+        margin = fetch_margin_history_cached(stock_id, start_date, end_date, token)
+    df = _strategy_signal_frame(price, strategy_name, chip, margin)
+    trades, i = [], 0
+    buy_cost, sell_cost = 0.001425 + 0.001, 0.001425 + 0.003 + 0.001
+    while i < len(df) - holding_days - 1:
+        if bool(df.loc[i, "Signal"]):
+            entry_i, exit_i = i + 1, min(i + 1 + holding_days, len(df) - 1)
+            entry = df.loc[entry_i, "Open"] * (1 + buy_cost)
+            exit_price = df.loc[exit_i, "Close"] * (1 - sell_cost)
+            if pd.notna(entry) and entry > 0 and pd.notna(exit_price):
+                trades.append({"股票代碼": stock_id, "訊號日": df.loc[i, "Date"],
+                               "進場日": df.loc[entry_i, "Date"], "出場日": df.loc[exit_i, "Date"],
+                               "報酬": float(exit_price / entry - 1)})
+            i = exit_i + 1
+        else:
+            i += 1
+    return trades
+
+
+def run_market_strategy_backtest(df_candidates, strategy_name, token):
+    """Backtest current scan cohort, capped at 10 stocks to keep Streamlit Cloud responsive."""
+    if df_candidates is None or df_candidates.empty:
+        return pd.DataFrame(), {"message": "請先執行市場掃描，取得候選股票後再回測。"}
+    end = taipei_now().date()
+    start = end - timedelta(days=550)
+    ranked = df_candidates.sort_values("綜合分數", ascending=False) if "綜合分數" in df_candidates.columns else df_candidates
+    ids = ranked["股票代碼"].astype(str).drop_duplicates().head(10).tolist()
+    rows = []
+    for horizon in (5, 10, 20):
+        trades = []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(_backtest_strategy_stock, sid, strategy_name,
+                                   start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), token, horizon) for sid in ids]
+            for f in futures:
+                try: trades.extend(f.result(timeout=35))
+                except Exception as exc: safe_log("strategy backtest stock", exc)
+        rs = [x["報酬"] for x in trades]; wins = [r for r in rs if r > 0]; losses = [r for r in rs if r <= 0]
+        curve = [1.0] + (np.cumprod([1+r for r in rs]).tolist() if rs else [])
+        rows.append({"持有區間": f"{horizon}天", "回測股票": len(ids), "交易數": len(rs),
+                     "勝率": len(wins)/len(rs)*100 if rs else np.nan,
+                     "平均報酬": np.mean(rs)*100 if rs else np.nan,
+                     "累積報酬": (curve[-1]-1)*100 if rs else np.nan,
+                     "最大回撤": _bt_max_drawdown(curve),
+                     "盈虧因子": sum(wins)/abs(sum(losses)) if losses and sum(losses) != 0 else (np.inf if wins else np.nan)})
+    note = "以本次掃描結果前 10 檔、最近約一年資料回測；訊號日收盤確認，下一交易日開盤進場，交易不重疊。"
+    if strategy_name == "飆風向上":
+        note += " 集保戶數缺乏逐日歷史資料，因此歷史回測不納入集保條件；法人或融資歷史取不到時，採價格條件代理並於結果中視為限制。"
+    return pd.DataFrame(rows), {"message": note, "stocks": ids}
+
+
+def render_market_strategy_backtest(table, strategy_name, meta):
+    st.markdown(f"### 🧪 {strategy_name}策略歷史回測")
+    st.caption(meta.get("message", ""))
+    if table is None or table.empty or table["交易數"].sum() == 0:
+        st.info("目前候選股票在回測期間沒有足夠交易訊號。")
+        return
+    view = table.copy()
+    for c in ("勝率", "平均報酬", "累積報酬", "最大回撤"):
+        view[c] = view[c].map(lambda v: "--" if pd.isna(v) else (f"{v:.1f}%" if c == "勝率" else f"{v:+.2f}%"))
+    view["盈虧因子"] = view["盈虧因子"].map(lambda v: "--" if pd.isna(v) else ("∞" if np.isinf(v) else f"{v:.2f}"))
+    st.dataframe(view, hide_index=True, use_container_width=True)
+
+
 # -----------------------------------------------------------------------------
 # 10. 主頁面模式邏輯
 # -----------------------------------------------------------------------------
@@ -2245,7 +2405,35 @@ if app_mode == "全市場自動選股版":
 
     if not df_res.empty:
         st.success(f"🎉 掃描完成！共挑選出 {len(df_res)} 檔達標個股。")
-        st.dataframe(df_res)
+        display_cols = [c for c in ["策略排名", "股票代碼", "股票名稱", "綜合分數", "選股依據",
+                                         "今日收盤", "漲幅(%)", "成交量(張)", "月線斜率(%)",
+                                         "主力1日", "主力5日", "主力10日", "近期主力大買",
+                                         "近期散戶大賣", "集保戶數大減"] if c in df_res.columns]
+        st.dataframe(df_res[display_cols], hide_index=True, use_container_width=True)
+
+        top10 = df_res.sort_values("綜合分數", ascending=False).head(10) if "綜合分數" in df_res.columns else df_res.head(10)
+        st.markdown("### 🏅 回測採用前十檔與選股依據")
+        st.caption("前十檔依本策略綜合分數由高至低選取。綜合分數採當次候選池內百分位排名，因此是相對強度分數，不是預測報酬率。")
+        top10_cols = [c for c in ["策略排名", "股票代碼", "股票名稱", "綜合分數", "選股依據"] if c in top10.columns]
+        st.dataframe(top10[top10_cols], hide_index=True, use_container_width=True)
+
+        with st.expander("查看綜合分數計算方式"):
+            if strategy_choice == "飆風向上":
+                st.markdown("**月線斜率 40% + 主力5日 25% + 主力10日 20% + 成交量 15%**。所有分項先轉為當次候選池百分位分數。")
+            elif strategy_choice == "短線強勢爆發":
+                st.markdown("**當日漲幅 50% + 成交量 30% + 紅K實體強度 20%**。目前紅K實體以當日開收漲幅作為代理值。")
+            else:
+                st.markdown("**成交量 50% + 波段漲幅品質 35% + 當日漲幅 15%**。波段漲幅品質偏好接近 2% 且仍位於 0.5% 至 3% 條件內的股票。")
+
+        st.markdown("### 🧪 策略歷史回測")
+        st.caption("回測以本次掃描結果為樣本，依綜合分數由高至低取前 10 檔，避免雲端執行逾時。")
+        if st.button(f"執行「{strategy_choice}」回測", key=f"run_strategy_bt_{strategy_choice}", use_container_width=True):
+            with st.spinner(f"正在回測 {strategy_choice}，請稍候..."):
+                bt_table, bt_meta = run_market_strategy_backtest(df_res, strategy_choice, get_secret("FINMIND_TOKEN", ""))
+                st.session_state["market_strategy_bt"] = {"strategy": strategy_choice, "table": bt_table, "meta": bt_meta}
+        saved_bt = st.session_state.get("market_strategy_bt")
+        if saved_bt and saved_bt.get("strategy") == strategy_choice:
+            render_market_strategy_backtest(saved_bt.get("table"), strategy_choice, saved_bt.get("meta", {}))
         
         st.markdown("### 🎯 從掃描結果啟動深度診斷")
         options = [f"{row['股票代碼']} {row['股票名稱']}" for idx, row in df_res.iterrows()]

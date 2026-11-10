@@ -18,6 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import math
 import inspect
+import sqlite3
 
 # -----------------------------------------------------------------------------
 # 1. 系統設定與金鑰解析
@@ -695,16 +696,163 @@ def get_all_taiwan_stock_info(api_token=""):
         except Exception: pass
     return {"2330": "台積電", "2356": "英業達", "2317": "鴻海", "2454": "聯發科"}
 
-@st.cache_data(ttl=43200)
-def fetch_stock_history_cached(stock_id, start_date, end_date, api_token=""):
+PRICE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_cache.sqlite3")
+
+
+def _normalize_price_df(df):
+    """Convert FinMind/Yahoo data to the schema used by the existing indicators."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
+    out = out.rename(columns={
+        "Date": "date", "Open": "open", "High": "max", "Low": "min",
+        "Close": "close", "Volume": "Trading_Volume",
+    })
+    required = ["date", "open", "max", "min", "close", "Trading_Volume"]
+    for col in required:
+        if col not in out.columns:
+            out[col] = np.nan
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    for col in ["open", "max", "min", "close", "Trading_Volume"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return (out[required].dropna(subset=["date", "open", "max", "min", "close"])
+            .sort_values("date").drop_duplicates("date").reset_index(drop=True))
+
+
+def _init_price_db():
+    try:
+        with sqlite3.connect(PRICE_DB, timeout=5) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS daily_prices (
+                stock_id TEXT NOT NULL, trade_date TEXT NOT NULL,
+                open REAL, high REAL, low REAL, close REAL, volume REAL,
+                source TEXT, updated_at TEXT,
+                PRIMARY KEY (stock_id, trade_date)
+            )""")
+    except Exception as exc:
+        safe_log("init price sqlite", exc)
+
+
+def _read_price_db(stock_id, start_date, end_date):
+    try:
+        _init_price_db()
+        with sqlite3.connect(PRICE_DB, timeout=5) as conn:
+            rows = pd.read_sql_query(
+                """SELECT trade_date AS date, open, high AS max, low AS min,
+                          close, volume AS Trading_Volume, source
+                   FROM daily_prices
+                   WHERE stock_id=? AND trade_date BETWEEN ? AND ?
+                   ORDER BY trade_date""",
+                conn, params=(str(stock_id), start_date, end_date))
+        if len(rows) >= 6:
+            src = rows["source"].dropna().iloc[-1] if "source" in rows and not rows["source"].dropna().empty else "本地快取"
+            rows = rows.drop(columns=["source"], errors="ignore")
+            rows.attrs["source"] = f"本地快取（原始來源：{src}）"
+            return _normalize_price_df(rows)
+    except Exception as exc:
+        safe_log("read price sqlite", exc)
+    return pd.DataFrame()
+
+
+def _write_price_db(stock_id, df, source):
+    if df is None or df.empty:
+        return
+    try:
+        _init_price_db()
+        rows = _normalize_price_df(df).copy()
+        now_text = taipei_now().isoformat(timespec="seconds")
+        payload = [(str(stock_id), r.date.strftime("%Y-%m-%d"), float(r.open), float(r.max),
+                    float(r.min), float(r.close), None if pd.isna(r.Trading_Volume) else float(r.Trading_Volume),
+                    source, now_text) for r in rows.itertuples(index=False)]
+        with sqlite3.connect(PRICE_DB, timeout=10) as conn:
+            conn.executemany("""INSERT OR REPLACE INTO daily_prices
+                (stock_id, trade_date, open, high, low, close, volume, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", payload)
+    except Exception as exc:
+        safe_log("write price sqlite", exc)
+
+
+def _fetch_price_finmind(stock_id, start_date, end_date, api_token=""):
     try:
         from FinMind.data import DataLoader
         fm = DataLoader()
-        if api_token: fm.login_by_token(api_token.strip())
-        df = fm.taiwan_stock_daily(stock_id=stock_id, start_date=start_date, end_date=end_date)
-        if not df.empty and len(df) > 5: return df
-    except Exception: pass
-    return pd.DataFrame()
+        if api_token and api_token.strip():
+            fm.login_by_token(api_token.strip())
+        df = _normalize_price_df(fm.taiwan_stock_daily(
+            stock_id=str(stock_id), start_date=start_date, end_date=end_date))
+        if len(df) >= 6:
+            df.attrs["source"] = "FinMind"
+            return df, None
+        return pd.DataFrame(), "FinMind 回傳空資料或少於 6 筆"
+    except Exception as exc:
+        return pd.DataFrame(), f"FinMind {type(exc).__name__}: {exc}"
+
+
+def _fetch_price_yahoo_symbol(symbol, start_date, end_date):
+    """Yahoo chart endpoint fallback; no yfinance dependency required."""
+    try:
+        period1 = int(pd.Timestamp(start_date, tz="Asia/Taipei").timestamp())
+        period2 = int((pd.Timestamp(end_date, tz="Asia/Taipei") + pd.Timedelta(days=1)).timestamp())
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        resp = requests.get(url, params={"period1": period1, "period2": period2,
+                            "interval": "1d", "events": "history"},
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=(4, 15))
+        resp.raise_for_status()
+        chart = resp.json().get("chart", {})
+        if chart.get("error"):
+            return pd.DataFrame(), str(chart["error"])
+        result = (chart.get("result") or [None])[0]
+        if not result or not result.get("timestamp"):
+            return pd.DataFrame(), f"Yahoo Finance 無 {symbol} 資料"
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
+        df = pd.DataFrame({
+            "date": pd.to_datetime(result["timestamp"], unit="s", utc=True).tz_convert("Asia/Taipei").tz_localize(None),
+            "open": quote.get("open"), "max": quote.get("high"), "min": quote.get("low"),
+            "close": quote.get("close"), "Trading_Volume": quote.get("volume")})
+        df = _normalize_price_df(df)
+        if len(df) >= 6:
+            df.attrs["source"] = f"Yahoo Finance（{symbol}）"
+            return df, None
+        return pd.DataFrame(), f"Yahoo Finance {symbol} 回傳少於 6 筆"
+    except Exception as exc:
+        return pd.DataFrame(), f"Yahoo Finance {symbol} {type(exc).__name__}: {exc}"
+
+
+def fetch_stock_history_cached(stock_id, start_date, end_date, api_token=""):
+    """Local DB -> FinMind -> Yahoo .TW/.TWO, and never persist a failed response."""
+    local = _read_price_db(stock_id, start_date, end_date)
+    # Only trust local cache when it reaches close to the requested recent date.
+    if not local.empty:
+        latest = pd.to_datetime(local["date"]).max().date()
+        requested = pd.Timestamp(end_date).date()
+        if (requested - latest).days <= 7:
+            return local
+
+    errors = []
+    for attempt in range(2):
+        df, err = _fetch_price_finmind(stock_id, start_date, end_date, api_token)
+        if not df.empty:
+            _write_price_db(stock_id, df, "FinMind")
+            return df
+        errors.append(err)
+        if attempt == 0:
+            time.sleep(1.2)
+
+    # Automatically try listed then OTC suffix, so an incomplete stock master does not break fallback.
+    for suffix in ("TW", "TWO"):
+        symbol = f"{stock_id}.{suffix}"
+        df, err = _fetch_price_yahoo_symbol(symbol, start_date, end_date)
+        if not df.empty:
+            _write_price_db(stock_id, df, f"Yahoo Finance {symbol}")
+            return df
+        errors.append(err)
+
+    failed = pd.DataFrame()
+    failed.attrs["errors"] = [x for x in errors if x]
+    failed.attrs["source"] = "全部來源失敗"
+    return failed
+
 
 @st.cache_data(ttl=43200)
 def fetch_chip_history_cached(stock_id, start_date, end_date, api_token=""):
@@ -1457,10 +1605,26 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         norway_df = get_norway_big_shareholders(stock_id)
 
     if price_df.empty:
-        st.error("❌ 無法取得該股票之歷史K線資料，請檢查 FinMind Token 或股票代碼。")
+        st.error(f"❌ 無法取得 {stock_id} {stock_name} 的歷史 K 線資料。FinMind 與 Yahoo Finance 備援均未成功。")
+        errors = price_df.attrs.get("errors", [])
+        if errors:
+            with st.expander("查看資料來源錯誤", expanded=True):
+                for message in errors:
+                    st.code(message)
+        st.info(f"查詢期間：{b_str} 至 {e_str}｜FinMind Token：{'已設定' if token else '未設定'}")
+        if st.button("🧹 清除價格快取並重試", key=f"clear_price_cache_{stock_id}"):
+            try:
+                if os.path.exists(PRICE_DB):
+                    os.remove(PRICE_DB)
+            except Exception as exc:
+                safe_log("clear price sqlite", exc)
+            st.rerun()
         return
 
     st.markdown(f"#### 📊 {stock_id} {stock_name}")
+    source = price_df.attrs.get("source", "未知來源")
+    latest_data_date = pd.to_datetime(price_df["date"], errors="coerce").max()
+    st.caption(f"歷史行情來源：{source}｜最新資料日：{latest_data_date:%Y-%m-%d}")
 
     # --- 圖表顯示設定（手機上一眼可調整；預設 40 日，K 棒與柱體寬度最舒適） ---
     view_label = st.radio("圖表顯示區間", list(VIEW_OPTIONS.keys()), index=1,

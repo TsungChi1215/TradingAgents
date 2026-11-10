@@ -18,6 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import math
 import inspect
+import html
 import sqlite3
 
 # -----------------------------------------------------------------------------
@@ -1894,14 +1895,14 @@ def run_verdict_backtest(price_df, end_date):
     df = df.dropna(subset=["Date", "Open", "High", "Low", "Close", "5MA", "20MA", "BB_Upper", "BB_Lower"]).sort_values("Date").reset_index(drop=True)
     if df.empty:
         return []
-    df["裁決分數"] = _historical_verdict_score(df)
+    df["技術條件分數"] = _historical_verdict_score(df)
     sample_start = pd.Timestamp(end_date) - pd.DateOffset(years=1)
     buy_cost, sell_cost = 0.001425 + 0.001, 0.001425 + 0.003 + 0.001
     rows = []
     for label, horizon in (("5天", 5), ("10天", 10), ("20天", 20), ("60D", 60), ("一年", 252)):
         returns, holds, i = [], [], 0
         while i < len(df) - horizon - 1:
-            if df.loc[i, "Date"] >= sample_start and df.loc[i, "裁決分數"] >= 60:
+            if df.loc[i, "Date"] >= sample_start and df.loc[i, "技術條件分數"] >= 60:
                 entry_i = i + 1
                 planned = min(entry_i + horizon, len(df) - 1)
                 entry = df.loc[entry_i, "Open"] * (1 + buy_cost)
@@ -1915,7 +1916,7 @@ def run_verdict_backtest(price_df, end_date):
                     if j > entry_i and df.loc[j, "Low"] <= trail:
                         exit_i, exit_price = j, min(df.loc[j, "Open"], trail)
                         break
-                    if j > entry_i and df.loc[j - 1, "裁決分數"] < 40:
+                    if j > entry_i and df.loc[j - 1, "技術條件分數"] < 40:
                         exit_i, exit_price = j, df.loc[j, "Open"]
                         break
                 if exit_price is None:
@@ -1929,41 +1930,123 @@ def run_verdict_backtest(price_df, end_date):
         curve = [1.0] + (np.cumprod([1 + r for r in returns]).tolist() if returns else [])
         std = np.std(returns, ddof=1) if len(returns) > 1 else np.nan
         pf = sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else (np.inf if wins else np.nan)
-        rows.append({"區間": label, "交易數": len(returns),
+        rows.append({"區間": label, "出現次數": len(returns),
                      "勝率": len(wins)/len(returns)*100 if returns else np.nan,
-                     "平均報酬": np.mean(returns)*100 if returns else np.nan,
-                     "累積報酬": (curve[-1]-1)*100 if returns else np.nan,
-                     "最大回撤": _bt_max_drawdown(curve),
-                     "盈虧因子": pf,
-                     "夏普比率": np.mean(returns)/std*np.sqrt(max(252/horizon, 1)) if pd.notna(std) and std > 0 else np.nan,
+                     "平均每次漲跌": np.mean(returns)*100 if returns else np.nan,
+                     "累積漲跌": (curve[-1]-1)*100 if returns else np.nan,
+                     "最大下跌幅度": _bt_max_drawdown(curve),
+                     "總賺錢／總賠錢": pf,
+                     "賺錢穩定度": np.mean(returns)/std*np.sqrt(max(252/horizon, 1)) if pd.notna(std) and std > 0 else np.nan,
                      "平均持有日": np.mean(holds) if holds else np.nan})
     return rows
 
 
+def render_mobile_friendly_table(df, mobile_columns=None, percent_columns=None, key_prefix="table"):
+    """Desktop table plus compact mobile cards, without horizontal scrollbar."""
+    if df is None or df.empty:
+        return
+    mobile_columns = mobile_columns or list(df.columns)
+    percent_columns = set(percent_columns or [])
+    safe = df.copy()
+    uid = re.sub(r"[^a-zA-Z0-9_-]", "", str(key_prefix)) or "table"
+    desktop_html = safe.to_html(index=False, classes=f"friendly-table friendly-table-{uid}", border=0, escape=True)
+    cards = []
+    for _, row in safe.iterrows():
+        title_col = mobile_columns[0]
+        title = row.get(title_col, "")
+        fields = []
+        for col in mobile_columns[1:]:
+            value = row.get(col, "--")
+            if pd.isna(value): value = "--"
+            fields.append(f'<div class="mobile-field"><span>{html.escape(str(col))}</span><strong>{html.escape(str(value))}</strong></div>')
+        cards.append(f'<div class="mobile-card"><div class="mobile-card-title">{html.escape(str(title))}</div>{"".join(fields)}</div>')
+    st.markdown(f"""
+<style>
+.desktop-{uid}{{display:block;width:100%;overflow-x:auto}}
+.mobile-{uid}{{display:none}}
+.friendly-table-{uid}{{width:100%;border-collapse:collapse;font-size:13px}}
+.friendly-table-{uid} th,.friendly-table-{uid} td{{padding:8px 6px;border:1px solid #454545;text-align:center;white-space:normal}}
+.friendly-table-{uid} th{{background:#302e2b;color:#f3f3f3}}
+.mobile-card{{background:#1d1d1c;border:1px solid #444;border-radius:10px;padding:10px;margin:8px 0}}
+.mobile-card-title{{font-size:15px;font-weight:700;color:#fff;padding-bottom:7px;margin-bottom:5px;border-bottom:1px solid #444}}
+.mobile-field{{display:flex;justify-content:space-between;gap:12px;padding:5px 0;font-size:12px}}
+.mobile-field span{{color:#b9b9b9;flex:1}}
+.mobile-field strong{{color:#fff;text-align:right;flex:1}}
+@media(max-width:640px){{
+ .desktop-{uid}{{display:none}}
+ .mobile-{uid}{{display:block}}
+}}
+</style>
+<div class="desktop-{uid}">{desktop_html}</div>
+<div class="mobile-{uid}">{''.join(cards)}</div>
+""", unsafe_allow_html=True)
+
+
 def render_verdict_backtest(results, stock_id, stock_name):
-    st.markdown(f"### 📐 {stock_id}-{stock_name}價格型裁決規則回測")
-    with st.expander("📘 回測依據與交易規則", expanded=False):
+    st.markdown(f"### 📈 {stock_id}-{stock_name}技術走勢歷史測試")
+    with st.expander("📘 測試方式與買賣規則", expanded=False):
         st.markdown("""
-- 以 5MA/20MA、收盤相對 20MA、布林通道、20日動能與20日波動率計算 0 至 100 分的歷史裁決分數。
+- 以 5MA/20MA、收盤相對 20MA、布林通道、20日動能與20日波動率計算 0 至 100 分的技術條件分數。
 - 60 分以上於下一交易日開盤進場；低於 40 分、固定停損 10%、高點回落 8% 或到期時出場。
 - 測試 5、10、20、60、252 個交易日持有區間；樣本使用截止日前最近一年，交易不重疊。
 - 已計入買賣手續費各 0.1425%、賣出證交稅 0.3%，以及買賣各 0.1% 滑價。
-- 本區僅評估價格與技術面的結構化規則，不代表完整 AI 終極裁決的歷史績效；不會把今日 AI 文字或今日籌碼回填到過去。
+- 本區只測試均線、布林通道、價格動能與波動等技術條件，不代表 AI 投資建議的實際成效，也不會把今天才知道的資料套用到過去。
         """)
-    if not results or all(r["交易數"] == 0 for r in results):
-        st.info("最近一年沒有足夠的裁決進場訊號可供回測。")
+    if not results or all(r["出現次數"] == 0 for r in results):
+        st.info("最近一年沒有足夠的買進訊號可供測試。")
         return
     df = pd.DataFrame(results)
-    for c in ("勝率", "平均報酬", "累積報酬", "最大回撤"):
+    for c in ("勝率", "平均每次漲跌", "累積漲跌", "最大下跌幅度"):
         df[c] = df[c].map(lambda v: "--" if pd.isna(v) else (f"{v:.1f}%" if c == "勝率" else f"{v:+.2f}%"))
-    for c in ("盈虧因子", "夏普比率", "平均持有日"):
+    for c in ("總賺錢／總賠錢", "賺錢穩定度", "平均持有日"):
         df[c] = df[c].map(lambda v: "--" if pd.isna(v) else ("∞" if np.isinf(v) else f"{v:.2f}"))
     st.markdown("""<style>.bt{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}.bt th,.bt td{padding:7px 3px;border:1px solid #444;text-align:center;word-break:break-word}.bt th{background:#302e2b}@media(max-width:640px){.bt{font-size:9px}.bt th,.bt td{padding:5px 1px}}</style>""", unsafe_allow_html=True)
-    main = df[["區間","交易數","勝率","平均報酬","累積報酬","最大回撤"]]
-    st.markdown(main.to_html(index=False, classes="bt", border=0, escape=True), unsafe_allow_html=True)
-    with st.expander("查看進階指標"):
-        adv = df[["區間","盈虧因子","夏普比率","平均持有日"]]
-        st.markdown(adv.to_html(index=False, classes="bt", border=0, escape=True), unsafe_allow_html=True)
+    main = df[["區間","出現次數","勝率","平均每次漲跌","累積漲跌","最大下跌幅度"]].rename(columns={
+        "區間":"持有時間", "出現次數":"出現次數", "勝率":"成功率",
+        "平均每次漲跌":"平均每次漲跌", "累積漲跌":"累積漲跌", "最大下跌幅度":"最大下跌幅度"})
+    st.caption("用過去一年的股價，測試固定技術條件出現後，分別持有 5、10、20、60 天及一年時的結果。")
+    render_mobile_friendly_table(
+        main,
+        mobile_columns=["持有時間", "成功率", "平均每次漲跌", "最大下跌幅度", "出現次數"],
+        key_prefix=f"technical-main-{stock_id}")
+    with st.expander("欄位怎麼看？", expanded=False):
+        st.markdown("""
+- **持有時間**：條件出現後，假設持有股票多久。
+- **出現次數**：過去一年符合技術條件並完成測試的次數。
+- **成功率**：扣除交易成本後仍有獲利的比例。
+- **平均每次漲跌**：每次訊號完成後的平均漲跌幅。
+- **累積漲跌**：假設每次將全部資金接續投入後的累積結果，不等同實際帳戶報酬。
+- **最大下跌幅度**：測試資金從高點往下跌得最深的一次，用來觀察可能承受的風險。
+        """)
+    with st.expander("查看更多結果"):
+        adv = df[["區間","總賺錢／總賠錢","賺錢穩定度","平均持有日"]].rename(columns={
+            "區間":"持有時間", "總賺錢／總賠錢":"總賺錢／總賠錢", "賺錢穩定度":"賺錢穩定度", "平均持有日":"平均持有天數"})
+        st.caption("總賺錢／總賠錢大於 1，代表全部賺到的金額高於全部賠掉的金額；賺錢穩定度用來比較「賺多少」和「過程有多大起伏」，數值越高，代表取得相同報酬時承受的價格起伏較小。")
+        render_mobile_friendly_table(
+            adv,
+            mobile_columns=["持有時間", "總賺錢／總賠錢", "賺錢穩定度", "平均持有天數"],
+            key_prefix=f"technical-more-{stock_id}")
+        with st.expander("賺錢穩定度怎麼看？", expanded=False):
+            st.markdown("""
+**賺錢穩定度不是報酬率，也不是勝率。**這個數字是在比較「平均賺多少」與「價格上下起伏有多大」。
+
+簡化例子：
+
+- **方法 A**：平均賺 10%，但過程常常大漲大跌，價格起伏約 20%，賺錢穩定度約為 **0.5**。
+- **方法 B**：平均只賺 8%，但價格起伏約 4%，賺錢穩定度約為 **2.0**。
+
+雖然方法 A 的平均報酬較高，但方法 B 的過程較穩定，因此賺錢穩定度更高。
+
+一般可這樣閱讀：
+
+- **小於 0**：整體平均為虧損。
+- **0 到 1**：有賺錢，但過程起伏較大。
+- **1 到 2**：報酬和價格起伏的搭配尚可。
+- **大於 2**：歷史結果相對穩定。
+- **顯示「--」**：出現次數太少，暫時無法計算。
+
+這些區間僅用來幫助閱讀歷史測試，不代表未來一定會有相同結果。
+            """)
 
 
 VERDICT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict_history.sqlite3")
@@ -2126,28 +2209,43 @@ def render_real_verdict_performance(stock_id=None):
             FROM verdict_history h JOIN verdict_performance p ON h.id=p.verdict_id {where}"""
     with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
         df = pd.read_sql_query(q, conn, params=params)
-    st.markdown("### 🎯 過去投資建議的實際結果")
-    st.caption("本區追蹤網站過去實際顯示並保存的投資建議。建議買進後，扣除約 0.785% 的交易成本仍有獲利，才算判斷正確；建議賣出或減碼後股價下跌，算判斷正確；建議觀望後，股價在評估期間內漲跌不超過 3%，算判斷正確。")
+    st.markdown("### 🎯 AI 建議成效追蹤")
+    st.caption("查看網站過去提供的 AI 投資建議，在 5、10、20、60 個交易日後的實際表現。買進建議會扣除約 0.785% 的交易成本；賣出、減碼與觀望則依後續股價走勢判斷是否正確。")
     if df.empty:
-        st.info("目前還沒有可以檢查的過去建議。網站已開始保存每次投資建議，最早會在 5 個交易日後顯示第一批結果。")
+        st.info("這是網站第一次追蹤這檔股票的 AI 建議，目前還沒有可檢查的結果。本次建議已保存，最早會在 5 個交易日後顯示第一筆結果。")
         return
     rows=[]
     for h,g in df.groupby("horizon_days"):
         buys=g[g.verdict_code.isin(["BUY","STRONG_BUY"])]
         sells=g[g.verdict_code.isin(["SELL","REDUCE"])]
         holds=g[g.verdict_code.eq("HOLD")]
-        rows.append({"區間":f"{h}天","已到期裁決":len(g),
-                     "買進勝率":buys.is_win.mean()*100 if len(buys) else np.nan,
-                     "賣出正確率":sells.is_win.mean()*100 if len(sells) else np.nan,
-                     "觀望正確率":holds.is_win.mean()*100 if len(holds) else np.nan,
-                     "平均結果":g.directional_return.mean()*100,
-                     "平均最高漲幅":g.max_favorable_excursion.mean()*100,
-                     "平均最大跌幅":g.max_adverse_excursion.mean()*100,
+        rows.append({"觀察期間":f"{h}天","已完成建議":len(g),
+                     "買進成功率":buys.is_win.mean()*100 if len(buys) else np.nan,
+                     "賣出判斷正確率":sells.is_win.mean()*100 if len(sells) else np.nan,
+                     "觀望判斷正確率":holds.is_win.mean()*100 if len(holds) else np.nan,
+                     "平均判斷結果":g.directional_return.mean()*100,
+                     "建議後平均最高漲幅":g.max_favorable_excursion.mean()*100,
+                     "建議後平均最大跌幅":g.max_adverse_excursion.mean()*100,
                      "參考程度":_confidence_label(len(g))})
     view=pd.DataFrame(rows)
-    for c in ("買進勝率","賣出正確率","觀望正確率","平均結果","平均最高漲幅","平均最大跌幅"):
-        view[c]=view[c].map(lambda x:"--" if pd.isna(x) else f"{x:+.2f}%" if c in ("平均結果","平均最高漲幅","平均最大跌幅") else f"{x:.1f}%")
-    st.dataframe(view,hide_index=True,use_container_width=True)
+    for c in ("買進成功率","賣出判斷正確率","觀望判斷正確率","平均判斷結果","建議後平均最高漲幅","建議後平均最大跌幅"):
+        view[c]=view[c].map(lambda x:"--" if pd.isna(x) else f"{x:+.2f}%" if c in ("平均判斷結果","建議後平均最高漲幅","建議後平均最大跌幅") else f"{x:.1f}%")
+    render_mobile_friendly_table(
+        view,
+        mobile_columns=["觀察期間", "已完成建議", "買進成功率", "賣出判斷正確率", "觀望判斷正確率", "平均判斷結果"],
+        key_prefix=f"ai-result-{stock_id or 'all'}")
+    st.caption("手機版優先顯示成功率與平均結果；最高漲幅、最大跌幅及參考程度可在桌面版表格查看。")
+    with st.expander("欄位怎麼看？", expanded=False):
+        st.markdown("""
+- **觀察期間**：投資建議出現後，經過多少個交易日檢查結果。
+- **已完成建議**：已走完該觀察期間、可以正式計算結果的建議數量。
+- **買進成功率**：買進建議扣除交易成本後仍有獲利的比例。
+- **賣出判斷正確率**：建議賣出或減碼後，股價確實下跌的比例。
+- **觀望判斷正確率**：建議觀望後，期間漲跌維持在正負 3% 內的比例。
+- **平均判斷結果**：依買進、賣出或觀望方向換算後的平均表現。正數代表整體判斷方向較有利。
+- **建議後平均最高漲幅／最大跌幅**：建議出現後，期間內平均曾經上漲或下跌的最大幅度，並非最後實現報酬。
+- **參考程度**：依已完成建議數量判斷資料是否足夠，不代表未來一定準確。
+        """)
 
 
 def render_verdict_history(stock_id):
@@ -2166,8 +2264,11 @@ def render_verdict_history(stock_id):
         h["建議動作"] = h["建議動作"].map(action_map).fillna(h["建議動作"])
         h["建議投入比例"] = h["建議投入比例"].map(lambda x: "--" if pd.isna(x) else f"{float(x)*100:.0f}%")
         main_cols = ["建議日期", "投資看法", "建議動作", "參考進場價", "停損價", "目標價", "建議投入比例"]
-        with st.expander("查看過去的投資建議"):
-            st.dataframe(h[main_cols], hide_index=True, use_container_width=True)
+        with st.expander("查看 AI 建議紀錄"):
+            render_mobile_friendly_table(
+                h[main_cols],
+                mobile_columns=["建議日期", "投資看法", "建議動作", "參考進場價", "停損價", "目標價", "建議投入比例"],
+                key_prefix=f"advice-history-{stock_id}")
             with st.expander("查看分析方式", expanded=False):
                 rule_name = "第 12 版投資分析方式" if (h["analysis_rule"] == "verdict-v12-structured").any() else "投資分析方式"
                 st.caption(f"分析方式：{rule_name}。這項資訊只用來區分網站不同時期採用的判斷方式，一般使用者不需要特別解讀。")
@@ -2535,7 +2636,7 @@ def _backtest_strategy_stock(stock_id, strategy_name, start_date, end_date, toke
 def run_market_strategy_backtest(df_candidates, strategy_name, token):
     """Backtest current scan cohort, capped at 10 stocks to keep Streamlit Cloud responsive."""
     if df_candidates is None or df_candidates.empty:
-        return pd.DataFrame(), {"message": "請先執行市場掃描，取得候選股票後再回測。"}
+        return pd.DataFrame(), {"message": "請先執行市場掃描，取得候選股票後再查看歷史表現。"}
     end = taipei_now().date()
     start = end - timedelta(days=550)
     ranked = df_candidates.sort_values("綜合分數", ascending=False) if "綜合分數" in df_candidates.columns else df_candidates
@@ -2551,38 +2652,57 @@ def run_market_strategy_backtest(df_candidates, strategy_name, token):
                 except Exception as exc: safe_log("strategy backtest stock", exc)
         rs = [x["報酬"] for x in trades]; wins = [r for r in rs if r > 0]; losses = [r for r in rs if r <= 0]
         curve = [1.0] + (np.cumprod([1+r for r in rs]).tolist() if rs else [])
-        rows.append({"持有區間": f"{horizon}天", "回測股票": len(ids), "交易數": len(rs),
+        rows.append({"持有區間": f"{horizon}天", "測試股票數": len(ids), "出現次數": len(rs),
                      "勝率": len(wins)/len(rs)*100 if rs else np.nan,
-                     "平均報酬": np.mean(rs)*100 if rs else np.nan,
-                     "累積報酬": (curve[-1]-1)*100 if rs else np.nan,
-                     "最大回撤": _bt_max_drawdown(curve),
-                     "盈虧因子": sum(wins)/abs(sum(losses)) if losses and sum(losses) != 0 else (np.inf if wins else np.nan)})
-    note = "以本次掃描結果前 10 檔、最近約一年資料回測；訊號日收盤確認，下一交易日開盤進場，交易不重疊。"
+                     "平均每次漲跌": np.mean(rs)*100 if rs else np.nan,
+                     "累積漲跌": (curve[-1]-1)*100 if rs else np.nan,
+                     "最大下跌幅度": _bt_max_drawdown(curve),
+                     "總賺錢／總賠錢": sum(wins)/abs(sum(losses)) if losses and sum(losses) != 0 else (np.inf if wins else np.nan)})
+    note = "使用本次掃描結果中綜合分數最高的前 10 檔，查看最近約一年的歷史表現；條件在收盤後成立，下一交易日開盤買進，同一檔股票不重複持有。"
     if strategy_name == "飆風向上":
-        note += " 集保戶數缺乏逐日歷史資料，因此歷史回測不納入集保條件；法人或融資歷史取不到時，採價格條件代理並於結果中視為限制。"
+        note += " 由於沒有每日集保戶數的完整歷史資料，這項測試不包含集保條件；若法人或融資歷史資料不足，會改用價格條件測試，結果僅供參考。"
     return pd.DataFrame(rows), {"message": note, "stocks": ids}
 
 
 def render_market_strategy_backtest(table, strategy_name, meta):
-    st.markdown(f"### 🧪 {strategy_name}策略歷史回測")
+    st.markdown(f"### 🧪 {strategy_name}選股成效測試")
     st.caption(meta.get("message", ""))
-    if table is None or table.empty or table["交易數"].sum() == 0:
-        st.info("目前候選股票在回測期間沒有足夠交易訊號。")
+    if table is None or table.empty or table["出現次數"].sum() == 0:
+        st.info("目前選出的股票在過去一年沒有足夠的買進訊號可供測試。")
         return
     view = table.copy()
-    for c in ("勝率", "平均報酬", "累積報酬", "最大回撤"):
+    for c in ("勝率", "平均每次漲跌", "累積漲跌", "最大下跌幅度"):
         view[c] = view[c].map(lambda v: "--" if pd.isna(v) else (f"{v:.1f}%" if c == "勝率" else f"{v:+.2f}%"))
-    view["盈虧因子"] = view["盈虧因子"].map(lambda v: "--" if pd.isna(v) else ("∞" if np.isinf(v) else f"{v:.2f}"))
-    st.dataframe(view, hide_index=True, use_container_width=True)
+    view["總賺錢／總賠錢"] = view["總賺錢／總賠錢"].map(lambda v: "--" if pd.isna(v) else ("∞" if np.isinf(v) else f"{v:.2f}"))
+    view = view.rename(columns={"持有區間":"持有時間", "測試股票數":"測試股票數", "出現次數":"出現次數",
+                                "勝率":"成功率", "平均每次漲跌":"平均每次漲跌", "累積漲跌":"累積漲跌",
+                                "最大下跌幅度":"最大下跌幅度", "總賺錢／總賠錢":"總賺錢／總賠錢"})
+    st.caption("成功率代表扣除交易成本後仍有獲利的比例；最大下跌幅度代表測試期間內曾經歷的最大資金下降。")
+    render_mobile_friendly_table(
+        view,
+        mobile_columns=["持有時間", "成功率", "平均每次漲跌", "最大下跌幅度", "出現次數"],
+        key_prefix=f"strategy-result-{strategy_name}")
+    st.caption("手機版顯示最重要的五項結果，其他欄位可在桌面版查看。")
+    with st.expander("欄位怎麼看？", expanded=False):
+        st.markdown("""
+- **持有時間**：選股條件出現後，假設持有股票多久。
+- **測試股票數**：本次依綜合分數選入測試的股票數量，最多 10 檔。
+- **出現次數**：這些股票在過去一年符合該選股條件的總次數。
+- **成功率**：扣除交易成本後仍有獲利的比例。
+- **平均每次漲跌**：每次條件成立並完成持有後的平均漲跌幅。
+- **累積漲跌**：將每次結果依序累積計算，不等同實際投資帳戶報酬。
+- **最大下跌幅度**：測試資金從高點往下跌得最深的一次。
+- **總賺錢／總賠錢**：把所有賺錢交易加總，再除以所有賠錢交易的金額；大於 1 代表賺的總額高於賠的總額。
+        """)
 
 
 # -----------------------------------------------------------------------------
 # 10. 主頁面模式邏輯
 # -----------------------------------------------------------------------------
 if app_mode == "全市場自動選股版":
-    st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
+    st.markdown("## 🔍 全市場選股")
     strategy_choice = st.radio(
-        "選擇篩選策略：",
+        "選擇選股方式：",
         ["飆風向上", "短線強勢爆發", "波段多頭排列"],
         horizontal=True,
         key="market_screener_strategy",
@@ -2643,13 +2763,19 @@ if app_mode == "全市場自動選股版":
                                          "今日收盤", "漲幅(%)", "成交量(張)", "月線斜率(%)",
                                          "主力1日", "主力5日", "主力10日", "近期主力大買",
                                          "近期散戶大賣", "集保戶數大減"] if c in df_res.columns]
-        st.dataframe(df_res[display_cols], hide_index=True, use_container_width=True)
+        render_mobile_friendly_table(
+            df_res[display_cols],
+            mobile_columns=[c for c in ["策略排名", "股票代碼", "股票名稱", "綜合分數", "選股依據"] if c in df_res.columns],
+            key_prefix=f"scan-result-{strategy_choice}")
 
         top10 = df_res.sort_values("綜合分數", ascending=False).head(10) if "綜合分數" in df_res.columns else df_res.head(10)
         st.markdown("### 🏅 回測採用前十檔與選股依據")
         st.caption("前十檔依本策略綜合分數由高至低選取。綜合分數採當次候選池內百分位排名，因此是相對強度分數，不是預測報酬率。")
         top10_cols = [c for c in ["策略排名", "股票代碼", "股票名稱", "綜合分數", "選股依據"] if c in top10.columns]
-        st.dataframe(top10[top10_cols], hide_index=True, use_container_width=True)
+        render_mobile_friendly_table(
+            top10[top10_cols],
+            mobile_columns=top10_cols,
+            key_prefix=f"top10-{strategy_choice}")
 
         with st.expander("查看綜合分數計算方式"):
             if strategy_choice == "飆風向上":
@@ -2659,20 +2785,20 @@ if app_mode == "全市場自動選股版":
             else:
                 st.markdown("**成交量 50% + 波段漲幅品質 35% + 當日漲幅 15%**。波段漲幅品質偏好接近 2% 且仍位於 0.5% 至 3% 條件內的股票。")
 
-        st.markdown("### 🧪 策略歷史回測")
-        st.caption("回測以本次掃描結果為樣本，依綜合分數由高至低取前 10 檔，避免雲端執行逾時。")
-        if st.button(f"執行「{strategy_choice}」回測", key=f"run_strategy_bt_{strategy_choice}", use_container_width=True):
-            with st.spinner(f"正在回測 {strategy_choice}，請稍候..."):
+        st.markdown("### 🧪 選股策略歷史測試")
+        st.caption("使用本次選出的股票，依綜合分數取前 10 檔，查看相同選股條件在過去一年出現時的表現。")
+        if st.button(f"查看「{strategy_choice}」歷史表現", key=f"run_strategy_bt_{strategy_choice}", use_container_width=True):
+            with st.spinner(f"正在整理「{strategy_choice}」的歷史表現，請稍候..."):
                 bt_table, bt_meta = run_market_strategy_backtest(df_res, strategy_choice, get_secret("FINMIND_TOKEN", ""))
                 st.session_state["market_strategy_bt"] = {"strategy": strategy_choice, "table": bt_table, "meta": bt_meta}
         saved_bt = st.session_state.get("market_strategy_bt")
         if saved_bt and saved_bt.get("strategy") == strategy_choice:
             render_market_strategy_backtest(saved_bt.get("table"), strategy_choice, saved_bt.get("meta", {}))
         
-        st.markdown("### 🎯 從掃描結果啟動深度診斷")
+        st.markdown("### 🎯 分析選出的股票")
         options = [f"{row['股票代碼']} {row['股票名稱']}" for idx, row in df_res.iterrows()]
-        sel = st.selectbox("📌 請選擇一檔標的進行分析：", options, key="screener_diagnosis_stock", on_change=clear_current_analysis)
-        if st.button("🚀 啟動此檔個股深度分析"):
+        sel = st.selectbox("📌 請選擇一檔股票：", options, key="screener_diagnosis_stock", on_change=clear_current_analysis)
+        if st.button("🚀 開始分析這檔股票"):
             sid = sel.split(" ")[0]
             sname = sel.split(" ")[1]
             st.session_state["diag_req"] = {"mode": app_mode, "id": sid, "name": sname}

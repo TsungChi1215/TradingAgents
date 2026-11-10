@@ -1697,6 +1697,7 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
     
     prompt = f"你是由 TauricResearch/TradingAgents 密集的 AI 多智能體團隊，正在為台股【{stock_id} {stock_name}】（當前收盤價：{latest_price} 元）進行深度投資裁決會議。\n請根據以下數據進行內部團隊辯論與風控審核：\n【技術面數據】：{tech_summary}\n【籌碼與大股東數據】：{chip_summary}\n\n請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：\n{{\n  \"volume_price_volatility\": \"成交量與價格波動分析說明...\",\n  \"market_stage\": \"目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...\",\n  \"key_price_levels\": \"關鍵價格門檻與支撐壓力位...\",\n  \"signal_analysis\": \"技術指標 (RSI/MACD/KD) 訊號評估...\",\n  \"pattern_recognition\": \"K線圖表模式與型態識別...\",\n  \"trend_strength\": \"趨勢強度與動能綜合評估...\",\n  \"bull_bear_debate\": \"看多研究員 vs 看空研究員 辯論焦點說明...\",\n  \"trader_decision\": \"交易員最終買賣建議與推薦部位比例...\",\n  \"risk_management\": \"風控團隊與投資組合經理最終核准/否決評估、停損價與目標價設定...\"\n}}"
     prompt += '\n僅依提供數據判斷；未提供或未計算的指標須明確標示資料不足，不得捏造。'
+    prompt += '\n另外必須輸出結構化欄位：verdict_code 為 STRONG_BUY、BUY、HOLD、REDUCE、SELL 五選一；decision_code 為 ENTER、HOLD、REDUCE、EXIT 四選一；position_size 為 0 到 1；entry_price、stop_loss、target_price 為數值；confidence 為 0 到 100。所有欄位須與 trader_decision 及 risk_management 一致。'
     failures = []
     start_idx = int(st.session_state.get('last_working_key_idx', 0)) % len(keys_list)
     indices = list(range(start_idx, len(keys_list))) + list(range(start_idx))
@@ -1940,14 +1941,14 @@ def run_verdict_backtest(price_df, end_date):
 
 
 def render_verdict_backtest(results, stock_id, stock_name):
-    st.markdown(f"### 🧪 {stock_id}-{stock_name}終極裁決歷史回測")
+    st.markdown(f"### 📐 {stock_id}-{stock_name}價格型裁決規則回測")
     with st.expander("📘 回測依據與交易規則", expanded=False):
         st.markdown("""
 - 以 5MA/20MA、收盤相對 20MA、布林通道、20日動能與20日波動率計算 0 至 100 分的歷史裁決分數。
 - 60 分以上於下一交易日開盤進場；低於 40 分、固定停損 10%、高點回落 8% 或到期時出場。
 - 測試 5、10、20、60、252 個交易日持有區間；樣本使用截止日前最近一年，交易不重疊。
 - 已計入買賣手續費各 0.1425%、賣出證交稅 0.3%，以及買賣各 0.1% 滑價。
-- 回測只使用價格型結構化裁決，不會把今日 AI 文字或今日籌碼回填到過去，避免前視偏誤。
+- 本區僅評估價格與技術面的結構化規則，不代表完整 AI 終極裁決的歷史績效；不會把今日 AI 文字或今日籌碼回填到過去。
         """)
     if not results or all(r["交易數"] == 0 for r in results):
         st.info("最近一年沒有足夠的裁決進場訊號可供回測。")
@@ -1963,6 +1964,202 @@ def render_verdict_backtest(results, stock_id, stock_name):
     with st.expander("查看進階指標"):
         adv = df[["區間","盈虧因子","夏普比率","平均持有日"]]
         st.markdown(adv.to_html(index=False, classes="bt", border=0, escape=True), unsafe_allow_html=True)
+
+
+VERDICT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict_history.sqlite3")
+VERDICT_PROMPT_VERSION = "verdict-v12-structured"
+VERDICT_HORIZONS = (5, 10, 20, 60)
+
+
+def _init_verdict_db():
+    with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS verdict_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_id TEXT NOT NULL, stock_name TEXT,
+            verdict_time TEXT NOT NULL, data_date TEXT NOT NULL,
+            verdict_code TEXT NOT NULL, verdict_text TEXT,
+            decision_code TEXT, decision_text TEXT,
+            entry_price REAL, stop_loss REAL, target_price REAL,
+            position_size REAL, confidence REAL,
+            technical_text TEXT, chip_text TEXT, risk_text TEXT,
+            model_name TEXT, prompt_version TEXT,
+            raw_json TEXT, created_at TEXT NOT NULL,
+            UNIQUE(stock_id, data_date, prompt_version)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS verdict_performance (
+            verdict_id INTEGER NOT NULL, horizon_days INTEGER NOT NULL,
+            entry_date TEXT, evaluation_date TEXT,
+            entry_price REAL, exit_price REAL,
+            gross_return REAL, net_return REAL,
+            directional_return REAL,
+            max_favorable_excursion REAL, max_adverse_excursion REAL,
+            hit_stop INTEGER, hit_target INTEGER, is_win INTEGER,
+            status TEXT, updated_at TEXT,
+            PRIMARY KEY (verdict_id, horizon_days)
+        )""")
+
+
+def _first_number(text, labels):
+    text = str(text or "")
+    for label in labels:
+        m = re.search(rf"{label}\s*[：:]?\s*(?:約|新台幣|NT\$|\$)?\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+        if m:
+            try: return float(m.group(1))
+            except Exception: pass
+    return None
+
+
+def _normalize_verdict(ai_res, latest_price):
+    trader = str(ai_res.get("trader_decision", ""))
+    risk = str(ai_res.get("risk_management", ""))
+    full = trader + " " + risk
+    explicit = str(ai_res.get("verdict_code", "")).upper().strip()
+    if explicit not in {"STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL"}:
+        if any(x in full for x in ("強力買進", "積極買進", "重倉買進")): explicit = "STRONG_BUY"
+        elif any(x in full for x in ("買進", "進場", "建立部位", "逢低布局")): explicit = "BUY"
+        elif any(x in full for x in ("賣出", "出清", "清倉", "退出")): explicit = "SELL"
+        elif any(x in full for x in ("減碼", "降低部位", "部分獲利了結")): explicit = "REDUCE"
+        else: explicit = "HOLD"
+    decision = str(ai_res.get("decision_code", "")).upper().strip()
+    if decision not in {"ENTER", "HOLD", "REDUCE", "EXIT"}:
+        decision = {"STRONG_BUY":"ENTER", "BUY":"ENTER", "HOLD":"HOLD", "REDUCE":"REDUCE", "SELL":"EXIT"}[explicit]
+    def num(key, labels, default=None):
+        try:
+            v = float(ai_res.get(key))
+            return v if v > 0 else default
+        except Exception:
+            return _first_number(full, labels) or default
+    pos = ai_res.get("position_size")
+    try:
+        pos = float(pos)
+        if pos > 1: pos /= 100
+    except Exception:
+        pm = re.search(r"(?:部位|倉位)[^0-9]{0,8}([0-9]{1,3})\s*%", full)
+        pos = float(pm.group(1))/100 if pm else ({"STRONG_BUY":1.0,"BUY":0.5,"HOLD":0.0,"REDUCE":0.25,"SELL":0.0}[explicit])
+    return {"verdict_code": explicit, "decision_code": decision,
+            "entry_price": num("entry_price", ["進場價", "買進價"], float(latest_price)),
+            "stop_loss": num("stop_loss", ["停損價", "止損價"]),
+            "target_price": num("target_price", ["目標價", "停利價"]),
+            "position_size": pos,
+            "confidence": num("confidence", ["信心", "信賴度"], None),
+            "verdict_text": trader, "decision_text": risk}
+
+
+def save_verdict_snapshot(stock_id, stock_name, data_date, latest_price, ai_res):
+    """Save the actual displayed AI verdict once per stock/data-date/prompt version."""
+    _init_verdict_db()
+    parsed = _normalize_verdict(ai_res, latest_price)
+    now = taipei_now().isoformat(timespec="seconds")
+    raw = json.dumps(ai_res, ensure_ascii=False, default=str)
+    with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
+        conn.execute("""INSERT INTO verdict_history
+            (stock_id,stock_name,verdict_time,data_date,verdict_code,verdict_text,
+             decision_code,decision_text,entry_price,stop_loss,target_price,position_size,confidence,
+             technical_text,chip_text,risk_text,model_name,prompt_version,raw_json,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(stock_id,data_date,prompt_version) DO UPDATE SET
+              verdict_time=excluded.verdict_time, verdict_code=excluded.verdict_code,
+              verdict_text=excluded.verdict_text, decision_code=excluded.decision_code,
+              decision_text=excluded.decision_text, entry_price=excluded.entry_price,
+              stop_loss=excluded.stop_loss, target_price=excluded.target_price,
+              position_size=excluded.position_size, confidence=excluded.confidence,
+              raw_json=excluded.raw_json""",
+            (str(stock_id),stock_name,now,pd.Timestamp(data_date).strftime("%Y-%m-%d"),
+             parsed["verdict_code"],parsed["verdict_text"],parsed["decision_code"],parsed["decision_text"],
+             parsed["entry_price"],parsed["stop_loss"],parsed["target_price"],parsed["position_size"],parsed["confidence"],
+             str(ai_res.get("signal_analysis","")),str(ai_res.get("bull_bear_debate","")),str(ai_res.get("risk_management","")),
+             "Gemini TradingAgents",VERDICT_PROMPT_VERSION,raw,now))
+    return parsed
+
+
+def update_verdict_performance(token=""):
+    """Evaluate matured real verdict snapshots. BUY uses positive return, SELL/REDUCE uses avoided decline, HOLD uses +/-3% neutral band."""
+    _init_verdict_db()
+    with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
+        verdicts = pd.read_sql_query("SELECT * FROM verdict_history ORDER BY data_date", conn)
+    if verdicts.empty: return
+    today = taipei_now().date()
+    for v in verdicts.itertuples(index=False):
+        price = fetch_stock_history_cached(v.stock_id, v.data_date, today.strftime("%Y-%m-%d"), token)
+        if price.empty: continue
+        d = _normalize_price_df(price); d["date"] = pd.to_datetime(d["date"]); d = d[d["date"] > pd.Timestamp(v.data_date)].reset_index(drop=True)
+        if d.empty: continue
+        entry = float(d.loc[0,"open"]); stop = v.stop_loss; target = v.target_price
+        for horizon in VERDICT_HORIZONS:
+            if len(d) < horizon: continue
+            window = d.iloc[:horizon]; exit_price = float(window.iloc[-1]["close"])
+            gross = exit_price / entry - 1
+            net = gross - 0.00785
+            if v.verdict_code in ("BUY","STRONG_BUY"):
+                directional, win = net, int(net > 0)
+                mfe = float(window["max"].max()/entry-1); mae = float(window["min"].min()/entry-1)
+            elif v.verdict_code in ("SELL","REDUCE"):
+                directional, win = -gross, int(gross < 0)
+                mfe = float(1-window["min"].min()/entry); mae = float(1-window["max"].max()/entry)
+            else:
+                directional, win = -abs(gross), int(abs(gross) <= 0.03)
+                mfe = float(window["max"].max()/entry-1); mae = float(window["min"].min()/entry-1)
+            hit_stop = int(bool(stop) and window["min"].min() <= stop)
+            hit_target = int(bool(target) and window["max"].max() >= target)
+            now = taipei_now().isoformat(timespec="seconds")
+            with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
+                conn.execute("""INSERT OR REPLACE INTO verdict_performance
+                    (verdict_id,horizon_days,entry_date,evaluation_date,entry_price,exit_price,gross_return,net_return,
+                     directional_return,max_favorable_excursion,max_adverse_excursion,hit_stop,hit_target,is_win,status,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (v.id,horizon,d.loc[0,"date"].strftime("%Y-%m-%d"),window.iloc[-1]["date"].strftime("%Y-%m-%d"),entry,exit_price,
+                     gross,net,directional,mfe,mae,hit_stop,hit_target,win,"已到期",now))
+
+
+def _confidence_label(n):
+    if n < 10: return "樣本不足"
+    if n < 30: return "初步參考"
+    if n < 100: return "中等可信度"
+    return "較具統計參考性"
+
+
+def render_real_verdict_performance(stock_id=None):
+    _init_verdict_db()
+    where, params = ("WHERE h.stock_id=?", (str(stock_id),)) if stock_id else ("", ())
+    q = f"""SELECT h.stock_id,h.stock_name,h.data_date,h.verdict_code,h.decision_code,
+                   p.horizon_days,p.net_return,p.directional_return,p.is_win,p.max_favorable_excursion,p.max_adverse_excursion
+            FROM verdict_history h JOIN verdict_performance p ON h.id=p.verdict_id {where}"""
+    with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
+        df = pd.read_sql_query(q, conn, params=params)
+    st.markdown("### 🎯 終極裁決真實實績")
+    st.caption("只統計系統當時實際顯示並保存的終極裁決與投資決策。買進以扣除 0.785% 成本後獲利為勝；賣出／減碼以後續下跌為正確；觀望以區間漲跌在 ±3% 內為正確。")
+    if df.empty:
+        st.info("尚無已到期的真實裁決樣本。系統已開始保存本次與後續裁決，待 5 個交易日後會出現第一批實績。")
+        return
+    rows=[]
+    for h,g in df.groupby("horizon_days"):
+        buys=g[g.verdict_code.isin(["BUY","STRONG_BUY"])]
+        sells=g[g.verdict_code.isin(["SELL","REDUCE"])]
+        holds=g[g.verdict_code.eq("HOLD")]
+        rows.append({"區間":f"{h}天","已到期裁決":len(g),
+                     "買進勝率":buys.is_win.mean()*100 if len(buys) else np.nan,
+                     "賣出正確率":sells.is_win.mean()*100 if len(sells) else np.nan,
+                     "觀望正確率":holds.is_win.mean()*100 if len(holds) else np.nan,
+                     "平均方向報酬":g.directional_return.mean()*100,
+                     "平均MFE":g.max_favorable_excursion.mean()*100,
+                     "平均MAE":g.max_adverse_excursion.mean()*100,
+                     "可信度":_confidence_label(len(g))})
+    view=pd.DataFrame(rows)
+    for c in ("買進勝率","賣出正確率","觀望正確率","平均方向報酬","平均MFE","平均MAE"):
+        view[c]=view[c].map(lambda x:"--" if pd.isna(x) else f"{x:+.2f}%" if "報酬" in c or "MFE" in c or "MAE" in c else f"{x:.1f}%")
+    st.dataframe(view,hide_index=True,use_container_width=True)
+
+
+def render_verdict_history(stock_id):
+    _init_verdict_db()
+    with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
+        h=pd.read_sql_query("""SELECT data_date AS 裁決日,verdict_code AS 終極裁決,decision_code AS 投資決策,
+                              entry_price AS 建議進場價,stop_loss AS 停損價,target_price AS 目標價,
+                              position_size AS 建議部位,prompt_version AS 提示詞版本
+                              FROM verdict_history WHERE stock_id=? ORDER BY data_date DESC LIMIT 50""",conn,params=(str(stock_id),))
+    if not h.empty:
+        with st.expander("查看真實裁決紀錄"):
+            st.dataframe(h,hide_index=True,use_container_width=True)
 
 
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
@@ -2068,6 +2265,16 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
             st.error(err)
         else:
             render_trading_agents_cards(ai_res)
+            parsed_verdict = save_verdict_snapshot(stock_id, stock_name, end_date, latest['Close'], ai_res)
+            st.caption(f"本次裁決已保存：{parsed_verdict['verdict_code']}／{parsed_verdict['decision_code']}，將於 5、10、20、60 個交易日後自動驗證。")
+
+    st.markdown("---")
+    try:
+        update_verdict_performance(token)
+    except Exception as exc:
+        safe_log("update verdict performance", exc)
+    render_real_verdict_performance(stock_id)
+    render_verdict_history(stock_id)
 
     st.markdown("---")
     render_verdict_backtest(run_verdict_backtest(backtest_df, end_date), stock_id, stock_name)

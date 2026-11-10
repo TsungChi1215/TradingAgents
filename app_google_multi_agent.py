@@ -1775,7 +1775,7 @@ def render_trading_agents_cards(res):
     st.markdown(f"""
         <div style="{card_style}; border: 2px solid #FF5252; background-color: #241920;">
             <div style="color: #FF5252; font-weight: bold; font-size: 18px; margin-bottom: 12px; border-bottom: 1px solid #FF5252; padding-bottom: 8px;">
-                🏆 終極裁決與投資決策結論 (Executive Summary)
+                🏆 投資建議重點
             </div>
             <div style="font-size: 15px; line-height: 1.7; margin-bottom: 14px;">
                 <span style="color: #FFD54F; font-weight: bold; font-size: 16px;">💡 交易員最終買賣建議與推薦部位比例：</span><br>
@@ -1851,7 +1851,7 @@ def render_trading_agents_cards(res):
     st.markdown(f"""
         <div style="{card_style}">
             <div style="color: #BA68C8; font-weight: bold; font-size: 16px; margin-bottom: 12px; border-bottom: 1px solid #2A2E3D; padding-bottom: 6px;">
-                4. ⚔️ 看多研究員 vs 看空研究員 正反辯論焦點 (Bull vs Bear Debate)
+                4. ⚖️ 看多與看空理由比較
             </div>
             <div style="font-size: 14.5px; line-height: 1.7; padding-left: 8px;">
                 {res.get('bull_bear_debate', '數據解析中...')}
@@ -2112,10 +2112,10 @@ def update_verdict_performance(token=""):
 
 
 def _confidence_label(n):
-    if n < 10: return "樣本不足"
-    if n < 30: return "初步參考"
-    if n < 100: return "中等可信度"
-    return "較具統計參考性"
+    if n < 10: return "資料還不夠"
+    if n < 30: return "可初步參考"
+    if n < 100: return "有一定參考性"
+    return "參考性較高"
 
 
 def render_real_verdict_performance(stock_id=None):
@@ -2126,10 +2126,10 @@ def render_real_verdict_performance(stock_id=None):
             FROM verdict_history h JOIN verdict_performance p ON h.id=p.verdict_id {where}"""
     with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
         df = pd.read_sql_query(q, conn, params=params)
-    st.markdown("### 🎯 終極裁決真實實績")
-    st.caption("只統計系統當時實際顯示並保存的終極裁決與投資決策。買進以扣除 0.785% 成本後獲利為勝；賣出／減碼以後續下跌為正確；觀望以區間漲跌在 ±3% 內為正確。")
+    st.markdown("### 🎯 過去投資建議的實際結果")
+    st.caption("本區追蹤網站過去實際顯示並保存的投資建議。建議買進後，扣除約 0.785% 的交易成本仍有獲利，才算判斷正確；建議賣出或減碼後股價下跌，算判斷正確；建議觀望後，股價在評估期間內漲跌不超過 3%，算判斷正確。")
     if df.empty:
-        st.info("尚無已到期的真實裁決樣本。系統已開始保存本次與後續裁決，待 5 個交易日後會出現第一批實績。")
+        st.info("目前還沒有可以檢查的過去建議。網站已開始保存每次投資建議，最早會在 5 個交易日後顯示第一批結果。")
         return
     rows=[]
     for h,g in df.groupby("horizon_days"):
@@ -2140,27 +2140,37 @@ def render_real_verdict_performance(stock_id=None):
                      "買進勝率":buys.is_win.mean()*100 if len(buys) else np.nan,
                      "賣出正確率":sells.is_win.mean()*100 if len(sells) else np.nan,
                      "觀望正確率":holds.is_win.mean()*100 if len(holds) else np.nan,
-                     "平均方向報酬":g.directional_return.mean()*100,
-                     "平均MFE":g.max_favorable_excursion.mean()*100,
-                     "平均MAE":g.max_adverse_excursion.mean()*100,
-                     "可信度":_confidence_label(len(g))})
+                     "平均結果":g.directional_return.mean()*100,
+                     "平均最高漲幅":g.max_favorable_excursion.mean()*100,
+                     "平均最大跌幅":g.max_adverse_excursion.mean()*100,
+                     "參考程度":_confidence_label(len(g))})
     view=pd.DataFrame(rows)
-    for c in ("買進勝率","賣出正確率","觀望正確率","平均方向報酬","平均MFE","平均MAE"):
-        view[c]=view[c].map(lambda x:"--" if pd.isna(x) else f"{x:+.2f}%" if "報酬" in c or "MFE" in c or "MAE" in c else f"{x:.1f}%")
+    for c in ("買進勝率","賣出正確率","觀望正確率","平均結果","平均最高漲幅","平均最大跌幅"):
+        view[c]=view[c].map(lambda x:"--" if pd.isna(x) else f"{x:+.2f}%" if c in ("平均結果","平均最高漲幅","平均最大跌幅") else f"{x:.1f}%")
     st.dataframe(view,hide_index=True,use_container_width=True)
 
 
 def render_verdict_history(stock_id):
     _init_verdict_db()
     with sqlite3.connect(VERDICT_DB, timeout=10) as conn:
-        h=pd.read_sql_query("""SELECT data_date AS 裁決日,verdict_code AS 終極裁決,decision_code AS 投資決策,
-                              entry_price AS 建議進場價,stop_loss AS 停損價,target_price AS 目標價,
-                              position_size AS 建議部位,prompt_version AS 提示詞版本
-                              FROM verdict_history WHERE stock_id=? ORDER BY data_date DESC LIMIT 50""",conn,params=(str(stock_id),))
+        h = pd.read_sql_query("""SELECT data_date AS 建議日期, verdict_code AS 投資看法,
+                              decision_code AS 建議動作, entry_price AS 參考進場價,
+                              stop_loss AS 停損價, target_price AS 目標價,
+                              position_size AS 建議投入比例, prompt_version AS analysis_rule
+                              FROM verdict_history WHERE stock_id=?
+                              ORDER BY data_date DESC LIMIT 50""", conn, params=(str(stock_id),))
     if not h.empty:
-        with st.expander("查看真實裁決紀錄"):
-            st.dataframe(h,hide_index=True,use_container_width=True)
-
+        look_map = {"STRONG_BUY":"積極買進", "BUY":"買進", "HOLD":"觀望或續抱", "REDUCE":"減碼", "SELL":"賣出"}
+        action_map = {"ENTER":"進場", "HOLD":"維持現況", "REDUCE":"降低持股", "EXIT":"出場"}
+        h["投資看法"] = h["投資看法"].map(look_map).fillna(h["投資看法"])
+        h["建議動作"] = h["建議動作"].map(action_map).fillna(h["建議動作"])
+        h["建議投入比例"] = h["建議投入比例"].map(lambda x: "--" if pd.isna(x) else f"{float(x)*100:.0f}%")
+        main_cols = ["建議日期", "投資看法", "建議動作", "參考進場價", "停損價", "目標價", "建議投入比例"]
+        with st.expander("查看過去的投資建議"):
+            st.dataframe(h[main_cols], hide_index=True, use_container_width=True)
+            with st.expander("查看分析方式", expanded=False):
+                rule_name = "第 12 版投資分析方式" if (h["analysis_rule"] == "verdict-v12-structured").any() else "投資分析方式"
+                st.caption(f"分析方式：{rule_name}。這項資訊只用來區分網站不同時期採用的判斷方式，一般使用者不需要特別解讀。")
 
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
@@ -2253,7 +2263,7 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     st.caption("總股東人數縱軸不從 0 起算，用以凸顯增減趨勢；請以標題列的最新數字為準。")
 
     st.markdown("---")
-    st.markdown("## 🤖 TradingAgents 多 Agent 投資診斷會議與終極裁決")
+    st.markdown("## 🤖 AI 綜合投資分析與建議")
     with st.spinner("TradingAgents 團隊（技術員/多空研究員/交易員/風控經理）連線分析中..."):
         df_calc = calculate_indicators(price_df)
         latest = df_calc.iloc[-1]
@@ -2266,7 +2276,11 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         else:
             render_trading_agents_cards(ai_res)
             parsed_verdict = save_verdict_snapshot(stock_id, stock_name, end_date, latest['Close'], ai_res)
-            st.caption(f"本次裁決已保存：{parsed_verdict['verdict_code']}／{parsed_verdict['decision_code']}，將於 5、10、20、60 個交易日後自動驗證。")
+            look_map = {"STRONG_BUY":"積極買進", "BUY":"買進", "HOLD":"觀望或續抱", "REDUCE":"減碼", "SELL":"賣出"}
+            action_map = {"ENTER":"進場", "HOLD":"維持現況", "REDUCE":"降低持股", "EXIT":"出場"}
+            look_text = look_map.get(parsed_verdict["verdict_code"], parsed_verdict["verdict_code"])
+            action_text = action_map.get(parsed_verdict["decision_code"], parsed_verdict["decision_code"])
+            st.caption(f"本次投資建議已保存：{look_text}／{action_text}。網站會在 5、10、20、60 個交易日後自動檢查結果。")
 
     st.markdown("---")
     try:
@@ -2285,14 +2299,26 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
 finmind_token = get_secret("FINMIND_TOKEN", "")
 STOCK_DICT = get_all_taiwan_stock_info(finmind_token)
 
+def clear_current_analysis():
+    """切換模式、策略、股票或日期時，清除畫面上的舊分析結果。"""
+    st.session_state.pop("diag_req", None)
+
+def clear_strategy_results():
+    """切換策略時，同時清除舊掃描、舊回測與舊個股分析。"""
+    clear_current_analysis()
+    st.session_state.pop("screener_res", None)
+    st.session_state.pop("screener_status", None)
+    st.session_state.pop("market_strategy_bt", None)
+
 with st.sidebar:
     st.markdown("### ⚡ 系統核心設定")
-    app_mode = st.selectbox("選擇系統執行模式：", ["單股與多 Agent 診斷版", "全市場自動選股版"], index=0)
+    app_mode = st.selectbox("選擇系統執行模式：", ["單股與多 Agent 診斷版", "全市場自動選股版"], index=0,
+                            key="app_mode_select", on_change=clear_current_analysis)
     st.markdown("---")
     st.info("🔒 Gemini API Key 與 FinMind Token 已全數由系統密鑰庫 (Streamlit Secrets) 安全自動載入。")
     st.markdown("---")
-    start_date = st.date_input("開始日期", value=taipei_now() - timedelta(days=90))
-    end_date = st.date_input("結束日期", value=taipei_now())
+    start_date = st.date_input("開始日期", value=taipei_now() - timedelta(days=90), key="analysis_start_date", on_change=clear_current_analysis)
+    end_date = st.date_input("結束日期", value=taipei_now(), key="analysis_end_date", on_change=clear_current_analysis)
 
 # -----------------------------------------------------------------------------
 # 9. 頂部四大指數獨立區塊（僅在盤中交易時間 60 秒自動重新整理）
@@ -2560,6 +2586,7 @@ if app_mode == "全市場自動選股版":
         ["飆風向上", "短線強勢爆發", "波段多頭排列"],
         horizontal=True,
         key="market_screener_strategy",
+        on_change=clear_strategy_results,
     )
 
     if strategy_choice == "飆風向上":
@@ -2644,7 +2671,7 @@ if app_mode == "全市場自動選股版":
         
         st.markdown("### 🎯 從掃描結果啟動深度診斷")
         options = [f"{row['股票代碼']} {row['股票名稱']}" for idx, row in df_res.iterrows()]
-        sel = st.selectbox("📌 請選擇一檔標的進行分析：", options)
+        sel = st.selectbox("📌 請選擇一檔標的進行分析：", options, key="screener_diagnosis_stock", on_change=clear_current_analysis)
         if st.button("🚀 啟動此檔個股深度分析"):
             sid = sel.split(" ")[0]
             sname = sel.split(" ")[1]
@@ -2654,7 +2681,7 @@ else:
     filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
     default_idx = next((i for i, opt in enumerate(filtered_options) if opt.startswith(st.session_state.get("selected_stock_code", "2356"))), 0)
 
-    selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options, index=default_idx, key="selected_stock_select")
+    selected_stock_raw = st.selectbox("請選擇或搜尋股票：", options=filtered_options, index=default_idx, key="selected_stock_select", on_change=clear_current_analysis)
     
     if selected_stock_raw:
         st.session_state["selected_stock_code"] = selected_stock_raw.split(" ")[0]

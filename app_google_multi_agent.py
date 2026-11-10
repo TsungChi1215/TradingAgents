@@ -2649,25 +2649,69 @@ finmind_token = get_secret("FINMIND_TOKEN", "")
 STOCK_DICT = get_all_taiwan_stock_info(finmind_token)
 
 def clear_current_analysis():
-    """切換模式、策略、股票或日期時，清除畫面上的舊分析結果。"""
+    """更換股票或日期時，只清除個股分析結果。"""
     st.session_state.pop("diag_req", None)
 
+
+def clear_all_page_results():
+    """切換主要功能時，清除上一個功能留在主畫面的所有執行結果。"""
+    keys_to_clear = (
+        "diag_req",
+        "screener_res",
+        "screener_status",
+        "screener_running",
+        "market_strategy_bt",
+        "screener_diagnosis_stock",
+        "selected_stock_select",
+        "view_days_radio",
+        "show_bb_checkbox",
+        "norway_weeks_radio",
+    )
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+
+    # 清除所有動態產生的按鈕／提示狀態，避免切換功能後沿用舊畫面。
+    dynamic_prefixes = (
+        "run_strategy_bt_",
+        "restart_stock_",
+        "refresh_latest_price_",
+        "price_refresh_done_",
+        "clear_price_cache_",
+    )
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(dynamic_prefixes):
+            st.session_state.pop(key, None)
+
+
 def clear_strategy_results():
-    """切換策略時，同時清除舊掃描、舊回測與舊個股分析。"""
-    clear_current_analysis()
-    st.session_state.pop("screener_res", None)
-    st.session_state.pop("screener_status", None)
-    st.session_state.pop("market_strategy_bt", None)
+    """切換選股方式時，清除舊掃描、舊測試與舊個股分析。"""
+    keys_to_clear = (
+        "diag_req",
+        "screener_res",
+        "screener_status",
+        "screener_running",
+        "market_strategy_bt",
+        "screener_diagnosis_stock",
+    )
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+
 
 with st.sidebar:
     st.markdown("### ⚡ 系統核心設定")
     app_mode = st.selectbox("選擇功能：", ["個股分析", "全市場選股"], index=0,
-                            key="app_mode_select", on_change=clear_current_analysis)
+                            key="app_mode_select", on_change=clear_all_page_results)
     st.markdown("---")
     st.info("🔒 Gemini API Key 與 FinMind Token 已全數由系統密鑰庫 (Streamlit Secrets) 安全自動載入。")
     st.markdown("---")
     start_date = st.date_input("開始日期", value=taipei_now() - timedelta(days=90), key="analysis_start_date", on_change=clear_current_analysis)
     end_date = st.date_input("結束日期", value=taipei_now(), key="analysis_end_date", on_change=clear_current_analysis)
+
+# 防呆：若瀏覽器還原舊工作階段而未觸發元件 callback，仍在主頁繪製前清除舊功能結果。
+_previous_mode = st.session_state.get("_previous_app_mode")
+if _previous_mode is not None and _previous_mode != app_mode:
+    clear_all_page_results()
+st.session_state["_previous_app_mode"] = app_mode
 
 # -----------------------------------------------------------------------------
 # 9. 頂部四大指數獨立區塊（僅在盤中交易時間 60 秒自動重新整理）
@@ -2949,6 +2993,7 @@ def render_market_strategy_backtest(table, strategy_name, meta):
 # -----------------------------------------------------------------------------
 if app_mode == "全市場選股":
     st.markdown("## 🔍 全市場選股")
+    st.caption("切換功能後，上一個功能的掃描、歷史測試與個股分析結果會自動畫面清除。")
     strategy_choice = st.radio(
         "選擇選股方式：",
         ["飆風向上", "短線強勢爆發", "波段多頭排列"],
@@ -3052,6 +3097,7 @@ if app_mode == "全市場選股":
             st.session_state["diag_req"] = {"mode": app_mode, "id": sid, "name": sname}
             
 else:
+    st.caption("切換功能後，上一個功能的掃描、歷史測試與個股分析結果會自動畫面清除。")
     filtered_options = [f"{code} {name}" for code, name in STOCK_DICT.items()]
     default_idx = next((i for i, opt in enumerate(filtered_options) if opt.startswith(st.session_state.get("selected_stock_code", "2356"))), 0)
 

@@ -15,7 +15,7 @@ import random
 import hashlib
 import html
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import math
 import inspect
 import sqlite3
@@ -548,9 +548,13 @@ def _num_series(df, names):
 
 
 def _price_slope_stage(item, token, start_str, end_str):
-    """第一優先：只抓價格，先確認月線近 5 日斜率 > 1%。"""
+    """第一優先：掃描時只用 Yahoo 快速備援抓價格，避免大量 FinMind 呼叫造成限流。"""
     sid = item["股票代碼"]
-    price = fetch_stock_history_cached(sid, start_str, end_str, token)
+    price = pd.DataFrame()
+    for suffix in ("TW", "TWO"):
+        price, _ = _fetch_price_yahoo_symbol(f"{sid}.{suffix}", start_str, end_str)
+        if not price.empty:
+            break
     if price.empty or len(price) < 26:
         return None
     price = price.sort_values("date" if "date" in price.columns else "Date")
@@ -558,8 +562,8 @@ def _price_slope_stage(item, token, start_str, end_str):
     if len(close) < 26:
         return None
     ma20 = close.rolling(20).mean()
-    base = ma20.iloc[-6]
-    slope = (ma20.iloc[-1] / base - 1) * 100 if pd.notna(base) and base > 0 else np.nan
+    base_ma = ma20.iloc[-6]
+    slope = (ma20.iloc[-1] / base_ma - 1) * 100 if pd.notna(base_ma) and base_ma > 0 else np.nan
     if pd.isna(slope) or slope <= 1.0:
         return None
     item = dict(item)
@@ -614,17 +618,45 @@ def _holder_stage(item):
     return item
 
 
+def _bounded_parallel(items, worker, max_workers, timeout_seconds):
+    """Return completed results by deadline without waiting forever for blocked network threads."""
+    if not items:
+        return [], 0
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = [executor.submit(worker, item) for item in items]
+    results, timed_out = [], 0
+    try:
+        for future in as_completed(futures, timeout=timeout_seconds):
+            try:
+                value = future.result()
+                if value is not None:
+                    results.append(value)
+            except Exception as exc:
+                safe_log("market screener worker", exc)
+    except TimeoutError:
+        timed_out = sum(1 for f in futures if not f.done())
+    finally:
+        for future in futures:
+            if not future.done():
+                future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+    return results, timed_out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def run_market_screener(stock_dict, strategy_type):
-    """三階段漏斗：月線優先、籌碼其次、集保最後；以有限平行降低全市場掃描時間。"""
+    """Time-boxed market scan. It always returns within about 80 seconds with status metadata."""
+    started = time.monotonic()
+    status = {"階段": "初始化", "訊息": "", "候選數": {}}
     url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     try:
         resp = requests.get(url_twse, timeout=(3, 10), headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         raw_data = resp.json()
     except Exception as exc:
-        safe_log("TWSE market screener", exc)
-        return pd.DataFrame()
+        failed = pd.DataFrame()
+        failed.attrs["scan_status"] = {"ok": False, "message": f"證交所全市場行情取得失敗：{type(exc).__name__}: {exc}"}
+        return failed
 
     base = []
     for raw in raw_data:
@@ -636,51 +668,71 @@ def run_market_screener(stock_dict, strategy_type):
         volume = as_number(raw.get("TradeVolume")) or 0
         vol_lots = int(volume / 1000)
         change_pct = ((close_p - open_p) / open_p * 100) if open_p > 0 else 0
+        row = {"股票代碼": sid, "股票名稱": stock_dict[sid], "今日收盤": close_p,
+               "漲幅(%)": round(change_pct, 2), "成交量(張)": vol_lots}
         if strategy_type == "波段多頭排列":
             if vol_lots >= 1000 and 0.5 <= change_pct <= 3.0 and close_p >= open_p:
-                base.append({"股票代碼": sid, "股票名稱": stock_dict[sid], "今日收盤": close_p,
-                             "漲幅(%)": round(change_pct, 2), "成交量(張)": vol_lots})
+                base.append(row)
         elif vol_lots > 1000:
-            base.append({"股票代碼": sid, "股票名稱": stock_dict[sid], "今日收盤": close_p,
-                         "漲幅(%)": round(change_pct, 2), "成交量(張)": vol_lots})
+            base.append(row)
 
     if strategy_type != "短線強勢爆發":
-        return pd.DataFrame(base).sort_values("成交量(張)", ascending=False).head(30) if base else pd.DataFrame()
+        result = pd.DataFrame(base).sort_values("成交量(張)", ascending=False).head(30) if base else pd.DataFrame()
+        result.attrs["scan_status"] = {"ok": True, "message": "掃描完成", "counts": {"成交量初篩": len(base)}}
+        return result
     if not base:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        result.attrs["scan_status"] = {"ok": True, "message": "今日沒有成交量大於 1,000 張的候選股", "counts": {"成交量初篩": 0}}
+        return result
 
+    # Hard cap before any per-stock history request. This is the main protection for Streamlit Cloud.
+    base.sort(key=lambda x: x["成交量(張)"], reverse=True)
+    base_total = len(base)
+    base = base[:40]
     token = get_secret("FINMIND_TOKEN", "")
-    end = taipei_now().date()
-    end_str = end.strftime("%Y-%m-%d")
-    price_start = (end - timedelta(days=120)).strftime("%Y-%m-%d")
-    chip_start = (end - timedelta(days=35)).strftime("%Y-%m-%d")
-    margin_start = (end - timedelta(days=50)).strftime("%Y-%m-%d")
+    end_date = taipei_now().date()
+    end_str = end_date.strftime("%Y-%m-%d")
+    price_start = (end_date - timedelta(days=120)).strftime("%Y-%m-%d")
+    chip_start = (end_date - timedelta(days=35)).strftime("%Y-%m-%d")
+    margin_start = (end_date - timedelta(days=50)).strftime("%Y-%m-%d")
 
-    # 第一優先：月線斜率。成交量門檻後即平行抓價格，不先浪費法人、融資、集保請求。
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        stage1 = list(pool.map(lambda x: _price_slope_stage(x, token, price_start, end_str), base))
-    stage1 = [x for x in stage1 if x]
+    stage1, timeout1 = _bounded_parallel(
+        base, lambda x: _price_slope_stage(x, token, price_start, end_str),
+        max_workers=8, timeout_seconds=35)
     stage1.sort(key=lambda x: (x["月線斜率(%)"], x["成交量(張)"]), reverse=True)
-    stage1 = stage1[:100]
+    stage1 = stage1[:15]
     if not stage1:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        result.attrs["scan_status"] = {"ok": True, "message": "掃描完成，但沒有股票通過月線斜率 > 1% 條件。",
+            "counts": {"成交量初篩": base_total, "價格深查": len(base), "月線通過": 0}, "timeouts": timeout1}
+        return result
 
-    # 第二階段：最多 100 檔，以 8 執行緒驗證法人與融資。
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        stage2 = list(pool.map(lambda x: _chip_margin_stage(x, token, chip_start, margin_start, end_str), stage1))
-    stage2 = [x for x in stage2 if x]
+    stage2, timeout2 = _bounded_parallel(
+        stage1, lambda x: _chip_margin_stage(x, token, chip_start, margin_start, end_str),
+        max_workers=4, timeout_seconds=25)
     stage2.sort(key=lambda x: (x["籌碼強度"], x["月線斜率(%)"]), reverse=True)
-    stage2 = stage2[:20]
+    stage2 = stage2[:8]
     if not stage2:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        result.attrs["scan_status"] = {"ok": True, "message": "月線條件已有候選，但沒有股票同時通過主力 1／5／10 日與融資下降條件。",
+            "counts": {"成交量初篩": base_total, "價格深查": len(base), "月線通過": len(stage1), "籌碼通過": 0},
+            "timeouts": timeout1 + timeout2}
+        return result
 
-    # 第三階段：集保只查籌碼最強前 20 檔，並限制 6 執行緒，避免對來源造成壓力。
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        final = list(pool.map(_holder_stage, stage2))
+    final, timeout3 = _bounded_parallel(stage2, _holder_stage, max_workers=4, timeout_seconds=15)
     final = [x for x in final if x]
-    if not final:
-        return pd.DataFrame()
-    return pd.DataFrame(final).sort_values(["月線斜率(%)", "主力5日"], ascending=False).head(30)
+    elapsed = round(time.monotonic() - started, 1)
+    if final:
+        result = pd.DataFrame(final).sort_values(["月線斜率(%)", "主力5日"], ascending=False).head(20)
+        result.attrs["scan_status"] = {"ok": True, "message": f"掃描完成，耗時 {elapsed} 秒。",
+            "counts": {"成交量初篩": base_total, "價格深查": len(base), "月線通過": len(stage1),
+                       "籌碼通過": len(stage2), "集保通過": len(result)}, "timeouts": timeout1 + timeout2 + timeout3}
+        return result
+    result = pd.DataFrame()
+    result.attrs["scan_status"] = {"ok": True, "message": f"掃描完成，耗時 {elapsed} 秒；沒有股票同時通過集保戶數下降條件。",
+        "counts": {"成交量初篩": base_total, "價格深查": len(base), "月線通過": len(stage1),
+                   "籌碼通過": len(stage2), "集保通過": 0}, "timeouts": timeout1 + timeout2 + timeout3}
+    return result
 
 # -----------------------------------------------------------------------------
 # 4. 個股資料抓取與技術指標計算
@@ -854,27 +906,166 @@ def fetch_stock_history_cached(stock_id, start_date, end_date, api_token=""):
     return failed
 
 
-@st.cache_data(ttl=43200)
-def fetch_chip_history_cached(stock_id, start_date, end_date, api_token=""):
+def _clean_number(value):
+    if value is None:
+        return np.nan
+    text = str(value).replace(",", "").replace("+", "").strip()
+    if text in ("", "--", "---", "None", "nan"):
+        return np.nan
     try:
-        from FinMind.data import DataLoader
-        fm = DataLoader()
-        if api_token: fm.login_by_token(api_token.strip())
-        df = fm.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date, end_date=end_date)
-        if not df.empty: return df
-    except Exception: pass
-    return pd.DataFrame()
+        return float(text)
+    except Exception:
+        return np.nan
 
-@st.cache_data(ttl=43200)
-def fetch_margin_history_cached(stock_id, start_date, end_date, api_token=""):
+
+def _pick_value(row, candidates):
+    for key in candidates:
+        if key in row:
+            value = _clean_number(row.get(key))
+            if pd.notna(value):
+                return value
+    return np.nan
+
+
+def _pick_text(row, candidates):
+    for key in candidates:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _today_trade_date():
+    return taipei_now().strftime("%Y-%m-%d")
+
+
+def _official_chip_snapshot(stock_id):
+    """Latest official TWSE/TPEx snapshot, normalized to FinMind chip schema."""
+    endpoints = [
+        ("TWSE", "https://openapi.twse.com.tw/v1/exchangeReport/T86"),
+        ("TPEx", "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"),
+    ]
+    errors = []
+    for market, url in endpoints:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(3, 12))
+            r.raise_for_status()
+            rows = r.json()
+            target = None
+            for row in rows if isinstance(rows, list) else []:
+                code = _pick_text(row, ["Code", "證券代號", "股票代號", "SecuritiesCompanyCode", "SecuritiesCompanyCode "])
+                if code == str(stock_id):
+                    target = row
+                    break
+            if not target:
+                errors.append(f"{market} 最新快照找不到 {stock_id}")
+                continue
+            date_text = _pick_text(target, ["Date", "日期", "TradeDate"]) or _today_trade_date()
+            categories = [
+                ("Foreign_Investor", ["ForeignInvestorsBuySell", "外陸資買賣超股數(不含外資自營商)", "外資及陸資(不含外資自營商)-買賣超股數", "外資及陸資買賣超股數"]),
+                ("Investment_Trust", ["InvestmentTrustBuySell", "投信買賣超股數", "投信-買賣超股數"]),
+                ("Dealer", ["DealerBuySell", "自營商買賣超股數", "自營商-買賣超股數", "自營商買賣超"]),
+            ]
+            out = []
+            for name, keys in categories:
+                net = _pick_value(target, keys)
+                if pd.notna(net):
+                    out.append({"date": date_text[:10], "name": name, "buy_sell": net})
+            if out:
+                df = pd.DataFrame(out)
+                df.attrs["source"] = f"{market} 官方最新快照"
+                return df
+            errors.append(f"{market} 欄位格式無法辨識")
+        except Exception as exc:
+            errors.append(f"{market} {type(exc).__name__}: {exc}")
+    failed = pd.DataFrame()
+    failed.attrs["errors"] = errors
+    return failed
+
+
+def _official_margin_snapshot(stock_id):
+    """Latest official TWSE/TPEx margin snapshot, normalized for the existing chart."""
+    endpoints = [
+        ("TWSE", "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"),
+        ("TPEx", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"),
+    ]
+    errors = []
+    for market, url in endpoints:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(3, 12))
+            r.raise_for_status()
+            rows = r.json()
+            target = None
+            for row in rows if isinstance(rows, list) else []:
+                code = _pick_text(row, ["股票代號", "證券代號", "Code", "SecuritiesCompanyCode"])
+                if code == str(stock_id):
+                    target = row
+                    break
+            if not target:
+                errors.append(f"{market} 融資快照找不到 {stock_id}")
+                continue
+            today = _pick_value(target, ["融資今日餘額", "融資餘額", "MarginPurchaseTodayBalance", "MarginBalance"])
+            change = _pick_value(target, ["融資增減", "融資餘額增減", "MarginPurchaseChange", "Change"])
+            yesterday = today - change if pd.notna(today) and pd.notna(change) else np.nan
+            if pd.notna(today):
+                df = pd.DataFrame([{
+                    "date": (_pick_text(target, ["日期", "Date", "TradeDate"]) or _today_trade_date())[:10],
+                    "MarginPurchaseTodayBalance": today,
+                    "MarginPurchaseYesterdayBalance": yesterday if pd.notna(yesterday) else today,
+                }])
+                df.attrs["source"] = f"{market} 官方最新快照"
+                return df
+            errors.append(f"{market} 融資欄位格式無法辨識")
+        except Exception as exc:
+            errors.append(f"{market} {type(exc).__name__}: {exc}")
+    failed = pd.DataFrame()
+    failed.attrs["errors"] = errors
+    return failed
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_chip_history_cached(stock_id, start_date, end_date, api_token=""):
+    errors = []
     try:
         from FinMind.data import DataLoader
         fm = DataLoader()
-        if api_token: fm.login_by_token(api_token.strip())
+        if api_token:
+            fm.login_by_token(api_token.strip())
+        df = fm.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date, end_date=end_date)
+        if df is not None and not df.empty:
+            df.attrs["source"] = "FinMind"
+            return df
+        errors.append("FinMind 三大法人回傳空資料")
+    except Exception as exc:
+        errors.append(f"FinMind 三大法人 {type(exc).__name__}: {exc}")
+    df = _official_chip_snapshot(stock_id)
+    if not df.empty:
+        return df
+    df.attrs["errors"] = errors + df.attrs.get("errors", [])
+    return df
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_margin_history_cached(stock_id, start_date, end_date, api_token=""):
+    errors = []
+    try:
+        from FinMind.data import DataLoader
+        fm = DataLoader()
+        if api_token:
+            fm.login_by_token(api_token.strip())
         df = fm.taiwan_stock_margin_purchase_short_sale(stock_id=stock_id, start_date=start_date, end_date=end_date)
-        if not df.empty: return df
-    except Exception: pass
-    return pd.DataFrame()
+        if df is not None and not df.empty:
+            df.attrs["source"] = "FinMind"
+            return df
+        errors.append("FinMind 融資融券回傳空資料")
+    except Exception as exc:
+        errors.append(f"FinMind 融資融券 {type(exc).__name__}: {exc}")
+    df = _official_margin_snapshot(stock_id)
+    if not df.empty:
+        return df
+    df.attrs["errors"] = errors + df.attrs.get("errors", [])
+    return df
+
 
 @st.cache_data(ttl=259200, show_spinner=False)
 def get_norway_big_shareholders(stock_id):
@@ -1096,7 +1287,8 @@ def plot_main_kline_chart(df_view, show_bb=True):
     # 均線數值附在說明框最後一行
     for i in range(len(hover_texts)):
         parts = []
-        for col, label in (("5MA", "5MA"), ("20MA", "20MA")):
+        for col, label in (("5MA", "5MA"), ("20MA", "20MA"),
+                           ("BB_Upper", "布林上軌"), ("BB_Lower", "布林下軌")):
             v = df_view[col].iloc[i]
             if pd.notna(v):
                 parts.append(f"{label} {v:,.2f}")
@@ -1653,10 +1845,26 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     show_chart(plot_main_kline_chart(df_view, show_bb=show_bb))
 
     chart_title("🏛️ 三大法人每日淨買賣超 (張 · 紅買綠賣)")
+    if chip_df.empty:
+        st.caption("FinMind 與證交所／櫃買中心官方備援均無資料。")
+        if chip_df.attrs.get("errors"):
+            with st.expander("三大法人資料錯誤明細"):
+                for message in chip_df.attrs["errors"]:
+                    st.code(message)
+    else:
+        st.caption(f"資料來源：{chip_df.attrs.get('source', 'FinMind')}。若使用官方備援，初次僅顯示最新快照，之後由快取累積。")
     st.caption("三家法人各自使用獨立縱軸，投信、自營商的小額買賣也能看得清楚。")
     show_chart(plot_chip_chart(chip_df, dates))
 
     chart_title("💳 融資餘額每日增減 (張 · 紅增綠減)")
+    if margin_df.empty:
+        st.caption("FinMind 與證交所／櫃買中心官方備援均無資料。")
+        if margin_df.attrs.get("errors"):
+            with st.expander("融資融券資料錯誤明細"):
+                for message in margin_df.attrs["errors"]:
+                    st.code(message)
+    else:
+        st.caption(f"資料來源：{margin_df.attrs.get('source', 'FinMind')}。若使用官方備援，初次僅顯示最新快照。")
     show_chart(plot_margin_chart(margin_df, dates))
 
     chart_title(f"🔺 {stock_id} {stock_name} 神秘金字塔：大股東持股率 vs 總股東人數")
@@ -1852,11 +2060,42 @@ if app_mode == "全市場自動選股版":
     else:
         st.info("📌 **當前篩選條件**：中價位穩定、成交量大於 1,000 張、且漲幅保持在 0.5% ~ 3% 之間的穩健多頭標的。")
 
-    if st.button("🚀 開始連線證交所全市場掃描"):
-        with st.spinner("三階段掃描中：月線斜率優先 → 法人與融資籌碼 → 集保戶數（僅最終候選）..."):
-            st.session_state["screener_res"] = run_market_screener(STOCK_DICT, strategy_choice)
+    if st.button("🚀 開始連線證交所全市場掃描", use_container_width=True):
+        st.session_state["screener_running"] = True
+        st.session_state.pop("screener_res", None)
+        st.session_state.pop("screener_status", None)
+        # A manual click always means a fresh scan; do not instantly reuse a cached empty result.
+        run_market_screener.clear()
+        progress = st.progress(5, text="取得證交所全市場行情，並依成交量建立候選池...")
+        try:
+            progress.progress(20, text="第一階段：優先檢查成交量前 40 檔的月線斜率 > 1%...")
+            result = run_market_screener(STOCK_DICT, strategy_choice)
+            progress.progress(100, text="掃描完成")
+            st.session_state["screener_res"] = result
+            st.session_state["screener_status"] = result.attrs.get("scan_status", {"ok": True, "message": "掃描完成"})
+        except Exception as exc:
+            st.session_state["screener_res"] = pd.DataFrame()
+            st.session_state["screener_status"] = {"ok": False, "message": f"掃描程式發生錯誤：{type(exc).__name__}: {exc}"}
+            safe_log("market screener UI", exc)
+        finally:
+            st.session_state["screener_running"] = False
+            time.sleep(0.2)
+            st.rerun()
 
     df_res = st.session_state.get("screener_res", pd.DataFrame())
+    scan_status = st.session_state.get("screener_status")
+    if scan_status:
+        message = scan_status.get("message", "掃描完成")
+        if scan_status.get("ok", False):
+            st.info(message)
+        else:
+            st.error(message)
+        counts = scan_status.get("counts", {})
+        if counts:
+            st.caption("｜".join(f"{k}：{v} 檔" for k, v in counts.items()))
+        if scan_status.get("timeouts", 0):
+            st.warning(f"有 {scan_status['timeouts']} 個外部查詢超過階段時限，已跳過，不影響已完成結果。")
+
     if not df_res.empty:
         st.success(f"🎉 掃描完成！共挑選出 {len(df_res)} 檔達標個股。")
         st.dataframe(df_res)

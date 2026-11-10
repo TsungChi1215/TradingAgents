@@ -671,18 +671,31 @@ def run_market_screener(stock_dict, strategy_type):
         row = {"股票代碼": sid, "股票名稱": stock_dict[sid], "今日收盤": close_p,
                "漲幅(%)": round(change_pct, 2), "成交量(張)": vol_lots}
         if strategy_type == "波段多頭排列":
+            # 維持既有條件不變。
             if vol_lots >= 1000 and 0.5 <= change_pct <= 3.0 and close_p >= open_p:
                 base.append(row)
-        elif vol_lots > 1000:
-            base.append(row)
+        elif strategy_type == "短線強勢爆發":
+            # 恢復先前版本：當日漲幅 >= 2%、成交量 >= 1,500 張、收盤高於開盤。
+            if change_pct >= 2.0 and vol_lots >= 1500 and close_p > open_p:
+                base.append(row)
+        elif strategy_type == "飆風向上":
+            # 目前的快速三階段漏斗，先以成交量建立候選池。
+            if vol_lots > 1000:
+                base.append(row)
 
-    if strategy_type != "短線強勢爆發":
-        result = pd.DataFrame(base).sort_values("成交量(張)", ascending=False).head(30) if base else pd.DataFrame()
-        result.attrs["scan_status"] = {"ok": True, "message": "掃描完成", "counts": {"成交量初篩": len(base)}}
+    if strategy_type in ("短線強勢爆發", "波段多頭排列"):
+        sort_col = "漲幅(%)" if strategy_type == "短線強勢爆發" else "成交量(張)"
+        result = pd.DataFrame(base).sort_values(sort_col, ascending=False).head(30) if base else pd.DataFrame()
+        condition_name = "舊版短線強勢條件" if strategy_type == "短線強勢爆發" else "波段多頭條件"
+        result.attrs["scan_status"] = {
+            "ok": True,
+            "message": f"{condition_name}掃描完成，共選出 {len(result)} 檔。",
+            "counts": {"符合條件": len(base)}
+        }
         return result
     if not base:
         result = pd.DataFrame()
-        result.attrs["scan_status"] = {"ok": True, "message": "今日沒有成交量大於 1,000 張的候選股", "counts": {"成交量初篩": 0}}
+        result.attrs["scan_status"] = {"ok": True, "message": "今日沒有成交量大於 1,000 張的飆風向上候選股", "counts": {"成交量初篩": 0}}
         return result
 
     # Hard cap before any per-stock history request. This is the main protection for Streamlit Cloud.
@@ -950,7 +963,15 @@ def _official_chip_snapshot(stock_id):
         try:
             r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(3, 12))
             r.raise_for_status()
-            rows = r.json()
+            content_type = (r.headers.get("content-type") or "").lower()
+            if "json" not in content_type and not r.text.lstrip().startswith(("[", "{")):
+                errors.append(f"{market} 官方服務暫時未回傳 JSON 資料")
+                continue
+            try:
+                rows = r.json()
+            except ValueError:
+                errors.append(f"{market} 官方服務回傳格式異常")
+                continue
             target = None
             for row in rows if isinstance(rows, list) else []:
                 code = _pick_text(row, ["Code", "證券代號", "股票代號", "SecuritiesCompanyCode", "SecuritiesCompanyCode "])
@@ -994,7 +1015,15 @@ def _official_margin_snapshot(stock_id):
         try:
             r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=(3, 12))
             r.raise_for_status()
-            rows = r.json()
+            content_type = (r.headers.get("content-type") or "").lower()
+            if "json" not in content_type and not r.text.lstrip().startswith(("[", "{")):
+                errors.append(f"{market} 官方服務暫時未回傳 JSON 資料")
+                continue
+            try:
+                rows = r.json()
+            except ValueError:
+                errors.append(f"{market} 官方服務回傳格式異常")
+                continue
             target = None
             for row in rows if isinstance(rows, list) else []:
                 code = _pick_text(row, ["股票代號", "證券代號", "Code", "SecuritiesCompanyCode"])
@@ -1785,6 +1814,107 @@ def render_trading_agents_cards(res):
 VIEW_OPTIONS = {"近 20 日": 20, "近 40 日": 40, "近 60 日": 60, "選定區間全部": 0}
 WEEK_OPTIONS = {"13 週": 13, "26 週": 26, "52 週": 52}
 
+def _bt_max_drawdown(curve):
+    if not curve:
+        return np.nan
+    arr = np.asarray(curve, dtype=float)
+    peaks = np.maximum.accumulate(arr)
+    return float(np.min(arr / peaks - 1.0) * 100)
+
+
+def _historical_verdict_score(df):
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    ret20 = close.pct_change(20)
+    vol20 = close.pct_change().rolling(20).std() * np.sqrt(252)
+    score = pd.Series(50.0, index=df.index)
+    score += np.where(df["5MA"] > df["20MA"], 15, -15)
+    score += np.where(close > df["20MA"], 10, -10)
+    score += np.where((close >= df["BB_Lower"]) & (close <= df["BB_Upper"]), 5, -5)
+    score += np.where(ret20 > 0, 10, -10)
+    score += np.where(vol20 < 0.45, 10, -10)
+    return pd.Series(np.clip(score, 0, 100), index=df.index)
+
+
+def run_verdict_backtest(price_df, end_date):
+    df = calculate_indicators(price_df).copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for c in ("Open", "High", "Low", "Close", "5MA", "20MA", "BB_Upper", "BB_Lower"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Date", "Open", "High", "Low", "Close", "5MA", "20MA", "BB_Upper", "BB_Lower"]).sort_values("Date").reset_index(drop=True)
+    if df.empty:
+        return []
+    df["裁決分數"] = _historical_verdict_score(df)
+    sample_start = pd.Timestamp(end_date) - pd.DateOffset(years=1)
+    buy_cost, sell_cost = 0.001425 + 0.001, 0.001425 + 0.003 + 0.001
+    rows = []
+    for label, horizon in (("5天", 5), ("10天", 10), ("20天", 20), ("60D", 60), ("一年", 252)):
+        returns, holds, i = [], [], 0
+        while i < len(df) - horizon - 1:
+            if df.loc[i, "Date"] >= sample_start and df.loc[i, "裁決分數"] >= 60:
+                entry_i = i + 1
+                planned = min(entry_i + horizon, len(df) - 1)
+                entry = df.loc[entry_i, "Open"] * (1 + buy_cost)
+                peak, exit_i, exit_price = entry, planned, None
+                for j in range(entry_i, planned + 1):
+                    peak = max(peak, df.loc[j, "High"])
+                    stop, trail = entry * 0.90, peak * 0.92
+                    if df.loc[j, "Low"] <= stop:
+                        exit_i, exit_price = j, min(df.loc[j, "Open"], stop)
+                        break
+                    if j > entry_i and df.loc[j, "Low"] <= trail:
+                        exit_i, exit_price = j, min(df.loc[j, "Open"], trail)
+                        break
+                    if j > entry_i and df.loc[j - 1, "裁決分數"] < 40:
+                        exit_i, exit_price = j, df.loc[j, "Open"]
+                        break
+                if exit_price is None:
+                    exit_price = df.loc[exit_i, "Close"]
+                r = exit_price * (1 - sell_cost) / entry - 1
+                returns.append(float(r)); holds.append(exit_i - entry_i + 1)
+                i = exit_i + 1
+            else:
+                i += 1
+        wins = [r for r in returns if r > 0]; losses = [r for r in returns if r <= 0]
+        curve = [1.0] + (np.cumprod([1 + r for r in returns]).tolist() if returns else [])
+        std = np.std(returns, ddof=1) if len(returns) > 1 else np.nan
+        pf = sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else (np.inf if wins else np.nan)
+        rows.append({"區間": label, "交易數": len(returns),
+                     "勝率": len(wins)/len(returns)*100 if returns else np.nan,
+                     "平均報酬": np.mean(returns)*100 if returns else np.nan,
+                     "累積報酬": (curve[-1]-1)*100 if returns else np.nan,
+                     "最大回撤": _bt_max_drawdown(curve),
+                     "盈虧因子": pf,
+                     "夏普比率": np.mean(returns)/std*np.sqrt(max(252/horizon, 1)) if pd.notna(std) and std > 0 else np.nan,
+                     "平均持有日": np.mean(holds) if holds else np.nan})
+    return rows
+
+
+def render_verdict_backtest(results, stock_id, stock_name):
+    st.markdown(f"### 🧪 {stock_id}-{stock_name}終極裁決歷史回測")
+    with st.expander("📘 回測依據與交易規則", expanded=False):
+        st.markdown("""
+- 以 5MA/20MA、收盤相對 20MA、布林通道、20日動能與20日波動率計算 0 至 100 分的歷史裁決分數。
+- 60 分以上於下一交易日開盤進場；低於 40 分、固定停損 10%、高點回落 8% 或到期時出場。
+- 測試 5、10、20、60、252 個交易日持有區間；樣本使用截止日前最近一年，交易不重疊。
+- 已計入買賣手續費各 0.1425%、賣出證交稅 0.3%，以及買賣各 0.1% 滑價。
+- 回測只使用價格型結構化裁決，不會把今日 AI 文字或今日籌碼回填到過去，避免前視偏誤。
+        """)
+    if not results or all(r["交易數"] == 0 for r in results):
+        st.info("最近一年沒有足夠的裁決進場訊號可供回測。")
+        return
+    df = pd.DataFrame(results)
+    for c in ("勝率", "平均報酬", "累積報酬", "最大回撤"):
+        df[c] = df[c].map(lambda v: "--" if pd.isna(v) else (f"{v:.1f}%" if c == "勝率" else f"{v:+.2f}%"))
+    for c in ("盈虧因子", "夏普比率", "平均持有日"):
+        df[c] = df[c].map(lambda v: "--" if pd.isna(v) else ("∞" if np.isinf(v) else f"{v:.2f}"))
+    st.markdown("""<style>.bt{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}.bt th,.bt td{padding:7px 3px;border:1px solid #444;text-align:center;word-break:break-word}.bt th{background:#302e2b}@media(max-width:640px){.bt{font-size:9px}.bt th,.bt td{padding:5px 1px}}</style>""", unsafe_allow_html=True)
+    main = df[["區間","交易數","勝率","平均報酬","累積報酬","最大回撤"]]
+    st.markdown(main.to_html(index=False, classes="bt", border=0, escape=True), unsafe_allow_html=True)
+    with st.expander("查看進階指標"):
+        adv = df[["區間","盈虧因子","夏普比率","平均持有日"]]
+        st.markdown(adv.to_html(index=False, classes="bt", border=0, escape=True), unsafe_allow_html=True)
+
+
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
         s_str = start_date.strftime("%Y-%m-%d")
@@ -1795,6 +1925,8 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
         margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
         norway_df = get_norway_big_shareholders(stock_id)
+        backtest_start = (end_date - timedelta(days=550)).strftime("%Y-%m-%d")
+        backtest_df = fetch_stock_history_cached(stock_id, backtest_start, e_str, token)
 
     if price_df.empty:
         st.error(f"❌ 無法取得 {stock_id} {stock_name} 的歷史 K 線資料。FinMind 與 Yahoo Finance 備援均未成功。")
@@ -1846,25 +1978,25 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
 
     chart_title("🏛️ 三大法人每日淨買賣超 (張 · 紅買綠賣)")
     if chip_df.empty:
-        st.caption("FinMind 與證交所／櫃買中心官方備援均無資料。")
-        if chip_df.attrs.get("errors"):
-            with st.expander("三大法人資料錯誤明細"):
+        st.warning("三大法人資料目前暫時無法取得。個股價格、K線與回測仍可正常使用；籌碼裁決將標示為資料不足，不會當成負分。")
+        if st.session_state.get("show_data_diagnostics", False) and chip_df.attrs.get("errors"):
+            with st.expander("三大法人資料診斷"):
                 for message in chip_df.attrs["errors"]:
                     st.code(message)
     else:
-        st.caption(f"資料來源：{chip_df.attrs.get('source', 'FinMind')}。若使用官方備援，初次僅顯示最新快照，之後由快取累積。")
+        st.caption(f"資料來源：{chip_df.attrs.get('source', 'FinMind')}。官方備援僅提供最新快照，完整歷史仍以 FinMind 為主。")
     st.caption("三家法人各自使用獨立縱軸，投信、自營商的小額買賣也能看得清楚。")
     show_chart(plot_chip_chart(chip_df, dates))
 
     chart_title("💳 融資餘額每日增減 (張 · 紅增綠減)")
     if margin_df.empty:
-        st.caption("FinMind 與證交所／櫃買中心官方備援均無資料。")
-        if margin_df.attrs.get("errors"):
-            with st.expander("融資融券資料錯誤明細"):
+        st.warning("融資融券資料目前暫時無法取得。個股價格、K線與回測仍可正常使用；籌碼裁決將標示為資料不足，不會當成負分。")
+        if st.session_state.get("show_data_diagnostics", False) and margin_df.attrs.get("errors"):
+            with st.expander("融資融券資料診斷"):
                 for message in margin_df.attrs["errors"]:
                     st.code(message)
     else:
-        st.caption(f"資料來源：{margin_df.attrs.get('source', 'FinMind')}。若使用官方備援，初次僅顯示最新快照。")
+        st.caption(f"資料來源：{margin_df.attrs.get('source', 'FinMind')}。官方備援僅提供最新快照，完整歷史仍以 FinMind 為主。")
     show_chart(plot_margin_chart(margin_df, dates))
 
     chart_title(f"🔺 {stock_id} {stock_name} 神秘金字塔：大股東持股率 vs 總股東人數")
@@ -1886,6 +2018,9 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
             st.error(err)
         else:
             render_trading_agents_cards(ai_res)
+
+    st.markdown("---")
+    render_verdict_backtest(run_verdict_backtest(backtest_df, end_date), stock_id, stock_name)
 
 # -----------------------------------------------------------------------------
 # 8. Streamlit 主程式介面
@@ -2053,12 +2188,19 @@ st.markdown("---")
 # -----------------------------------------------------------------------------
 if app_mode == "全市場自動選股版":
     st.markdown("## 🔍 全市場策略篩選 (Market Screener)")
-    strategy_choice = st.radio("選擇篩選策略：", ["短線強勢爆發", "波段多頭排列"], horizontal=True)
-    
-    if strategy_choice == "短線強勢爆發":
-        st.info("📌 **快速三階段篩選**：先以成交量大於 1,000 張建立候選池，第一優先平行驗證月線近 5 個交易日斜率 > 1%；再對最多 100 檔檢查主力 1／5／10 日皆為正、近期主力大買及融資下降；最後只對籌碼最強前 20 檔驗證集保戶數下降。")
+    strategy_choice = st.radio(
+        "選擇篩選策略：",
+        ["飆風向上", "短線強勢爆發", "波段多頭排列"],
+        horizontal=True,
+        key="market_screener_strategy",
+    )
+
+    if strategy_choice == "飆風向上":
+        st.info("📌 **飆風向上**：沿用目前的快速三階段策略。先篩成交量大於 1,000 張，再優先驗證月線近 5 個交易日斜率 > 1%；接著檢查主力 1／5／10 日皆為正、近期主力大買與融資下降；最後驗證集保戶數下降。")
+    elif strategy_choice == "短線強勢爆發":
+        st.info("📌 **短線強勢爆發**：恢復先前版本條件，當日漲幅至少 2%、成交量至少 1,500 張，且收盤價高於開盤價；依漲幅由高至低顯示前 30 檔。")
     else:
-        st.info("📌 **當前篩選條件**：中價位穩定、成交量大於 1,000 張、且漲幅保持在 0.5% ~ 3% 之間的穩健多頭標的。")
+        st.info("📌 **波段多頭排列**：維持目前條件不變，成交量至少 1,000 張、當日漲幅介於 0.5% 至 3%，且收盤價不低於開盤價；依成交量由高至低顯示前 30 檔。")
 
     if st.button("🚀 開始連線證交所全市場掃描", use_container_width=True):
         st.session_state["screener_running"] = True
@@ -2066,9 +2208,14 @@ if app_mode == "全市場自動選股版":
         st.session_state.pop("screener_status", None)
         # A manual click always means a fresh scan; do not instantly reuse a cached empty result.
         run_market_screener.clear()
-        progress = st.progress(5, text="取得證交所全市場行情，並依成交量建立候選池...")
+        progress = st.progress(5, text="取得證交所全市場行情並建立候選池...")
         try:
-            progress.progress(20, text="第一階段：優先檢查成交量前 40 檔的月線斜率 > 1%...")
+            if strategy_choice == "飆風向上":
+                progress.progress(20, text="飆風向上：優先檢查成交量前 40 檔的月線斜率 > 1%...")
+            elif strategy_choice == "短線強勢爆發":
+                progress.progress(40, text="短線強勢爆發：檢查漲幅、成交量與紅 K 條件...")
+            else:
+                progress.progress(40, text="波段多頭排列：檢查成交量、漲幅區間與紅 K 條件...")
             result = run_market_screener(STOCK_DICT, strategy_choice)
             progress.progress(100, text="掃描完成")
             st.session_state["screener_res"] = result

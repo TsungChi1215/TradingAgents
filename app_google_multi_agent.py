@@ -1402,6 +1402,31 @@ def calculate_indicators(df_price):
     df.loc[(avg_loss == 0) & (avg_gain > 0), 'RSI14'] = 100.0
     df.loc[(avg_loss == 0) & (avg_gain == 0), 'RSI14'] = 50.0
 
+    # RSI short/long lines for crossover observation. Taiwan market convention often uses RSI6/RSI12.
+    def _rsi_wilder(period):
+        avg_g = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        avg_l = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        ratio = avg_g / avg_l.replace(0, np.nan)
+        result = 100 - (100 / (1 + ratio))
+        result = result.mask((avg_l == 0) & (avg_g > 0), 100.0)
+        result = result.mask((avg_l == 0) & (avg_g == 0), 50.0)
+        return result.round(2)
+    df['RSI6'] = _rsi_wilder(6)
+    df['RSI12'] = _rsi_wilder(12)
+
+    # OBV and its 20-day average. Volume is in shares; only direction matters for interpretation.
+    volume_col = 'Trading_Volume' if 'Trading_Volume' in df.columns else None
+    if volume_col:
+        vol = pd.to_numeric(df[volume_col], errors='coerce').fillna(0)
+        direction = np.sign(pd.to_numeric(df['Close'], errors='coerce').diff()).fillna(0)
+        df['OBV'] = (direction * vol).cumsum().round(0)
+        df['OBV_MA20'] = df['OBV'].rolling(20).mean().round(0)
+        df['OBV_CHANGE5'] = df['OBV'].diff(5).round(0)
+    else:
+        df['OBV'] = np.nan
+        df['OBV_MA20'] = np.nan
+        df['OBV_CHANGE5'] = np.nan
+
     # MACD(12,26,9): DIF, signal line and histogram.
     ema12 = pd.to_numeric(df['Close'], errors='coerce').ewm(span=12, adjust=False, min_periods=12).mean()
     ema26 = pd.to_numeric(df['Close'], errors='coerce').ewm(span=26, adjust=False, min_periods=26).mean()
@@ -1689,60 +1714,59 @@ def _chip_series(chip_df, dates):
     return out
 
 def plot_technical_indicator_charts(df_view):
-    """RSI, MACD and KD in three stacked mobile-friendly panels."""
+    """RSI crossover, MACD, KD and OBV in four stacked mobile-friendly panels."""
     if df_view is None or df_view.empty:
         return _empty_fig("尚無技術指標資料")
-    required = ["Date","RSI14","MACD_DIF","MACD_SIGNAL","MACD_HIST","KD_K","KD_D"]
+    required = ["Date","RSI6","RSI12","MACD_DIF","MACD_SIGNAL","MACD_HIST","KD_K","KD_D","OBV","OBV_MA20"]
     if any(c not in df_view.columns for c in required):
         return _empty_fig("技術指標資料不足")
     d=df_view.copy(); dates=d["Date"].tolist()
-    fig=make_subplots(rows=3,cols=1,shared_xaxes=True,vertical_spacing=0.075,
-                      row_heights=[0.30,0.38,0.32],
-                      subplot_titles=["RSI（14日）","MACD（12、26、9）","KD（9、3、3）"])
+    fig=make_subplots(rows=4,cols=1,shared_xaxes=True,vertical_spacing=0.052,
+                      row_heights=[0.24,0.28,0.23,0.25],
+                      subplot_titles=["RSI（6日／12日）","MACD（12、26、9）","KD（9、3、3）","OBV 能量潮"])
 
-    # RSI
-    fig.add_trace(go.Scatter(x=dates,y=d["RSI14"],mode="lines",name="RSI",
+    # RSI6 / RSI12 allows golden/death crossover reading.
+    fig.add_trace(go.Scatter(x=dates,y=d["RSI6"],mode="lines",name="RSI6",
                              line=dict(color="#FFD54F",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>RSI %{y:.2f}<extra></extra>"),row=1,col=1)
-    fig.add_hline(y=70,line_dash="dot",line_color=C_UP,opacity=.75,row=1,col=1)
-    fig.add_hline(y=50,line_dash="dot",line_color="#90A4AE",opacity=.55,row=1,col=1)
-    fig.add_hline(y=30,line_dash="dot",line_color=C_DOWN,opacity=.75,row=1,col=1)
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>RSI6 %{y:.2f}<extra></extra>"),row=1,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["RSI12"],mode="lines",name="RSI12",
+                             line=dict(color="#42A5F5",width=2),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>RSI12 %{y:.2f}<extra></extra>"),row=1,col=1)
+    for y,color in ((70,C_UP),(50,"#90A4AE"),(30,C_DOWN)):
+        fig.add_hline(y=y,line_dash="dot",line_color=color,opacity=.65,row=1,col=1)
     fig.update_yaxes(range=[0,100],dtick=20,row=1,col=1)
 
-    # MACD
     hist=pd.to_numeric(d["MACD_HIST"],errors="coerce")
     hist_colors=[C_UP if pd.notna(v) and v>=0 else C_DOWN for v in hist]
-    fig.add_trace(go.Bar(x=dates,y=hist,name="柱狀體",marker_color=hist_colors,marker_line_width=0,
+    fig.add_trace(go.Bar(x=dates,y=hist,name="MACD柱",marker_color=hist_colors,marker_line_width=0,
                          hovertemplate="<b>%{x|%Y/%m/%d}</b><br>MACD柱 %{y:.4f}<extra></extra>"),row=2,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["MACD_DIF"],mode="lines",name="DIF",
-                             line=dict(color="#42A5F5",width=2),
+    fig.add_trace(go.Scatter(x=dates,y=d["MACD_DIF"],mode="lines",name="DIF",line=dict(color="#42A5F5",width=2),
                              hovertemplate="<b>%{x|%Y/%m/%d}</b><br>DIF %{y:.4f}<extra></extra>"),row=2,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["MACD_SIGNAL"],mode="lines",name="訊號線",
-                             line=dict(color="#FFB74D",width=2),
+    fig.add_trace(go.Scatter(x=dates,y=d["MACD_SIGNAL"],mode="lines",name="訊號線",line=dict(color="#FFB74D",width=2),
                              hovertemplate="<b>%{x|%Y/%m/%d}</b><br>訊號線 %{y:.4f}<extra></extra>"),row=2,col=1)
     fig.add_hline(y=0,line_color="#78909C",opacity=.7,row=2,col=1)
 
-    # KD
-    fig.add_trace(go.Scatter(x=dates,y=d["KD_K"],mode="lines",name="K",
-                             line=dict(color="#EC407A",width=2),
+    fig.add_trace(go.Scatter(x=dates,y=d["KD_K"],mode="lines",name="K",line=dict(color="#EC407A",width=2),
                              hovertemplate="<b>%{x|%Y/%m/%d}</b><br>K %{y:.2f}<extra></extra>"),row=3,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["KD_D"],mode="lines",name="D",
-                             line=dict(color="#26C6DA",width=2),
+    fig.add_trace(go.Scatter(x=dates,y=d["KD_D"],mode="lines",name="D",line=dict(color="#26C6DA",width=2),
                              hovertemplate="<b>%{x|%Y/%m/%d}</b><br>D %{y:.2f}<extra></extra>"),row=3,col=1)
-    fig.add_hline(y=80,line_dash="dot",line_color=C_UP,opacity=.7,row=3,col=1)
-    fig.add_hline(y=20,line_dash="dot",line_color=C_DOWN,opacity=.7,row=3,col=1)
+    fig.add_hline(y=80,line_dash="dot",line_color=C_UP,opacity=.65,row=3,col=1)
+    fig.add_hline(y=20,line_dash="dot",line_color=C_DOWN,opacity=.65,row=3,col=1)
     fig.update_yaxes(range=[0,100],dtick=20,row=3,col=1)
 
-    _base_layout(fig,dates,height=690,top_margin=76)
-    fig.update_layout(
-        hovermode="x unified",
-        legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0,
-                    font=dict(size=10),itemwidth=34),
-        hoverlabel=dict(font_size=10,bgcolor="#1B2130",bordercolor="#3A4258",align="left",namelength=-1),
-        margin=dict(l=36,r=12,t=76,b=34),
-    )
-    fig.update_xaxes(showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,
-                     spikedash="dot",spikecolor="#9AA4B5")
+    fig.add_trace(go.Scatter(x=dates,y=d["OBV"],mode="lines",name="OBV",line=dict(color="#AB47BC",width=2),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>OBV %{y:,.0f}<extra></extra>"),row=4,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["OBV_MA20"],mode="lines",name="OBV 20日均線",
+                             line=dict(color="#66BB6A",width=2,dash="dot"),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>OBV20均線 %{y:,.0f}<extra></extra>"),row=4,col=1)
+    fig.update_yaxes(tickformat="~s",row=4,col=1)
+
+    _base_layout(fig,dates,height=880,top_margin=82)
+    fig.update_layout(hovermode="x unified",
+                      legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0,font=dict(size=9),itemwidth=30),
+                      hoverlabel=dict(font_size=10,bgcolor="#1B2130",bordercolor="#3A4258",align="left",namelength=-1),
+                      margin=dict(l=38,r=10,t=82,b=34))
+    fig.update_xaxes(showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,spikedash="dot",spikecolor="#9AA4B5")
     _style_subplot_titles(fig)
     return fig
 
@@ -2049,7 +2073,7 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
     
     prompt = f"你是由 TauricResearch/TradingAgents 密集的 AI 多智能體團隊，正在為台股【{stock_id} {stock_name}】（當前收盤價：{latest_price} 元）進行深度投資裁決會議。\n請根據以下數據進行內部團隊辯論與風控審核：\n【技術面數據】：{tech_summary}\n【籌碼與大股東數據】：{chip_summary}\n\n請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：\n{{\n  \"volume_price_volatility\": \"成交量與價格波動分析說明...\",\n  \"market_stage\": \"目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...\",\n  \"key_price_levels\": \"關鍵價格門檻與支撐壓力位...\",\n  \"signal_analysis\": \"技術指標 (RSI/MACD/KD) 訊號評估...\",\n  \"pattern_recognition\": \"K線圖表模式與型態識別...\",\n  \"trend_strength\": \"趨勢強度與動能綜合評估...\",\n  \"bull_bear_debate\": \"看多研究員 vs 看空研究員 辯論焦點說明...\",\n  \"trader_decision\": \"交易員最終買賣建議與推薦部位比例...\",\n  \"risk_management\": \"風控團隊與投資組合經理最終核准/否決評估、停損價與目標價設定...\"\n}}"
     prompt += '\n僅依提供數據判斷；未提供或未計算的指標須明確標示資料不足，不得捏造。'
-    prompt += '\n技術指標評估必須逐項引用 RSI(14)、MACD DIF/訊號線/柱狀體、KD 的 K/D/J 實際數值，說明黃金交叉或死亡交叉、動能是否擴大，以及是否位於高檔或低檔區；不得只寫資料不足。'
+    prompt += '\n技術指標評估必須逐項引用 RSI6/RSI12 與交叉狀態、RSI14、MACD DIF/訊號線/柱狀體、KD 的 K/D/J、OBV 與 OBV 20日均線的實際數值，說明黃金交叉或死亡交叉、動能是否擴大，以及是否位於高檔或低檔區；不得只寫資料不足。'
     prompt += '\n另外必須輸出結構化欄位：verdict_code 為 STRONG_BUY、BUY、HOLD、REDUCE、SELL 五選一；decision_code 為 ENTER、HOLD、REDUCE、EXIT 四選一；position_size 為 0 到 1；entry_price、stop_loss、target_price 為數值；confidence 為 0 到 100。所有欄位須與 trader_decision 及 risk_management 一致。'
     failures = []
     start_idx = int(st.session_state.get('last_working_key_idx', 0)) % len(keys_list)
@@ -2638,6 +2662,8 @@ def _technical_signal_summary(df_calc):
     prev = df_calc.iloc[-2] if len(df_calc) >= 2 else latest
 
     rsi = latest.get('RSI14', np.nan)
+    rsi6 = latest.get('RSI6', np.nan); rsi12 = latest.get('RSI12', np.nan)
+    prev_rsi6 = prev.get('RSI6', np.nan); prev_rsi12 = prev.get('RSI12', np.nan)
     if pd.isna(rsi): rsi_text = "資料不足"
     elif rsi >= 70: rsi_text = "偏熱，需留意追高風險"
     elif rsi <= 30: rsi_text = "偏弱，可能超賣但仍需等待轉強"
@@ -2667,37 +2693,57 @@ def _technical_signal_summary(df_calc):
     if not any(pd.isna(v) for v in (close, ma5, ma10, ma20)):
         ma_text = f"收盤{'高於' if close > ma20 else '低於'}20MA；均線{'偏多' if ma5 > ma10 > ma20 else ('偏空' if ma5 < ma10 < ma20 else '糾結')}"
 
+    if any(pd.isna(v) for v in (rsi6, rsi12)):
+        rsi_cross_text = "資料不足"
+    elif rsi6 > rsi12 and prev_rsi6 <= prev_rsi12:
+        rsi_cross_text = "RSI6 剛向上穿越 RSI12，形成黃金交叉"
+    elif rsi6 < rsi12 and prev_rsi6 >= prev_rsi12:
+        rsi_cross_text = "RSI6 剛向下穿越 RSI12，形成死亡交叉"
+    else:
+        rsi_cross_text = "RSI6 位於 RSI12 上方" if rsi6 > rsi12 else "RSI6 位於 RSI12 下方"
+
+    obv = latest.get('OBV', np.nan); obv_ma = latest.get('OBV_MA20', np.nan); obv_chg5 = latest.get('OBV_CHANGE5', np.nan)
+    if any(pd.isna(v) for v in (obv, obv_ma)):
+        obv_text = "資料不足"
+    else:
+        obv_text = f"OBV {'高於' if obv > obv_ma else '低於'}20日均線；近5日 {'上升' if obv_chg5 > 0 else '下降'}"
+
     return (
         f"收盤價={_indicator_value(latest,'Close')}；5MA={_indicator_value(latest,'5MA')}；10MA={_indicator_value(latest,'10MA')}；20MA={_indicator_value(latest,'20MA')}；"
         f"布林上軌={_indicator_value(latest,'BB_Upper')}；布林下軌={_indicator_value(latest,'BB_Lower')}；均線判讀={ma_text}。\n"
-        f"RSI(14)={_indicator_value(latest,'RSI14')}，判讀={rsi_text}。\n"
+        f"RSI14={_indicator_value(latest,'RSI14')}；RSI6={_indicator_value(latest,'RSI6')}；RSI12={_indicator_value(latest,'RSI12')}；判讀={rsi_text}；交叉判讀={rsi_cross_text}。\n"
         f"MACD DIF={_indicator_value(latest,'MACD_DIF',4)}；訊號線={_indicator_value(latest,'MACD_SIGNAL',4)}；柱狀體={_indicator_value(latest,'MACD_HIST',4)}；判讀={macd_text}。\n"
-        f"KD(9,3,3) K={_indicator_value(latest,'KD_K')}；D={_indicator_value(latest,'KD_D')}；J={_indicator_value(latest,'KD_J')}；判讀={kd_text}。"
+        f"KD(9,3,3) K={_indicator_value(latest,'KD_K')}；D={_indicator_value(latest,'KD_D')}；J={_indicator_value(latest,'KD_J')}；判讀={kd_text}。\n"
+        f"OBV={_indicator_value(latest,'OBV',0)}；OBV20日均線={_indicator_value(latest,'OBV_MA20',0)}；近5日變化={_indicator_value(latest,'OBV_CHANGE5',0)}；判讀={obv_text}。"
     )
 
 
 def render_technical_indicator_snapshot(df_calc):
-    """Compact user-facing values so the AI conclusion is auditable."""
-    if df_calc is None or df_calc.empty:
-        return
-    latest = df_calc.iloc[-1]
-    prev = df_calc.iloc[-2] if len(df_calc) >= 2 else latest
-    rsi = latest.get('RSI14', np.nan)
-    dif = latest.get('MACD_DIF', np.nan); sig = latest.get('MACD_SIGNAL', np.nan)
-    k = latest.get('KD_K', np.nan); d = latest.get('KD_D', np.nan)
-    rsi_label = "資料不足" if pd.isna(rsi) else ("偏熱" if rsi >= 70 else ("偏弱" if rsi <= 30 else ("偏多" if rsi >= 50 else "偏空")))
-    macd_label = "資料不足" if pd.isna(dif) or pd.isna(sig) else ("黃金交叉／偏多" if dif > sig else "死亡交叉／偏空")
-    kd_label = "資料不足" if pd.isna(k) or pd.isna(d) else ("K 在 D 上方／偏多" if k > d else "K 在 D 下方／偏空")
+    if df_calc is None or df_calc.empty: return
+    latest=df_calc.iloc[-1]; prev=df_calc.iloc[-2] if len(df_calc)>=2 else latest
+    r6=latest.get('RSI6',np.nan); r12=latest.get('RSI12',np.nan)
+    if pd.isna(r6) or pd.isna(r12): rsi_label="資料不足"
+    elif r6>r12 and prev.get('RSI6',np.nan)<=prev.get('RSI12',np.nan): rsi_label="黃金交叉"
+    elif r6<r12 and prev.get('RSI6',np.nan)>=prev.get('RSI12',np.nan): rsi_label="死亡交叉"
+    else: rsi_label="短期較強" if r6>r12 else "短期較弱"
+    dif=latest.get('MACD_DIF',np.nan); sig=latest.get('MACD_SIGNAL',np.nan)
+    macd_label="資料不足" if pd.isna(dif) or pd.isna(sig) else ("偏多" if dif>sig else "偏空")
+    k=latest.get('KD_K',np.nan); d=latest.get('KD_D',np.nan)
+    kd_label="資料不足" if pd.isna(k) or pd.isna(d) else ("K在D上方" if k>d else "K在D下方")
+    obv=latest.get('OBV',np.nan); obvma=latest.get('OBV_MA20',np.nan)
+    obv_label="資料不足" if pd.isna(obv) or pd.isna(obvma) else ("量能偏強" if obv>obvma else "量能偏弱")
     st.markdown("### 🎯 技術指標快照")
-    c1,c2,c3 = st.columns(3)
-    c1.metric("RSI（14日）", _indicator_value(latest,'RSI14'), rsi_label)
-    c2.metric("MACD 柱狀體", _indicator_value(latest,'MACD_HIST',4), macd_label)
-    c3.metric("KD（K／D）", f"{_indicator_value(latest,'KD_K')}／{_indicator_value(latest,'KD_D')}", kd_label)
-    with st.expander("這些指標怎麼看？", expanded=False):
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("RSI6／RSI12",f"{_indicator_value(latest,'RSI6')}／{_indicator_value(latest,'RSI12')}",rsi_label)
+    c2.metric("MACD柱",_indicator_value(latest,'MACD_HIST',4),macd_label)
+    c3.metric("KD（K／D）",f"{_indicator_value(latest,'KD_K')}／{_indicator_value(latest,'KD_D')}",kd_label)
+    c4.metric("OBV／20日均線",f"{_indicator_value(latest,'OBV',0)}／{_indicator_value(latest,'OBV_MA20',0)}",obv_label)
+    with st.expander("這些指標怎麼看？",expanded=False):
         st.markdown("""
-- **RSI**：衡量近期上漲與下跌力道。70 以上代表相對偏熱，30 以下代表相對偏弱；不能單獨當作買賣依據。
-- **MACD**：觀察中短期趨勢與動能。DIF 高於訊號線通常偏多；低於訊號線通常偏空。柱狀體擴大代表目前方向的動能增強。
-- **KD**：觀察短線動能轉折。K 值由下往上穿越 D 值稱為黃金交叉；由上往下穿越稱為死亡交叉。80 以上屬高檔區，20 以下屬低檔區。
+- **RSI6／RSI12**：RSI6 由下往上穿越 RSI12，稱為黃金交叉；由上往下穿越稱為死亡交叉。RSI 仍需搭配趨勢與成交量判斷。
+- **MACD**：DIF 高於訊號線通常偏多；低於訊號線通常偏空。柱狀體擴大代表目前方向動能增強。
+- **KD**：K 值由下往上穿越 D 值為黃金交叉；80 以上為高檔區，20 以下為低檔區。
+- **OBV 能量潮**：上漲日把成交量加上、下跌日把成交量扣除。OBV 高於 20 日均線且持續上升，代表量能較支持上漲；價格上漲但 OBV 下滑時，需留意量價背離。
         """)
 
 
@@ -2815,8 +2861,8 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     chart_title(f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
     show_chart(plot_main_kline_chart(df_view, show_bb=show_bb))
 
-    chart_title("🎯 RSI、MACD 與 KD 技術指標")
-    st.caption("RSI 的 70／30 線用來觀察相對偏熱或偏弱；MACD 顯示趨勢與動能；KD 的 80／20 線用來觀察短線高低檔區。")
+    chart_title("🎯 RSI、MACD、KD 與 OBV 技術指標")
+    st.caption("RSI6 與 RSI12 可觀察黃金交叉／死亡交叉，70／30 線用來觀察偏熱或偏弱；MACD 顯示趨勢動能；KD 觀察短線轉折；OBV 比較價格與成交量是否同步。")
     show_chart(plot_technical_indicator_charts(df_view))
 
     chart_title("🏛️ 三大法人每日淨買賣超 (張 · 紅買綠賣)")

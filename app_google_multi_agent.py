@@ -1528,8 +1528,16 @@ def prepare_price_view(price_df, display_start_date, n_bars=40):
 def _fmt_signed(v, unit=""):
     return f"{v:+,.0f}{unit}"
 
+def _display_date(value):
+    """All chart tooltips use YYYY/MM/DD."""
+    try:
+        return pd.Timestamp(value).strftime("%Y/%m/%d")
+    except Exception:
+        return str(value).replace("-", "/")
+
+
 def _kline_hover_texts(df_view):
-    """每一天一段說明文字：日期由 hover 標題顯示，內容含 OHLC、漲跌、成交量與均線。"""
+    """Compact tooltip: short lines prevent mobile clipping at the left/right edge."""
     texts = []
     closes = df_view["Close"].tolist()
     for i, r in enumerate(df_view.itertuples(index=False)):
@@ -1541,13 +1549,15 @@ def _kline_hover_texts(df_view):
             chg_txt = f"<span style='color:{col}'>{chg:+.2f} ({pct:+.2f}%)</span>"
         else:
             col = C_UP if r.Close >= r.Open else C_DOWN
-            chg_txt = ""
+            chg_txt = "--"
         texts.append(
-            f"<b>收 <span style='color:{col}'>{r.Close:,.2f}</span></b> {chg_txt}<br>"
-            f"開 {r.Open:,.2f}　高 {r.High:,.2f}　低 {r.Low:,.2f}<br>"
-            f"<b>成交量 {r.Volume_張:,.0f} 張</b>"
+            f"<b>{_display_date(r.Date)}</b><br>"
+            f"收 <span style='color:{col}'><b>{r.Close:,.2f}</b></span>　{chg_txt}<br>"
+            f"開 {r.Open:,.2f}　高 {r.High:,.2f}<br>"
+            f"低 {r.Low:,.2f}　量 {r.Volume_張:,.0f}張"
         )
     return texts
+
 
 def plot_main_kline_chart(df_view, show_bb=True):
     if df_view.empty:
@@ -1568,7 +1578,10 @@ def plot_main_kline_chart(df_view, show_bb=True):
             if pd.notna(v):
                 parts.append(f"{label} {v:,.2f}")
         if parts:
-            hover_texts[i] += "<br>" + "　".join(parts)
+            # Two short rows are safer than one long row on narrow phone screens.
+            hover_texts[i] += "<br>" + "　".join(parts[:2])
+            if len(parts) > 2:
+                hover_texts[i] += "<br>" + "　".join(parts[2:])
 
     fig.add_trace(go.Candlestick(
         x=dates, open=df_view["Open"], high=df_view["High"],
@@ -1671,7 +1684,8 @@ def plot_chip_chart(chip_df, dates):
     for k in range(len(dates)):
         vals = [series[lb].iloc[k] for lb in series]
         total = float(np.nansum(vals)) if not all(pd.isna(vals)) else float("nan")
-        lines = [f"<b>{lb}</b>　{_fmt_net(series[lb].iloc[k])}" for lb in series]
+        lines = [f"<b>{_display_date(dates[k])}</b>"]
+        lines.extend(f"<b>{lb}</b>　{_fmt_net(series[lb].iloc[k])}" for lb in series)
         lines.append(f"<b>合計</b>　{_fmt_net(total)}")
         hover_texts.append("<br>".join(lines))
 
@@ -1689,40 +1703,97 @@ def plot_chip_chart(chip_df, dates):
     fig.update_traces(marker_line_width=0, selector=dict(type="bar"))
     _base_layout(fig, dates, height=520, top_margin=46)
     _style_subplot_titles(fig)
-    fig.update_layout(hoverlabel=dict(font_size=12, bgcolor="#1B2130", bordercolor="#3A4258", align="left"))
+    fig.update_layout(
+        hovermode="closest",
+        hoverlabel=dict(font_size=11, bgcolor="#1B2130", bordercolor="#3A4258", align="left", namelength=-1),
+    )
     fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
                      spikethickness=1, spikedash="dot", spikecolor="#9AA4B5")
     return fig
+
+def _margin_diff_series(d, prefix, dates):
+    """Return daily balance change for MarginPurchase or ShortSale in FinMind schema."""
+    today_candidates = [f"{prefix}TodayBalance", f"{prefix}Balance"]
+    yesterday_candidates = [f"{prefix}YesterdayBalance"]
+    today_col = next((c for c in today_candidates if c in d.columns), None)
+    yesterday_col = next((c for c in yesterday_candidates if c in d.columns), None)
+    if today_col:
+        today = pd.to_numeric(d[today_col], errors="coerce")
+        if yesterday_col:
+            diff = today - pd.to_numeric(d[yesterday_col], errors="coerce")
+        else:
+            diff = today.diff()
+    else:
+        buy_col = next((c for c in d.columns if f"{prefix}Buy" in c), None)
+        sell_col = next((c for c in d.columns if f"{prefix}Sell" in c), None)
+        if not (buy_col and sell_col):
+            return pd.Series(index=dates, dtype=float)
+        buy = pd.to_numeric(d[buy_col], errors="coerce").fillna(0)
+        sell = pd.to_numeric(d[sell_col], errors="coerce").fillna(0)
+        # Financing: buys increase balance, sells/repayment decrease it.
+        # Short sale: sells increase short balance, buys/redemption decrease it.
+        if prefix == "MarginPurchase":
+            diff = buy - sell
+            repayment = next((c for c in d.columns if "MarginPurchaseCashRepayment" in c), None)
+            if repayment: diff -= pd.to_numeric(d[repayment], errors="coerce").fillna(0)
+        else:
+            diff = sell - buy
+            redemption = next((c for c in d.columns if "ShortSaleStockRedemption" in c or "ShortSaleCashRepayment" in c), None)
+            if redemption: diff -= pd.to_numeric(d[redemption], errors="coerce").fillna(0)
+    d_col = "date" if "date" in d.columns else d.columns[0]
+    return pd.Series(diff.values, index=d[d_col].values).groupby(level=0).last().reindex(dates)
+
 
 def plot_margin_chart(margin_df, dates):
     if margin_df.empty or not dates:
         return _empty_fig("尚無融資融券資料")
     d = margin_df.copy()
     d_col = "date" if "date" in d.columns else d.columns[0]
-    d[d_col] = d[d_col].astype(str).str[:10]
-    # FinMind 融資欄位本身已是「張」，不需再除以 1000
-    if "MarginPurchaseTodayBalance" in d.columns and "MarginPurchaseYesterdayBalance" in d.columns:
-        diff = d["MarginPurchaseTodayBalance"] - d["MarginPurchaseYesterdayBalance"]
-    else:
-        m_buy = [c for c in d.columns if "MarginPurchaseBuy" in c]
-        m_sell = [c for c in d.columns if "MarginPurchaseSell" in c]
-        if not (m_buy and m_sell):
-            return _empty_fig("融資欄位不完整，無法繪圖")
-        diff = d[m_buy[0]] - d[m_sell[0]]
-        if "MarginPurchaseCashRepayment" in d.columns:
-            diff = diff - d["MarginPurchaseCashRepayment"]
-    s = pd.Series(diff.values, index=d[d_col].values).groupby(level=0).last().reindex(dates)
-    total = float(np.nansum(s.values))
-    fig = make_subplots(rows=1, cols=1,
-                        subplot_titles=[f"融資增減　區間累計 {_fmt_signed(total, ' 張')}"])
-    colors = [C_UP if (pd.notna(v) and v >= 0) else C_DOWN for v in s.values]
-    fig.add_trace(go.Bar(x=dates, y=s.values, name="融資增減(張)", marker_color=colors,
-                         showlegend=False), row=1, col=1)
-    fig.update_yaxes(tickformat="~s")
-    fig.update_traces(marker_line_width=0, selector=dict(type="bar"))
-    _base_layout(fig, dates, height=300, top_margin=46)
+    d[d_col] = pd.to_datetime(d[d_col], errors="coerce").dt.strftime("%Y-%m-%d")
+    margin_s = _margin_diff_series(d, "MarginPurchase", dates)
+    short_s = _margin_diff_series(d, "ShortSale", dates)
+    has_margin = margin_s.notna().any()
+    has_short = short_s.notna().any()
+    if not has_margin and not has_short:
+        return _empty_fig("融資融券欄位不完整，無法繪圖")
+
+    margin_total = float(np.nansum(margin_s.values)) if has_margin else 0.0
+    short_total = float(np.nansum(short_s.values)) if has_short else 0.0
+    titles = [
+        f"融資增減　區間累計 {_fmt_signed(margin_total, ' 張')}" if has_margin else "融資增減　無資料",
+        f"融券增減　區間累計 {_fmt_signed(short_total, ' 張')}" if has_short else "融券增減　無資料",
+    ]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.15,
+                        row_heights=[0.5, 0.5], subplot_titles=titles)
+
+    def fmt_value(v):
+        if pd.isna(v): return "--"
+        color = C_UP if v >= 0 else C_DOWN
+        return f"<span style='color:{color}'>{v:+,.0f} 張</span>"
+
+    hover_texts = []
+    for i, day in enumerate(dates):
+        hover_texts.append(
+            f"<b>{_display_date(day)}</b><br>"
+            f"融資增減　{fmt_value(margin_s.iloc[i])}<br>"
+            f"融券增減　{fmt_value(short_s.iloc[i])}"
+        )
+
+    for row, (label, values) in enumerate((("融資增減(張)", margin_s), ("融券增減(張)", short_s)), start=1):
+        colors = [C_UP if (pd.notna(v) and v >= 0) else C_DOWN for v in values.values]
+        fig.add_trace(go.Bar(x=dates, y=values.values, name=label, marker_color=colors,
+                             marker_line_width=0, showlegend=False, hoverinfo="skip"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=values.values, mode="markers", name="", showlegend=False,
+                                 marker=dict(size=16, opacity=0), hovertext=hover_texts,
+                                 hovertemplate="%{hovertext}<extra></extra>"), row=row, col=1)
+        fig.update_yaxes(tickformat="~s", row=row, col=1)
+
+    _base_layout(fig, dates, height=470, top_margin=48)
+    fig.update_layout(hovermode="closest",
+                      hoverlabel=dict(font_size=11, bgcolor="#1B2130", bordercolor="#3A4258", align="left", namelength=-1))
     _style_subplot_titles(fig)
     return fig
+
 
 def plot_norway_pyramid_chart(norway_df, weeks=26):
     if norway_df is None or norway_df.empty:

@@ -1688,6 +1688,65 @@ def _chip_series(chip_df, dates):
         out[label] = s.reindex(dates).round(0)
     return out
 
+def plot_technical_indicator_charts(df_view):
+    """RSI, MACD and KD in three stacked mobile-friendly panels."""
+    if df_view is None or df_view.empty:
+        return _empty_fig("尚無技術指標資料")
+    required = ["Date","RSI14","MACD_DIF","MACD_SIGNAL","MACD_HIST","KD_K","KD_D"]
+    if any(c not in df_view.columns for c in required):
+        return _empty_fig("技術指標資料不足")
+    d=df_view.copy(); dates=d["Date"].tolist()
+    fig=make_subplots(rows=3,cols=1,shared_xaxes=True,vertical_spacing=0.075,
+                      row_heights=[0.30,0.38,0.32],
+                      subplot_titles=["RSI（14日）","MACD（12、26、9）","KD（9、3、3）"])
+
+    # RSI
+    fig.add_trace(go.Scatter(x=dates,y=d["RSI14"],mode="lines",name="RSI",
+                             line=dict(color="#FFD54F",width=2),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>RSI %{y:.2f}<extra></extra>"),row=1,col=1)
+    fig.add_hline(y=70,line_dash="dot",line_color=C_UP,opacity=.75,row=1,col=1)
+    fig.add_hline(y=50,line_dash="dot",line_color="#90A4AE",opacity=.55,row=1,col=1)
+    fig.add_hline(y=30,line_dash="dot",line_color=C_DOWN,opacity=.75,row=1,col=1)
+    fig.update_yaxes(range=[0,100],dtick=20,row=1,col=1)
+
+    # MACD
+    hist=pd.to_numeric(d["MACD_HIST"],errors="coerce")
+    hist_colors=[C_UP if pd.notna(v) and v>=0 else C_DOWN for v in hist]
+    fig.add_trace(go.Bar(x=dates,y=hist,name="柱狀體",marker_color=hist_colors,marker_line_width=0,
+                         hovertemplate="<b>%{x|%Y/%m/%d}</b><br>MACD柱 %{y:.4f}<extra></extra>"),row=2,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["MACD_DIF"],mode="lines",name="DIF",
+                             line=dict(color="#42A5F5",width=2),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>DIF %{y:.4f}<extra></extra>"),row=2,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["MACD_SIGNAL"],mode="lines",name="訊號線",
+                             line=dict(color="#FFB74D",width=2),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>訊號線 %{y:.4f}<extra></extra>"),row=2,col=1)
+    fig.add_hline(y=0,line_color="#78909C",opacity=.7,row=2,col=1)
+
+    # KD
+    fig.add_trace(go.Scatter(x=dates,y=d["KD_K"],mode="lines",name="K",
+                             line=dict(color="#EC407A",width=2),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>K %{y:.2f}<extra></extra>"),row=3,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["KD_D"],mode="lines",name="D",
+                             line=dict(color="#26C6DA",width=2),
+                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>D %{y:.2f}<extra></extra>"),row=3,col=1)
+    fig.add_hline(y=80,line_dash="dot",line_color=C_UP,opacity=.7,row=3,col=1)
+    fig.add_hline(y=20,line_dash="dot",line_color=C_DOWN,opacity=.7,row=3,col=1)
+    fig.update_yaxes(range=[0,100],dtick=20,row=3,col=1)
+
+    _base_layout(fig,dates,height=690,top_margin=76)
+    fig.update_layout(
+        hovermode="x unified",
+        legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0,
+                    font=dict(size=10),itemwidth=34),
+        hoverlabel=dict(font_size=10,bgcolor="#1B2130",bordercolor="#3A4258",align="left",namelength=-1),
+        margin=dict(l=36,r=12,t=76,b=34),
+    )
+    fig.update_xaxes(showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,
+                     spikedash="dot",spikecolor="#9AA4B5")
+    _style_subplot_titles(fig)
+    return fig
+
+
 def plot_chip_chart(chip_df, dates):
     if chip_df.empty or not dates:
         return _empty_fig("尚無三大法人資料")
@@ -2755,6 +2814,10 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
 
     chart_title(f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
     show_chart(plot_main_kline_chart(df_view, show_bb=show_bb))
+
+    chart_title("🎯 RSI、MACD 與 KD 技術指標")
+    st.caption("RSI 的 70／30 線用來觀察相對偏熱或偏弱；MACD 顯示趨勢與動能；KD 的 80／20 線用來觀察短線高低檔區。")
+    show_chart(plot_technical_indicator_charts(df_view))
 
     chart_title("🏛️ 三大法人每日淨買賣超 (張 · 紅買綠賣)")
     if chip_df.empty:

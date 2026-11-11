@@ -1390,6 +1390,32 @@ def calculate_indicators(df_price):
     std20 = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = (df['20MA'] + (std20 * 2)).round(2)
     df['BB_Lower'] = (df['20MA'] - (std20 * 2)).round(2)
+
+    # RSI(14): Wilder smoothing. Values above 70 are relatively hot; below 30 relatively weak.
+    delta = pd.to_numeric(df['Close'], errors='coerce').diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta.clip(upper=0))
+    avg_gain = gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df['RSI14'] = (100 - (100 / (1 + rs))).round(2)
+    df.loc[(avg_loss == 0) & (avg_gain > 0), 'RSI14'] = 100.0
+    df.loc[(avg_loss == 0) & (avg_gain == 0), 'RSI14'] = 50.0
+
+    # MACD(12,26,9): DIF, signal line and histogram.
+    ema12 = pd.to_numeric(df['Close'], errors='coerce').ewm(span=12, adjust=False, min_periods=12).mean()
+    ema26 = pd.to_numeric(df['Close'], errors='coerce').ewm(span=26, adjust=False, min_periods=26).mean()
+    df['MACD_DIF'] = (ema12 - ema26).round(4)
+    df['MACD_SIGNAL'] = df['MACD_DIF'].ewm(span=9, adjust=False, min_periods=9).mean().round(4)
+    df['MACD_HIST'] = (df['MACD_DIF'] - df['MACD_SIGNAL']).round(4)
+
+    # KD(9,3,3): RSV with 1/3 smoothing.
+    low9 = pd.to_numeric(df['Low'], errors='coerce').rolling(9).min()
+    high9 = pd.to_numeric(df['High'], errors='coerce').rolling(9).max()
+    rsv = ((df['Close'] - low9) / (high9 - low9).replace(0, np.nan) * 100).fillna(50)
+    df['KD_K'] = rsv.ewm(alpha=1/3, adjust=False).mean().round(2)
+    df['KD_D'] = df['KD_K'].ewm(alpha=1/3, adjust=False).mean().round(2)
+    df['KD_J'] = (3 * df['KD_K'] - 2 * df['KD_D']).round(2)
     return df
 
 # -----------------------------------------------------------------------------
@@ -1964,6 +1990,7 @@ def call_trading_agents_team(stock_id, stock_name, latest_price, tech_summary, c
     
     prompt = f"你是由 TauricResearch/TradingAgents 密集的 AI 多智能體團隊，正在為台股【{stock_id} {stock_name}】（當前收盤價：{latest_price} 元）進行深度投資裁決會議。\n請根據以下數據進行內部團隊辯論與風控審核：\n【技術面數據】：{tech_summary}\n【籌碼與大股東數據】：{chip_summary}\n\n請嚴格輸出一個符合 JSON 格式的字典（不要帶額外的 Markdown 說明），格式包含以下 Key：\n{{\n  \"volume_price_volatility\": \"成交量與價格波動分析說明...\",\n  \"market_stage\": \"目前市場階段評估 (例如：拉回整理、多頭發散、高檔震盪)...\",\n  \"key_price_levels\": \"關鍵價格門檻與支撐壓力位...\",\n  \"signal_analysis\": \"技術指標 (RSI/MACD/KD) 訊號評估...\",\n  \"pattern_recognition\": \"K線圖表模式與型態識別...\",\n  \"trend_strength\": \"趨勢強度與動能綜合評估...\",\n  \"bull_bear_debate\": \"看多研究員 vs 看空研究員 辯論焦點說明...\",\n  \"trader_decision\": \"交易員最終買賣建議與推薦部位比例...\",\n  \"risk_management\": \"風控團隊與投資組合經理最終核准/否決評估、停損價與目標價設定...\"\n}}"
     prompt += '\n僅依提供數據判斷；未提供或未計算的指標須明確標示資料不足，不得捏造。'
+    prompt += '\n技術指標評估必須逐項引用 RSI(14)、MACD DIF/訊號線/柱狀體、KD 的 K/D/J 實際數值，說明黃金交叉或死亡交叉、動能是否擴大，以及是否位於高檔或低檔區；不得只寫資料不足。'
     prompt += '\n另外必須輸出結構化欄位：verdict_code 為 STRONG_BUY、BUY、HOLD、REDUCE、SELL 五選一；decision_code 為 ENTER、HOLD、REDUCE、EXIT 四選一；position_size 為 0 到 1；entry_price、stop_loss、target_price 為數值；confidence 為 0 到 100。所有欄位須與 trader_decision 及 risk_management 一致。'
     failures = []
     start_idx = int(st.session_state.get('last_working_key_idx', 0)) % len(keys_list)
@@ -2539,6 +2566,82 @@ def render_verdict_history(stock_id):
                 rule_name = "第 12 版投資分析方式" if (h["analysis_rule"] == "verdict-v12-structured").any() else "投資分析方式"
                 st.caption(f"分析方式：{rule_name}。這項資訊只用來區分網站不同時期採用的判斷方式，一般使用者不需要特別解讀。")
 
+def _indicator_value(row, key, digits=2):
+    value = row.get(key, np.nan) if isinstance(row, pd.Series) else np.nan
+    return "資料不足" if pd.isna(value) else f"{float(value):.{digits}f}"
+
+
+def _technical_signal_summary(df_calc):
+    """Structured technical summary for AI. Includes values, direction, crossovers and plain interpretation."""
+    if df_calc is None or df_calc.empty:
+        return "技術指標資料不足"
+    latest = df_calc.iloc[-1]
+    prev = df_calc.iloc[-2] if len(df_calc) >= 2 else latest
+
+    rsi = latest.get('RSI14', np.nan)
+    if pd.isna(rsi): rsi_text = "資料不足"
+    elif rsi >= 70: rsi_text = "偏熱，需留意追高風險"
+    elif rsi <= 30: rsi_text = "偏弱，可能超賣但仍需等待轉強"
+    elif rsi >= 50: rsi_text = "位於 50 以上，動能偏多"
+    else: rsi_text = "位於 50 以下，動能偏弱"
+
+    dif = latest.get('MACD_DIF', np.nan); signal = latest.get('MACD_SIGNAL', np.nan); hist = latest.get('MACD_HIST', np.nan)
+    prev_dif = prev.get('MACD_DIF', np.nan); prev_signal = prev.get('MACD_SIGNAL', np.nan); prev_hist = prev.get('MACD_HIST', np.nan)
+    if any(pd.isna(v) for v in (dif, signal, hist)):
+        macd_text = "資料不足"
+    else:
+        cross = "剛黃金交叉" if dif > signal and prev_dif <= prev_signal else ("剛死亡交叉" if dif < signal and prev_dif >= prev_signal else ("DIF 高於訊號線" if dif > signal else "DIF 低於訊號線"))
+        momentum = "柱狀體擴大" if pd.notna(prev_hist) and abs(hist) > abs(prev_hist) else "柱狀體縮小"
+        macd_text = f"{cross}，{momentum}"
+
+    kval = latest.get('KD_K', np.nan); dval = latest.get('KD_D', np.nan); jval = latest.get('KD_J', np.nan)
+    prev_k = prev.get('KD_K', np.nan); prev_d = prev.get('KD_D', np.nan)
+    if any(pd.isna(v) for v in (kval, dval)):
+        kd_text = "資料不足"
+    else:
+        cross = "剛黃金交叉" if kval > dval and prev_k <= prev_d else ("剛死亡交叉" if kval < dval and prev_k >= prev_d else ("K 值高於 D 值" if kval > dval else "K 值低於 D 值"))
+        zone = "高檔區" if kval >= 80 and dval >= 80 else ("低檔區" if kval <= 20 and dval <= 20 else "中間區")
+        kd_text = f"{cross}，位於{zone}"
+
+    close = latest.get('Close', np.nan); ma5 = latest.get('5MA', np.nan); ma10 = latest.get('10MA', np.nan); ma20 = latest.get('20MA', np.nan)
+    ma_text = "資料不足"
+    if not any(pd.isna(v) for v in (close, ma5, ma10, ma20)):
+        ma_text = f"收盤{'高於' if close > ma20 else '低於'}20MA；均線{'偏多' if ma5 > ma10 > ma20 else ('偏空' if ma5 < ma10 < ma20 else '糾結')}"
+
+    return (
+        f"收盤價={_indicator_value(latest,'Close')}；5MA={_indicator_value(latest,'5MA')}；10MA={_indicator_value(latest,'10MA')}；20MA={_indicator_value(latest,'20MA')}；"
+        f"布林上軌={_indicator_value(latest,'BB_Upper')}；布林下軌={_indicator_value(latest,'BB_Lower')}；均線判讀={ma_text}。\n"
+        f"RSI(14)={_indicator_value(latest,'RSI14')}，判讀={rsi_text}。\n"
+        f"MACD DIF={_indicator_value(latest,'MACD_DIF',4)}；訊號線={_indicator_value(latest,'MACD_SIGNAL',4)}；柱狀體={_indicator_value(latest,'MACD_HIST',4)}；判讀={macd_text}。\n"
+        f"KD(9,3,3) K={_indicator_value(latest,'KD_K')}；D={_indicator_value(latest,'KD_D')}；J={_indicator_value(latest,'KD_J')}；判讀={kd_text}。"
+    )
+
+
+def render_technical_indicator_snapshot(df_calc):
+    """Compact user-facing values so the AI conclusion is auditable."""
+    if df_calc is None or df_calc.empty:
+        return
+    latest = df_calc.iloc[-1]
+    prev = df_calc.iloc[-2] if len(df_calc) >= 2 else latest
+    rsi = latest.get('RSI14', np.nan)
+    dif = latest.get('MACD_DIF', np.nan); sig = latest.get('MACD_SIGNAL', np.nan)
+    k = latest.get('KD_K', np.nan); d = latest.get('KD_D', np.nan)
+    rsi_label = "資料不足" if pd.isna(rsi) else ("偏熱" if rsi >= 70 else ("偏弱" if rsi <= 30 else ("偏多" if rsi >= 50 else "偏空")))
+    macd_label = "資料不足" if pd.isna(dif) or pd.isna(sig) else ("黃金交叉／偏多" if dif > sig else "死亡交叉／偏空")
+    kd_label = "資料不足" if pd.isna(k) or pd.isna(d) else ("K 在 D 上方／偏多" if k > d else "K 在 D 下方／偏空")
+    st.markdown("### 🎯 技術指標快照")
+    c1,c2,c3 = st.columns(3)
+    c1.metric("RSI（14日）", _indicator_value(latest,'RSI14'), rsi_label)
+    c2.metric("MACD 柱狀體", _indicator_value(latest,'MACD_HIST',4), macd_label)
+    c3.metric("KD（K／D）", f"{_indicator_value(latest,'KD_K')}／{_indicator_value(latest,'KD_D')}", kd_label)
+    with st.expander("這些指標怎麼看？", expanded=False):
+        st.markdown("""
+- **RSI**：衡量近期上漲與下跌力道。70 以上代表相對偏熱，30 以下代表相對偏弱；不能單獨當作買賣依據。
+- **MACD**：觀察中短期趨勢與動能。DIF 高於訊號線通常偏多；低於訊號線通常偏空。柱狀體擴大代表目前方向的動能增強。
+- **KD**：觀察短線動能轉折。K 值由下往上穿越 D 值稱為黃金交叉；由上往下穿越稱為死亡交叉。80 以上屬高檔區，20 以下屬低檔區。
+        """)
+
+
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
         s_str = start_date.strftime("%Y-%m-%d")
@@ -2687,8 +2790,10 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     with st.spinner("AI 正在整理技術走勢、籌碼資料與投資建議，請稍候..."):
         df_calc = calculate_indicators(price_df)
         latest = df_calc.iloc[-1]
-        tech_info = f"收盤價:{latest['Close']}, 5MA:{latest['5MA']}, 20MA:{latest['20MA']}, 布林上軌:{latest['BB_Upper']}, 布林下軌:{latest['BB_Lower']}"
-        chip_info = f"三大法人與融資資料長度: {len(chip_df)}天"
+        tech_info = _technical_signal_summary(df_calc)
+        chip_info = f"三大法人資料筆數: {len(chip_df)}；融資融券資料筆數: {len(margin_df)}。若資料為空，請明確標示資料不足，不得推測。"
+        render_technical_indicator_snapshot(df_calc)
+        st.caption("AI 會使用上方 RSI、MACD、KD 的實際數值、交叉方向與均線／布林通道資料一起判斷。")
 
         ai_res, err = call_trading_agents_team(stock_id, stock_name, latest['Close'], tech_info, chip_info)
         if err:

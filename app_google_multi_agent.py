@@ -2860,42 +2860,43 @@ render_market_ticker()
 st.markdown("---")
 
 def _strategy_signal_frame(price_df, strategy_name, chip_df=None, margin_df=None):
+    """V22 backtest signals exactly match the three production strategy definitions."""
     df = calculate_indicators(price_df).copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    for c in ("Open", "High", "Low", "Close", "Trading_Volume", "20MA"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["VolumeLots"] = df.get("Trading_Volume", 0) / 1000
-    df["DayChange"] = np.where(df["Open"] > 0, (df["Close"] / df["Open"] - 1) * 100, np.nan)
-    df["MA20Slope5"] = (df["20MA"] / df["20MA"].shift(5) - 1) * 100
-    if strategy_name == "短線強勢爆發":
-        df["Signal"] = (df["DayChange"] >= 2.0) & (df["VolumeLots"] >= 1500) & (df["Close"] > df["Open"])
-    elif strategy_name == "波段多頭排列":
-        df["Signal"] = (df["VolumeLots"] >= 1000) & df["DayChange"].between(0.5, 3.0) & (df["Close"] >= df["Open"])
+    for c in ("Open","High","Low","Close","Trading_Volume","5MA","10MA","20MA"):
+        if c in df.columns: df[c]=pd.to_numeric(df[c],errors="coerce")
+    df["60MA"]=df["Close"].rolling(60).mean()
+    df["VolumeLots"]=df.get("Trading_Volume",0)/1000
+    df["V20"]=df["VolumeLots"].rolling(20).mean()
+    df["DayChange"]=np.where(df["Open"]>0,(df["Close"]/df["Open"]-1)*100,np.nan)
+    df["MA20Slope5"]=(df["20MA"]/df["20MA"].shift(5)-1)*100
+    df["H20prev"]=df["High"].shift(1).rolling(20).max()
+    k,d=_v22_kd(df["Close"],df["Low"],df["High"]); df["K"]=k; df["D"]=d
+    df["Chip1"]=df["Chip5"]=df["Chip10"]=np.nan
+    if chip_df is not None and not chip_df.empty:
+        c=chip_df.copy(); dc="date" if "date" in c.columns else "Date"; c["Date"]=pd.to_datetime(c[dc],errors="coerce")
+        if "buy" in c.columns and "sell" in c.columns:
+            c["net"]=pd.to_numeric(c["buy"],errors="coerce").fillna(0)-pd.to_numeric(c["sell"],errors="coerce").fillna(0)
+        else: c["net"]=_num_series(c,["buy_sell","net_buy_sell","NetBuySell"]).fillna(0)
+        daily=c.groupby("Date")["net"].sum().sort_index()
+        chip=pd.DataFrame({"Chip1":daily,"Chip5":daily.rolling(5).sum(),"Chip10":daily.rolling(10).sum()})
+        df=df.drop(columns=["Chip1","Chip5","Chip10"]).merge(chip,left_on="Date",right_index=True,how="left")
+    if strategy_name=="強勢突破":
+        df["Signal"]=(df["Close"]>df["H20prev"])&(df["VolumeLots"]>=df["V20"]*1.5)&(df["K"]>df["D"])&(df["K"].shift(1)<=df["D"].shift(1))&(df["5MA"]>df["10MA"])&df["DayChange"].between(2,8)
+    elif strategy_name=="多頭趨勢波段":
+        base=(df["5MA"]>df["10MA"])&(df["10MA"]>df["20MA"])&(df["20MA"]>df["60MA"])&(df["Close"]>df["20MA"])&(df["MA20Slope5"]>0)&(df["V20"]>1000)
+        df["Signal"]=base & ((df["Chip5"]>0) if chip_df is not None and not chip_df.empty else True)
     else:
-        # 飆風向上歷史訊號：價格條件完整；籌碼資料能取得時再疊加 1/5/10 日及融資下降。
-        signal = (df["VolumeLots"] > 1000) & (df["MA20Slope5"] > 1.0)
-        if chip_df is not None and not chip_df.empty:
-            c = chip_df.copy()
-            dc = "date" if "date" in c.columns else "Date"
-            c["Date"] = pd.to_datetime(c[dc], errors="coerce")
-            if "buy" in c.columns and "sell" in c.columns:
-                c["net"] = pd.to_numeric(c["buy"], errors="coerce").fillna(0) - pd.to_numeric(c["sell"], errors="coerce").fillna(0)
-            else:
-                c["net"] = _num_series(c, ["buy_sell", "net_buy_sell", "NetBuySell"]).fillna(0)
-            daily = c.groupby("Date")["net"].sum().sort_index()
-            chip = pd.DataFrame({"Chip1": daily, "Chip5": daily.rolling(5).sum(), "Chip10": daily.rolling(10).sum()})
-            df = df.merge(chip, left_on="Date", right_index=True, how="left")
-            signal &= (df["Chip1"] > 0) & (df["Chip5"] > 0) & (df["Chip10"] > 0)
+        signal=(df["VolumeLots"]>1000)&(df["MA20Slope5"]>1)
+        if chip_df is not None and not chip_df.empty: signal &= (df["Chip1"]>0)&(df["Chip5"]>0)&(df["Chip10"]>0)
         if margin_df is not None and not margin_df.empty:
-            m = margin_df.copy(); dc = "date" if "date" in m.columns else "Date"
-            m["Date"] = pd.to_datetime(m[dc], errors="coerce")
-            bal = _num_series(m, ["MarginPurchaseTodayBalance", "MarginPurchaseBalance", "margin_purchase_today_balance"])
-            m["MarginBalance"] = bal
-            mm = m.groupby("Date")["MarginBalance"].last().sort_index()
-            df = df.merge(mm.rename("MarginBalance"), left_on="Date", right_index=True, how="left")
-            signal &= df["MarginBalance"] < df["MarginBalance"].shift(5)
-        df["Signal"] = signal.fillna(False)
+            m=margin_df.copy(); dc="date" if "date" in m.columns else "Date"; m["Date"]=pd.to_datetime(m[dc],errors="coerce")
+            m["MarginBalance"]=_num_series(m,["MarginPurchaseTodayBalance","MarginPurchaseBalance","margin_purchase_today_balance"])
+            mm=m.groupby("Date")["MarginBalance"].last().sort_index()
+            df=df.merge(mm.rename("MarginBalance"),left_on="Date",right_index=True,how="left")
+            signal &= df["MarginBalance"]<df["MarginBalance"].shift(5)
+        df["Signal"]=signal
+    df["Signal"]=df["Signal"].fillna(False)
     return df.sort_values("Date").reset_index(drop=True)
 
 
@@ -2903,9 +2904,9 @@ def _backtest_strategy_stock(stock_id, strategy_name, start_date, end_date, toke
     price = fetch_stock_history_cached(stock_id, start_date, end_date, token)
     if price.empty:
         return []
-    chip = margin = pd.DataFrame()
+    chip = fetch_chip_history_cached(stock_id, start_date, end_date, token)
+    margin = pd.DataFrame()
     if strategy_name == "飆風向上":
-        chip = fetch_chip_history_cached(stock_id, start_date, end_date, token)
         margin = fetch_margin_history_cached(stock_id, start_date, end_date, token)
     df = _strategy_signal_frame(price, strategy_name, chip, margin)
     trades, i = [], 0
@@ -2989,6 +2990,167 @@ def render_market_strategy_backtest(table, strategy_name, meta):
 
 
 # -----------------------------------------------------------------------------
+# V22 三策略引擎、策略卡片與管理員績效比較
+# -----------------------------------------------------------------------------
+V22_STRATEGIES = {
+    "⚡ 飆風向上－籌碼布局型（→ 主力正在布局）": {
+        "code": "飆風向上", "summary": "觀察法人、融資與持股集中情況，尋找可能正在被布局的股票。",
+        "holding": "10～30 個交易日", "market": "多頭初升段",
+        "conditions": ["成交量大於 1,000 張", "20 日均線近 5 日上升超過 1%", "主力近 1／5／10 日買超皆為正", "近期主力買超強度增加", "融資餘額下降", "集保總戶數下降"],
+        "weights": ["月線上升幅度 40%", "主力近 5 日買超 25%", "主力近 10 日買超 20%", "成交量 15%"],
+    },
+    "🚀 強勢突破－技術突破型（→ 剛剛發動）": {
+        "code": "強勢突破", "summary": "尋找剛突破整理區，成交量同步放大且短線動能轉強的股票。",
+        "holding": "3～10 個交易日", "market": "盤整後突破",
+        "conditions": ["最新價格突破前 20 日最高價", "成交量大於 20 日平均量 1.5 倍", "KD 黃金交叉", "5 日均線高於 10 日均線", "當日漲幅介於 2% 至 8%"],
+        "weights": ["突破 20 日高點 35%", "成交量放大 25%", "KD 黃金交叉 20%", "法人買超 20%"],
+    },
+    "📈 多頭趨勢波段－波段續漲型（→ 趨勢已形成）": {
+        "code": "多頭趨勢波段", "summary": "尋找均線已呈多頭排列，且趨勢仍持續向上的股票。",
+        "holding": "20～60 個交易日", "market": "主升段趨勢",
+        "conditions": ["5 日均線 > 10 日均線 > 20 日均線 > 60 日均線", "最新價格高於 20 日均線", "20 日均線持續向上", "近 5 日法人合計買超", "20 日平均成交量大於 1,000 張"],
+        "weights": ["均線排列完整度 40%", "月線上升幅度 25%", "法人買超 20%", "平均成交量 15%"],
+    },
+}
+
+
+def v22_market_mode():
+    now = taipei_now()
+    if is_twse_trading_day(now.date()) and (now.hour < 13 or (now.hour == 13 and now.minute < 45)):
+        return "盤中", "使用目前可取得的最新價格計算，數值仍可能變動。"
+    return "盤後", "使用最近完整交易日資料計算。"
+
+
+def render_v22_strategy_intro(strategy_display):
+    cfg = V22_STRATEGIES[strategy_display]
+    st.info(f"**{strategy_display}**\n\n{cfg['summary']}")
+    with st.expander("📖 顯示完整策略", expanded=False):
+        st.markdown(f"**適合持有時間：** {cfg['holding']}  \n**適合行情：** {cfg['market']}")
+        st.markdown("**篩選條件**")
+        for item in cfg["conditions"]:
+            st.markdown(f"- {item}")
+        st.markdown("**綜合分數權重**")
+        for item in cfg["weights"]:
+            st.markdown(f"- {item}")
+
+
+def _v22_kd(close, low, high, period=9):
+    ll = low.rolling(period).min(); hh = high.rolling(period).max()
+    rsv = ((close-ll)/(hh-ll).replace(0,np.nan)*100).fillna(50)
+    k = rsv.ewm(alpha=1/3, adjust=False).mean(); d = k.ewm(alpha=1/3, adjust=False).mean()
+    return k, d
+
+
+def _v22_price_features(stock_id, market_row, token, start_str, end_str):
+    price = fetch_stock_history_cached(stock_id, start_str, end_str, token)
+    if price.empty or len(price) < 70: return None
+    d = _normalize_price_df(price).copy()
+    close=d['close']; high=d['max']; low=d['min']; vol=d['Trading_Volume']/1000
+    for n in (5,10,20,60): d[f'MA{n}']=close.rolling(n).mean()
+    d['V20']=vol.rolling(20).mean(); d['H20prev']=high.shift(1).rolling(20).max()
+    d['Slope20_5']=(d['MA20']/d['MA20'].shift(5)-1)*100
+    k,dd=_v22_kd(close,low,high); d['K']=k; d['D']=dd
+    x=d.iloc[-1]; prev=d.iloc[-2]
+    item=dict(market_row)
+    item.update({"MA5":x.MA5,"MA10":x.MA10,"MA20":x.MA20,"MA60":x.MA60,"月線斜率(%)":x.Slope20_5,
+                 "20日均量(張)":x.V20,"量能倍數":(vol.iloc[-1]/x.V20 if x.V20 else np.nan),
+                 "突破20日高點":bool(x.close>x.H20prev),"KD黃金交叉":bool(x.K>x.D and prev.K<=prev.D),
+                 "最新價格":x.close,"K值":x.K,"D值":x.D})
+    return item
+
+
+def _v22_add_chip(item, token, start_str, end_str):
+    c=fetch_chip_history_cached(item['股票代碼'],start_str,end_str,token)
+    if c.empty: item.update({"法人1日":0.0,"法人5日":0.0,"法人10日":0.0}); return item
+    c=c.copy(); dc='date' if 'date' in c.columns else 'Date'
+    if 'buy' in c.columns and 'sell' in c.columns:
+        c['net']=pd.to_numeric(c['buy'],errors='coerce').fillna(0)-pd.to_numeric(c['sell'],errors='coerce').fillna(0)
+    else: c['net']=_num_series(c,['buy_sell','net_buy_sell','NetBuySell']).fillna(0)
+    daily=c.groupby(dc)['net'].sum().sort_index()
+    item.update({"法人1日":daily.tail(1).sum(),"法人5日":daily.tail(5).sum(),"法人10日":daily.tail(10).sum()})
+    return item
+
+
+def _v22_score(df, code):
+    if df.empty: return df
+    out=df.copy()
+    if code=='強勢突破':
+        breakout=np.where(out['突破20日高點'],100,0); kd=np.where(out['KD黃金交叉'],100,0)
+        out['綜合分數']=(breakout*.35+_percentile_score(out['量能倍數'])*.25+kd*.20+_percentile_score(out['法人5日'])*.20).round(1)
+        out['選股依據']=out.apply(lambda r:f"突破20日高點；量能 {r['量能倍數']:.1f} 倍；KD黃金交叉；法人5日 {r['法人5日']/1000:,.0f} 張",axis=1)
+    elif code=='多頭趨勢波段':
+        arrange=np.where((out.MA5>out.MA10)&(out.MA10>out.MA20)&(out.MA20>out.MA60),100,0)
+        out['綜合分數']=(arrange*.40+_percentile_score(out['月線斜率(%)'])*.25+_percentile_score(out['法人5日'])*.20+_percentile_score(out['20日均量(張)'])*.15).round(1)
+        out['選股依據']=out.apply(lambda r:f"均線多頭排列；月線上升 {r['月線斜率(%)']:.2f}%；法人5日 {r['法人5日']/1000:,.0f} 張；均量 {r['20日均量(張)']:,.0f} 張",axis=1)
+    else: return add_strategy_composite_score(out,'飆風向上')
+    out=out.sort_values(['綜合分數','成交量(張)'],ascending=False).reset_index(drop=True); out['策略排名']=np.arange(1,len(out)+1)
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def run_market_screener_v22(stock_dict, strategy_display):
+    code=V22_STRATEGIES[strategy_display]['code']
+    if code=='飆風向上': return run_market_screener(stock_dict,'飆風向上')
+    try:
+        rows=requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',timeout=(3,12),headers={'User-Agent':'Mozilla/5.0'}).json()
+    except Exception as exc:
+        x=pd.DataFrame(); x.attrs['scan_status']={'ok':False,'message':f'證交所行情取得失敗：{exc}'}; return x
+    base=[]
+    for r in rows:
+        sid=str(r.get('Code','')).strip()
+        if sid not in stock_dict or len(sid)!=4 or not sid.isdigit(): continue
+        close=as_number(r.get('ClosingPrice')) or 0; open_=as_number(r.get('OpeningPrice')) or close; volume=int((as_number(r.get('TradeVolume')) or 0)/1000)
+        if volume<800 or open_<=0: continue
+        base.append({'股票代碼':sid,'股票名稱':stock_dict[sid],'今日收盤':close,'漲幅(%)':round((close/open_-1)*100,2),'成交量(張)':volume})
+    base=sorted(base,key=lambda x:x['成交量(張)'],reverse=True)[:60]
+    token=get_secret('FINMIND_TOKEN',''); end=taipei_now().date(); start=(end-timedelta(days=180)).strftime('%Y-%m-%d'); end_s=end.strftime('%Y-%m-%d')
+    items,_=_bounded_parallel(base,lambda x:_v22_price_features(x['股票代碼'],x,token,start,end_s),8,45); items=[x for x in items if x]
+    if code=='強勢突破':
+        items=[x for x in items if x['突破20日高點'] and x['量能倍數']>=1.5 and x['KD黃金交叉'] and x['MA5']>x['MA10'] and 2<=x['漲幅(%)']<=8]
+    else:
+        items=[x for x in items if x['MA5']>x['MA10']>x['MA20']>x['MA60'] and x['最新價格']>x['MA20'] and x['月線斜率(%)']>0 and x['20日均量(張)']>1000]
+    items=items[:25]
+    chip_start=(end-timedelta(days=35)).strftime('%Y-%m-%d')
+    enriched,_=_bounded_parallel(items,lambda x:_v22_add_chip(x,token,chip_start,end_s),4,25)
+    if code=='多頭趨勢波段': enriched=[x for x in enriched if x['法人5日']>0]
+    result=_v22_score(pd.DataFrame(enriched),code).head(30) if enriched else pd.DataFrame()
+    result.attrs['scan_status']={'ok':True,'message':f'{strategy_display}掃描完成，共選出 {len(result)} 檔。','counts':{'初步候選':len(base),'符合策略':len(result)}}
+    return result
+
+
+def render_admin_strategy_compare(df_candidates):
+    with st.expander('🔒 策略績效比較（管理員）',expanded=False):
+        expected=get_secret('STRATEGY_ADMIN_PASSWORD','')
+        password=st.text_input('管理員密碼',type='password',key='strategy_admin_password')
+        if not expected:
+            st.warning('尚未設定 STRATEGY_ADMIN_PASSWORD。')
+            return
+        if password!=expected:
+            if password: st.error('密碼不正確。')
+            return
+        st.success('管理員驗證成功。')
+        if st.button('📊 比較三個策略',use_container_width=True,key='run_admin_compare'):
+            rows=[]; token=get_secret('FINMIND_TOKEN','')
+            pool=df_candidates if df_candidates is not None and not df_candidates.empty else pd.DataFrame()
+            for display,cfg in V22_STRATEGIES.items():
+                table,meta=run_market_strategy_backtest(pool,cfg['code'],token)
+                if table is None or table.empty: continue
+                t=table.copy(); t['策略']=display; rows.append(t)
+            st.session_state['admin_strategy_compare']=pd.concat(rows,ignore_index=True) if rows else pd.DataFrame()
+        comp=st.session_state.get('admin_strategy_compare',pd.DataFrame())
+        if comp is None or comp.empty: return
+        # Ranking by 20-day row; percentile normalization prevents scale domination.
+        rank=comp[comp['持有區間'].eq('20天')].copy()
+        if rank.empty: rank=comp.groupby('策略',as_index=False).first()
+        rank['綜合評分']=(_percentile_score(rank['勝率'])*.40+_percentile_score(rank['平均每次漲跌'])*.30+_percentile_score(rank['總賺錢／總賠錢'])*.20+_percentile_score(rank['最大下跌幅度'])*.10).round(1)
+        rank=rank.sort_values('綜合評分',ascending=False); rank['排名']=np.arange(1,len(rank)+1)
+        st.markdown('#### 🏆 綜合排行榜')
+        render_mobile_friendly_table(rank[['排名','策略','綜合評分','勝率','平均每次漲跌','最大下跌幅度']],mobile_columns=['排名','策略','綜合評分','勝率','平均每次漲跌','最大下跌幅度'],key_prefix='admin-rank')
+        st.markdown('#### 完整比較')
+        render_mobile_friendly_table(comp,mobile_columns=['策略','持有區間','勝率','平均每次漲跌','最大下跌幅度','總賺錢／總賠錢'],key_prefix='admin-compare')
+
+
+# -----------------------------------------------------------------------------
 # 10. 主頁面模式邏輯
 # -----------------------------------------------------------------------------
 if app_mode == "全市場選股":
@@ -2996,34 +3158,31 @@ if app_mode == "全市場選股":
     st.caption("切換功能後，上一個功能的掃描、歷史測試與個股分析結果會自動畫面清除。")
     strategy_choice = st.radio(
         "選擇選股方式：",
-        ["飆風向上", "短線強勢爆發", "波段多頭排列"],
-        horizontal=True,
-        key="market_screener_strategy",
+        list(V22_STRATEGIES.keys()),
+        horizontal=False,
+        key="market_screener_strategy_v22",
         on_change=clear_strategy_results,
     )
-
-    if strategy_choice == "飆風向上":
-        st.info("📌 **飆風向上**：沿用目前的快速三階段策略。先篩成交量大於 1,000 張，再優先驗證月線近 5 個交易日斜率 > 1%；接著檢查主力 1／5／10 日皆為正、近期主力大買與融資下降；最後驗證集保戶數下降。")
-    elif strategy_choice == "短線強勢爆發":
-        st.info("📌 **短線強勢爆發**：恢復先前版本條件，當日漲幅至少 2%、成交量至少 1,500 張，且收盤價高於開盤價；依漲幅由高至低顯示前 30 檔。")
-    else:
-        st.info("📌 **波段多頭排列**：維持目前條件不變，成交量至少 1,000 張、當日漲幅介於 0.5% 至 3%，且收盤價不低於開盤價；依成交量由高至低顯示前 30 檔。")
+    mode_name, mode_desc = v22_market_mode()
+    st.markdown(f"**{'🟡' if mode_name == '盤中' else '🟢'} {mode_name}模式**")
+    st.caption(mode_desc)
+    render_v22_strategy_intro(strategy_choice)
 
     if st.button("🚀 開始連線證交所全市場掃描", use_container_width=True):
         st.session_state["screener_running"] = True
         st.session_state.pop("screener_res", None)
         st.session_state.pop("screener_status", None)
         # A manual click always means a fresh scan; do not instantly reuse a cached empty result.
-        run_market_screener.clear()
+        run_market_screener_v22.clear()
         progress = st.progress(5, text="取得證交所全市場行情並建立候選池...")
         try:
-            if strategy_choice == "飆風向上":
+            if V22_STRATEGIES[strategy_choice]["code"] == "飆風向上":
                 progress.progress(20, text="飆風向上：優先檢查成交量前 40 檔的月線斜率 > 1%...")
-            elif strategy_choice == "短線強勢爆發":
+            elif V22_STRATEGIES[strategy_choice]["code"] == "強勢突破":
                 progress.progress(40, text="短線強勢爆發：檢查漲幅、成交量與紅 K 條件...")
             else:
                 progress.progress(40, text="波段多頭排列：檢查成交量、漲幅區間與紅 K 條件...")
-            result = run_market_screener(STOCK_DICT, strategy_choice)
+            result = run_market_screener_v22(STOCK_DICT, strategy_choice)
             progress.progress(100, text="掃描完成")
             st.session_state["screener_res"] = result
             st.session_state["screener_status"] = result.attrs.get("scan_status", {"ok": True, "message": "掃描完成"})
@@ -3062,7 +3221,7 @@ if app_mode == "全市場選股":
             key_prefix=f"scan-result-{strategy_choice}")
 
         top10 = df_res.sort_values("綜合分數", ascending=False).head(10) if "綜合分數" in df_res.columns else df_res.head(10)
-        st.markdown("### 🏅 回測採用前十檔與選股依據")
+        st.markdown("### 🏅 歷史測試採用前十檔與選股依據")
         st.caption("前十檔依本策略綜合分數由高至低選取。綜合分數採當次候選池內百分位排名，因此是相對強度分數，不是預測報酬率。")
         top10_cols = [c for c in ["策略排名", "股票代碼", "股票名稱", "綜合分數", "選股依據"] if c in top10.columns]
         render_mobile_friendly_table(
@@ -3082,12 +3241,14 @@ if app_mode == "全市場選股":
         st.caption("使用本次選出的股票，依綜合分數取前 10 檔，查看相同選股條件在過去一年出現時的表現。")
         if st.button(f"查看「{strategy_choice}」歷史表現", key=f"run_strategy_bt_{strategy_choice}", use_container_width=True):
             with st.spinner(f"正在整理「{strategy_choice}」的歷史表現，請稍候..."):
-                bt_table, bt_meta = run_market_strategy_backtest(df_res, strategy_choice, get_secret("FINMIND_TOKEN", ""))
+                bt_table, bt_meta = run_market_strategy_backtest(df_res, V22_STRATEGIES[strategy_choice]["code"], get_secret("FINMIND_TOKEN", ""))
                 st.session_state["market_strategy_bt"] = {"strategy": strategy_choice, "table": bt_table, "meta": bt_meta}
         saved_bt = st.session_state.get("market_strategy_bt")
         if saved_bt and saved_bt.get("strategy") == strategy_choice:
             render_market_strategy_backtest(saved_bt.get("table"), strategy_choice, saved_bt.get("meta", {}))
         
+        render_admin_strategy_compare(df_res)
+
         st.markdown("### 🎯 分析選出的股票")
         options = [f"{row['股票代碼']} {row['股票名稱']}" for idx, row in df_res.iterrows()]
         sel = st.selectbox("📌 請選擇一檔股票：", options, key="screener_diagnosis_stock", on_change=clear_current_analysis)

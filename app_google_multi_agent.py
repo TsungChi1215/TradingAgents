@@ -20,6 +20,7 @@ import math
 import inspect
 import html
 import sqlite3
+import xml.etree.ElementTree
 
 # -----------------------------------------------------------------------------
 # 1. 系統設定與金鑰解析
@@ -3198,13 +3199,19 @@ def fetch_financial_news(limit=5):
     rows=[];errors=[]
     for source,url in [("Google News","https://news.google.com/rss/search?q=%E5%8F%B0%E8%82%A1%20OR%20%E5%8F%B0%E7%81%A3%E8%82%A1%E5%B8%82%20when%3A1d&hl=zh-TW&gl=TW&ceid=TW%3Azh-Hant"),("Yahoo 股市","https://tw.stock.yahoo.com/rss?category=tw-market")]:
         try:
-            r=requests.get(url,headers={"User-Agent":"Mozilla/5.0","Accept":"application/rss+xml,application/xml,text/xml"},timeout=(3,10));r.raise_for_status();root=ET.fromstring(r.content)
+            r=requests.get(url,headers={"User-Agent":"Mozilla/5.0","Accept":"application/rss+xml,application/xml,text/xml"},timeout=(3,10));r.raise_for_status();root=xml.etree.ElementTree.fromstring(r.content)
             for item in root.findall(".//item"):
                 title=html.unescape(item.findtext("title") or "").strip();link=(item.findtext("link") or "").strip()
                 if title and link and not any(x["title"]==title for x in rows):rows.append({"title":title,"link":link,"source":source})
                 if len(rows)>=limit:break
             if len(rows)>=limit:break
-        except Exception as exc:errors.append(f"{source}: {type(exc).__name__}: {exc}")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 429:
+                errors.append(f"{source}: 新聞來源限制查詢頻率（HTTP 429），請稍後再試")
+            else:
+                errors.append(f"{source}: HTTP {exc.response.status_code if exc.response is not None else '--'}，{exc}")
+        except Exception as exc:
+            errors.append(f"{source}: {type(exc).__name__}: {exc}")
     return rows[:limit],errors
 
 def render_financial_news():

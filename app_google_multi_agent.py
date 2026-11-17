@@ -1587,26 +1587,44 @@ def _display_date(value):
         return str(value).replace("-", "/")
 
 
+def _trend_html(current, previous, digits=2, suffix=""):
+    """Taiwan-market convention: up red, down green. Returns colored arrow + change."""
+    try:
+        current, previous = float(current), float(previous)
+        if not np.isfinite(current) or not np.isfinite(previous): return ""
+        diff = current - previous
+        if abs(diff) < 10 ** (-(digits + 1)):
+            return " <span style='color:#FFFFFF'>→ 持平</span>"
+        color, arrow = (C_UP, "↑") if diff > 0 else (C_DOWN, "↓")
+        return f" <span style='color:{color}'><b>{arrow}</b> {diff:+,.{digits}f}{suffix}</span>"
+    except Exception:
+        return ""
+
+
+def _trend_text(current, previous, digits=2):
+    """Plain text trend for Plotly unified hover."""
+    try:
+        current, previous = float(current), float(previous)
+        if not np.isfinite(current) or not np.isfinite(previous): return ""
+        diff=current-previous
+        if abs(diff) < 10 ** (-(digits+1)): return "→"
+        return "↑" if diff>0 else "↓"
+    except Exception: return ""
+
+
 def _kline_hover_texts(df_view):
-    """Compact tooltip: short lines prevent mobile clipping at the left/right edge."""
-    texts = []
-    closes = df_view["Close"].tolist()
-    for i, r in enumerate(df_view.itertuples(index=False)):
-        prev = closes[i - 1] if i > 0 else None
-        if prev:
-            chg = r.Close - prev
-            pct = chg / prev * 100
-            col = C_UP if chg > 0 else (C_DOWN if chg < 0 else "#FFFFFF")
-            chg_txt = f"<span style='color:{col}'>{chg:+.2f} ({pct:+.2f}%)</span>"
-        else:
-            col = C_UP if r.Close >= r.Open else C_DOWN
-            chg_txt = "--"
-        texts.append(
-            f"<b>{_display_date(r.Date)}</b><br>"
-            f"收 <span style='color:{col}'><b>{r.Close:,.2f}</b></span>　{chg_txt}<br>"
-            f"開 {r.Open:,.2f}　高 {r.High:,.2f}<br>"
-            f"低 {r.Low:,.2f}　量 {r.Volume_張:,.0f}張"
-        )
+    """Compact tooltip with red-up/green-down arrows for phone screens."""
+    texts=[]
+    for i,r in enumerate(df_view.itertuples(index=False)):
+        prev=df_view.iloc[i-1] if i>0 else None
+        close_trend=_trend_html(r.Close, prev["Close"], 2) if prev is not None else ""
+        vol_trend=_trend_html(r.Volume_張, prev["Volume_張"], 0, "張") if prev is not None else ""
+        col=C_UP if (prev is not None and r.Close>prev["Close"]) else (C_DOWN if prev is not None and r.Close<prev["Close"] else "#FFFFFF")
+        text=(f"<b>{_display_date(r.Date)}</b><br>"
+              f"收 <span style='color:{col}'><b>{r.Close:,.2f}</b></span>{close_trend}<br>"
+              f"開 {r.Open:,.2f}　高 {r.High:,.2f}<br>"
+              f"低 {r.Low:,.2f}　量 {r.Volume_張:,.0f}張{vol_trend}")
+        texts.append(text)
     return texts
 
 
@@ -1627,7 +1645,8 @@ def plot_main_kline_chart(df_view, show_bb=True):
                            ("BB_Upper", "布林上軌"), ("BB_Lower", "布林下軌")):
             v = df_view[col].iloc[i]
             if pd.notna(v):
-                parts.append(f"{label} {v:,.2f}")
+                prev_v = df_view[col].iloc[i - 1] if i > 0 else np.nan
+                parts.append(f"{label} {v:,.2f}{_trend_html(v, prev_v, 2)}")
         if parts:
             # Two short rows are safer than one long row on narrow phone screens.
             hover_texts[i] += "<br>" + "　".join(parts[:2])
@@ -1714,61 +1733,52 @@ def _chip_series(chip_df, dates):
     return out
 
 def plot_technical_indicator_charts(df_view):
-    """RSI crossover, MACD, KD and OBV in four stacked mobile-friendly panels."""
-    if df_view is None or df_view.empty:
-        return _empty_fig("尚無技術指標資料")
-    required = ["Date","RSI6","RSI12","MACD_DIF","MACD_SIGNAL","MACD_HIST","KD_K","KD_D","OBV","OBV_MA20"]
-    if any(c not in df_view.columns for c in required):
-        return _empty_fig("技術指標資料不足")
+    """RSI, MACD, KD and OBV with directional arrows in every tooltip."""
+    if df_view is None or df_view.empty: return _empty_fig("尚無技術指標資料")
+    required=["Date","RSI6","RSI12","MACD_DIF","MACD_SIGNAL","MACD_HIST","KD_K","KD_D","OBV","OBV_MA20"]
+    if any(c not in df_view.columns for c in required): return _empty_fig("技術指標資料不足")
     d=df_view.copy(); dates=d["Date"].tolist()
-    fig=make_subplots(rows=4,cols=1,shared_xaxes=True,vertical_spacing=0.052,
-                      row_heights=[0.24,0.28,0.23,0.25],
+    fig=make_subplots(rows=4,cols=1,shared_xaxes=True,vertical_spacing=.052,row_heights=[.24,.28,.23,.25],
                       subplot_titles=["RSI（6日／12日）","MACD（12、26、9）","KD（9、3、3）","OBV 能量潮"])
-
-    # RSI6 / RSI12 allows golden/death crossover reading.
-    fig.add_trace(go.Scatter(x=dates,y=d["RSI6"],mode="lines",name="RSI6",
-                             line=dict(color="#FFD54F",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>RSI6 %{y:.2f}<extra></extra>"),row=1,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["RSI12"],mode="lines",name="RSI12",
-                             line=dict(color="#42A5F5",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>RSI12 %{y:.2f}<extra></extra>"),row=1,col=1)
-    for y,color in ((70,C_UP),(50,"#90A4AE"),(30,C_DOWN)):
-        fig.add_hline(y=y,line_dash="dot",line_color=color,opacity=.65,row=1,col=1)
+    def hovers(cols,digits):
+        out=[]
+        for i in range(len(d)):
+            lines=[f"<b>{_display_date(dates[i])}</b>"]
+            for col,label in cols:
+                v=d[col].iloc[i]; pv=d[col].iloc[i-1] if i>0 else np.nan
+                val="--" if pd.isna(v) else f"{v:,.{digits}f}"
+                lines.append(f"{label} {val}{_trend_html(v,pv,digits)}")
+            out.append("<br>".join(lines))
+        return out
+    rsi_h=hovers([("RSI6","RSI6"),("RSI12","RSI12")],2)
+    for col,name,color in (("RSI6","RSI6","#FFD54F"),("RSI12","RSI12","#42A5F5")):
+        fig.add_trace(go.Scatter(x=dates,y=d[col],mode="lines",name=name,line=dict(color=color,width=2),hoverinfo="skip"),row=1,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["RSI6"],mode="markers",marker=dict(size=14,opacity=0),showlegend=False,hovertext=rsi_h,hovertemplate="%{hovertext}<extra></extra>"),row=1,col=1)
+    for y,color in ((70,C_UP),(50,"#90A4AE"),(30,C_DOWN)): fig.add_hline(y=y,line_dash="dot",line_color=color,opacity=.65,row=1,col=1)
     fig.update_yaxes(range=[0,100],dtick=20,row=1,col=1)
-
+    macd_h=hovers([("MACD_DIF","DIF"),("MACD_SIGNAL","訊號線"),("MACD_HIST","柱狀體")],4)
     hist=pd.to_numeric(d["MACD_HIST"],errors="coerce")
-    hist_colors=[C_UP if pd.notna(v) and v>=0 else C_DOWN for v in hist]
-    fig.add_trace(go.Bar(x=dates,y=hist,name="MACD柱",marker_color=hist_colors,marker_line_width=0,
-                         hovertemplate="<b>%{x|%Y/%m/%d}</b><br>MACD柱 %{y:.4f}<extra></extra>"),row=2,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["MACD_DIF"],mode="lines",name="DIF",line=dict(color="#42A5F5",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>DIF %{y:.4f}<extra></extra>"),row=2,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["MACD_SIGNAL"],mode="lines",name="訊號線",line=dict(color="#FFB74D",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>訊號線 %{y:.4f}<extra></extra>"),row=2,col=1)
+    fig.add_trace(go.Bar(x=dates,y=hist,name="MACD柱",marker_color=[C_UP if pd.notna(v) and v>=0 else C_DOWN for v in hist],marker_line_width=0,hoverinfo="skip"),row=2,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["MACD_DIF"],mode="lines",name="DIF",line=dict(color="#42A5F5",width=2),hoverinfo="skip"),row=2,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["MACD_SIGNAL"],mode="lines",name="訊號線",line=dict(color="#FFB74D",width=2),hoverinfo="skip"),row=2,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["MACD_DIF"],mode="markers",marker=dict(size=14,opacity=0),showlegend=False,hovertext=macd_h,hovertemplate="%{hovertext}<extra></extra>"),row=2,col=1)
     fig.add_hline(y=0,line_color="#78909C",opacity=.7,row=2,col=1)
-
-    fig.add_trace(go.Scatter(x=dates,y=d["KD_K"],mode="lines",name="K",line=dict(color="#EC407A",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>K %{y:.2f}<extra></extra>"),row=3,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["KD_D"],mode="lines",name="D",line=dict(color="#26C6DA",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>D %{y:.2f}<extra></extra>"),row=3,col=1)
-    fig.add_hline(y=80,line_dash="dot",line_color=C_UP,opacity=.65,row=3,col=1)
-    fig.add_hline(y=20,line_dash="dot",line_color=C_DOWN,opacity=.65,row=3,col=1)
+    kd_h=hovers([("KD_K","K"),("KD_D","D")],2)
+    for col,name,color in (("KD_K","K","#EC407A"),("KD_D","D","#26C6DA")):
+        fig.add_trace(go.Scatter(x=dates,y=d[col],mode="lines",name=name,line=dict(color=color,width=2),hoverinfo="skip"),row=3,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["KD_K"],mode="markers",marker=dict(size=14,opacity=0),showlegend=False,hovertext=kd_h,hovertemplate="%{hovertext}<extra></extra>"),row=3,col=1)
+    fig.add_hline(y=80,line_dash="dot",line_color=C_UP,opacity=.65,row=3,col=1); fig.add_hline(y=20,line_dash="dot",line_color=C_DOWN,opacity=.65,row=3,col=1)
     fig.update_yaxes(range=[0,100],dtick=20,row=3,col=1)
-
-    fig.add_trace(go.Scatter(x=dates,y=d["OBV"],mode="lines",name="OBV",line=dict(color="#AB47BC",width=2),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>OBV %{y:,.0f}<extra></extra>"),row=4,col=1)
-    fig.add_trace(go.Scatter(x=dates,y=d["OBV_MA20"],mode="lines",name="OBV 20日均線",
-                             line=dict(color="#66BB6A",width=2,dash="dot"),
-                             hovertemplate="<b>%{x|%Y/%m/%d}</b><br>OBV20均線 %{y:,.0f}<extra></extra>"),row=4,col=1)
+    obv_h=hovers([("OBV","OBV"),("OBV_MA20","OBV20均線")],0)
+    fig.add_trace(go.Scatter(x=dates,y=d["OBV"],mode="lines",name="OBV",line=dict(color="#AB47BC",width=2),hoverinfo="skip"),row=4,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["OBV_MA20"],mode="lines",name="OBV 20日均線",line=dict(color="#66BB6A",width=2,dash="dot"),hoverinfo="skip"),row=4,col=1)
+    fig.add_trace(go.Scatter(x=dates,y=d["OBV"],mode="markers",marker=dict(size=14,opacity=0),showlegend=False,hovertext=obv_h,hovertemplate="%{hovertext}<extra></extra>"),row=4,col=1)
     fig.update_yaxes(tickformat="~s",row=4,col=1)
-
     _base_layout(fig,dates,height=880,top_margin=82)
-    fig.update_layout(hovermode="x unified",
-                      legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0,font=dict(size=9),itemwidth=30),
-                      hoverlabel=dict(font_size=10,bgcolor="#1B2130",bordercolor="#3A4258",align="left",namelength=-1),
-                      margin=dict(l=38,r=10,t=82,b=34))
+    fig.update_layout(hovermode="closest",legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0,font=dict(size=9),itemwidth=30),
+                      hoverlabel=dict(font=dict(size=10,color="#FFFFFF"),bgcolor="#1B2130",bordercolor="#3A4258",align="left",namelength=-1),margin=dict(l=38,r=10,t=82,b=34))
     fig.update_xaxes(showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,spikedash="dot",spikecolor="#9AA4B5")
-    _style_subplot_titles(fig)
-    return fig
+    _style_subplot_titles(fig); return fig
 
 
 def plot_chip_chart(chip_df, dates):
@@ -1814,7 +1824,7 @@ def plot_chip_chart(chip_df, dates):
     _style_subplot_titles(fig)
     fig.update_layout(
         hovermode="closest",
-        hoverlabel=dict(font_size=11, bgcolor="#1B2130", bordercolor="#3A4258", align="left", namelength=-1),
+        hoverlabel=dict(font=dict(size=11, color="#FFFFFF"), bgcolor="#1B2130", bordercolor="#3A4258", align="left", namelength=-1),
     )
     fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
                      spikethickness=1, spikedash="dot", spikecolor="#9AA4B5")
@@ -2747,6 +2757,59 @@ def render_technical_indicator_snapshot(df_calc):
         """)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_intraday_stock(stock_id, token=""):
+    """Fetch today's 5-minute path. Yahoo first for a full curve; FinMind snapshot supplements latest fields."""
+    errors=[]
+    for suffix in ("TW","TWO"):
+        symbol=f"{stock_id}.{suffix}"
+        try:
+            url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            r=requests.get(url,params={"interval":"5m","range":"1d"},headers={"User-Agent":"Mozilla/5.0"},timeout=(3,10)); r.raise_for_status()
+            result=(r.json().get("chart",{}).get("result") or [None])[0]
+            if result and result.get("timestamp"):
+                q=result.get("indicators",{}).get("quote",[{}])[0]
+                df=pd.DataFrame({"DateTime":pd.to_datetime(result["timestamp"],unit="s",utc=True).tz_convert("Asia/Taipei"),
+                                 "Open":q.get("open"),"High":q.get("high"),"Low":q.get("low"),"Close":q.get("close"),"Volume":q.get("volume")})
+                df=df.dropna(subset=["Close"]).copy(); df=df[(df["DateTime"].dt.hour*60+df["DateTime"].dt.minute).between(9*60,13*60+35)]
+                if not df.empty:
+                    df["AveragePrice"]=(pd.to_numeric(df["Close"],errors="coerce")*pd.to_numeric(df["Volume"],errors="coerce").fillna(0)).cumsum()/pd.to_numeric(df["Volume"],errors="coerce").fillna(0).cumsum().replace(0,np.nan)
+                    df.attrs.update({"source":f"Yahoo Finance {symbol}","updated_at":df["DateTime"].iloc[-1].strftime("%Y-%m-%d %H:%M:%S")})
+                    return df
+        except Exception as exc: errors.append(f"Yahoo {symbol}: {exc}")
+    failed=pd.DataFrame(); failed.attrs["errors"]=errors; return failed
+
+
+def merge_intraday_into_daily(price_df, intraday_df, requested_end):
+    """Append/replace today's provisional daily bar so every indicator includes today's path before close."""
+    if price_df is None or price_df.empty or intraday_df is None or intraday_df.empty: return price_df
+    today=taipei_now().date()
+    if pd.Timestamp(requested_end).date()!=today or not is_twse_trading_day(today): return price_df
+    d=intraday_df.copy(); day=d["DateTime"].dt.date
+    d=d[day==today]
+    if d.empty: return price_df
+    row={"date":pd.Timestamp(today),"open":float(d["Open"].dropna().iloc[0]) if d["Open"].notna().any() else float(d["Close"].iloc[0]),
+         "max":float(d["High"].max()),"min":float(d["Low"].min()),"close":float(d["Close"].iloc[-1]),"Trading_Volume":float(d["Volume"].fillna(0).sum())}
+    attrs=dict(price_df.attrs); merged=_normalize_price_df(pd.concat([price_df,pd.DataFrame([row])],ignore_index=True)); merged.attrs.update(attrs)
+    merged.attrs.update({"intraday_provisional":True,"intraday_updated_at":intraday_df.attrs.get("updated_at"),"intraday_source":intraday_df.attrs.get("source")})
+    return merged
+
+
+def plot_intraday_wave(intraday_df):
+    if intraday_df is None or intraday_df.empty: return _empty_fig("目前沒有當日走勢資料")
+    d=intraday_df.copy(); x=d["DateTime"]
+    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.76,.24],vertical_spacing=.04)
+    prev_close=d.attrs.get("previous_close")
+    fig.add_trace(go.Scatter(x=x,y=d["Close"],mode="lines",name="最新價",line=dict(color="#FF5252",width=2),fill="tozeroy",fillcolor="rgba(255,82,82,.08)"),row=1,col=1)
+    fig.add_trace(go.Scatter(x=x,y=d["AveragePrice"],mode="lines",name="當日均價",line=dict(color="#FFD54F",width=1.7,dash="dot")),row=1,col=1)
+    colors=[C_UP if i==0 or d["Close"].iloc[i]>=d["Close"].iloc[i-1] else C_DOWN for i in range(len(d))]
+    fig.add_trace(go.Bar(x=x,y=pd.to_numeric(d["Volume"],errors="coerce").fillna(0)/1000,name="成交量(張)",marker_color=colors,showlegend=False),row=2,col=1)
+    if prev_close: fig.add_hline(y=prev_close,line_dash="dot",line_color="#90A4AE",row=1,col=1)
+    fig.update_layout(template="plotly_dark",height=470,margin=dict(l=46,r=12,t=52,b=34),paper_bgcolor=C_BG,plot_bgcolor=C_BG,
+                      hovermode="x unified",legend=dict(orientation="h",y=1.03,x=0),hoverlabel=dict(font=dict(color="#FFFFFF",size=10),bgcolor="#1B2130"),dragmode=False)
+    fig.update_xaxes(tickformat="%H:%M",fixedrange=True,showgrid=False); fig.update_yaxes(fixedrange=True,gridcolor=C_GRID); return fig
+
+
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     with st.spinner(f"正在抓取 {stock_id} {stock_name} 的歷史行情與籌碼資料..."):
         s_str = start_date.strftime("%Y-%m-%d")
@@ -2754,6 +2817,8 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         b_str = (start_date - timedelta(days=120)).strftime("%Y-%m-%d")
 
         price_df = fetch_stock_history_cached(stock_id, b_str, e_str, token)
+        intraday_df = fetch_intraday_stock(stock_id, token) if pd.Timestamp(end_date).date() == taipei_now().date() else pd.DataFrame()
+        price_df = merge_intraday_into_daily(price_df, intraday_df, end_date)
         chip_df = fetch_chip_history_cached(stock_id, b_str, e_str, token)
         margin_df = fetch_margin_history_cached(stock_id, b_str, e_str, token)
         norway_df = get_norway_big_shareholders(stock_id)
@@ -2858,6 +2923,11 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
         unsafe_allow_html=True,
     )
 
+    if price_df.attrs.get("intraday_provisional"):
+        st.warning(f"今日尚未收盤，K 線與 RSI、MACD、KD、OBV 已納入盤中最新資料；數值會隨成交價與成交量變動。更新：{price_df.attrs.get('intraday_updated_at','--')}｜來源：{price_df.attrs.get('intraday_source','--')}")
+    if intraday_df is not None and not intraday_df.empty:
+        chart_title(f"〽️ {stock_id} {stock_name} 當日股價走勢（江波圖）")
+        show_chart(plot_intraday_wave(intraday_df))
     chart_title(f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
     show_chart(plot_main_kline_chart(df_view, show_bb=show_bb))
 
@@ -3141,7 +3211,34 @@ try:
 except Exception as exc:
     safe_log("touch hover script", exc)
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_financial_news(limit=5):
+    """Five current Taiwan stock/finance headlines from Google News RSS."""
+    try:
+        r=requests.get("https://news.google.com/rss/search",params={"q":"台股 OR 台灣股市 OR 金融市場 when:1d","hl":"zh-TW","gl":"TW","ceid":"TW:zh-Hant"},headers={"User-Agent":"Mozilla/5.0"},timeout=(3,10)); r.raise_for_status()
+        root=ET.fromstring(r.content); rows=[]
+        for item in root.findall(".//item"):
+            title=html.unescape(item.findtext("title") or "").strip(); link=(item.findtext("link") or "").strip(); pub=(item.findtext("pubDate") or "").strip()
+            if title and link: rows.append({"title":title,"link":link,"published":pub})
+            if len(rows)>=limit: break
+        return rows
+    except Exception as exc:
+        safe_log("financial news",exc); return []
+
+
+def render_financial_news():
+    st.markdown("### 📰 最新財經新聞")
+    news=fetch_financial_news(5)
+    if not news:
+        st.caption("財經新聞暫時無法取得，稍後會自動再試。")
+        return
+    for i,item in enumerate(news,1):
+        st.markdown(f"{i}. [{item['title']}]({item['link']})")
+    st.caption("新聞標題來自 Google News RSS，點選標題可查看原始報導；約每 10 分鐘更新。")
+
+
 render_market_ticker()
+render_financial_news()
 st.markdown("---")
 
 def _strategy_signal_frame(price_df, strategy_name, chip_df=None, margin_df=None):
@@ -3387,16 +3484,16 @@ def run_market_screener_v22(stock_dict, strategy_display):
         close=as_number(r.get('ClosingPrice')) or 0; open_=as_number(r.get('OpeningPrice')) or close; volume=int((as_number(r.get('TradeVolume')) or 0)/1000)
         if volume<800 or open_<=0: continue
         base.append({'股票代碼':sid,'股票名稱':stock_dict[sid],'今日收盤':close,'漲幅(%)':round((close/open_-1)*100,2),'成交量(張)':volume})
-    base=sorted(base,key=lambda x:x['成交量(張)'],reverse=True)[:60]
+    base=sorted(base,key=lambda x:x['成交量(張)'],reverse=True)[:40]
     token=get_secret('FINMIND_TOKEN',''); end=taipei_now().date(); start=(end-timedelta(days=180)).strftime('%Y-%m-%d'); end_s=end.strftime('%Y-%m-%d')
-    items,_=_bounded_parallel(base,lambda x:_v22_price_features(x['股票代碼'],x,token,start,end_s),8,45); items=[x for x in items if x]
+    items,_=_bounded_parallel(base,lambda x:_v22_price_features(x['股票代碼'],x,token,start,end_s),10,30); items=[x for x in items if x]
     if code=='強勢突破':
         items=[x for x in items if x['突破20日高點'] and x['量能倍數']>=1.5 and x['KD黃金交叉'] and x['MA5']>x['MA10'] and 2<=x['漲幅(%)']<=8]
     else:
         items=[x for x in items if x['MA5']>x['MA10']>x['MA20']>x['MA60'] and x['最新價格']>x['MA20'] and x['月線斜率(%)']>0 and x['20日均量(張)']>1000]
-    items=items[:25]
+    items=items[:12]
     chip_start=(end-timedelta(days=35)).strftime('%Y-%m-%d')
-    enriched,_=_bounded_parallel(items,lambda x:_v22_add_chip(x,token,chip_start,end_s),4,25)
+    enriched,_=_bounded_parallel(items,lambda x:_v22_add_chip(x,token,chip_start,end_s),6,18)
     if code=='多頭趨勢波段': enriched=[x for x in enriched if x['法人5日']>0]
     result=_v22_score(pd.DataFrame(enriched),code).head(30) if enriched else pd.DataFrame()
     result.attrs['scan_status']={'ok':True,'message':f'{strategy_display}掃描完成，共選出 {len(result)} 檔。','counts':{'初步候選':len(base),'符合策略':len(result)}}
@@ -3464,9 +3561,9 @@ if app_mode == "全市場選股":
             if V22_STRATEGIES[strategy_choice]["code"] == "飆風向上":
                 progress.progress(20, text="飆風向上：優先檢查成交量前 40 檔的月線斜率 > 1%...")
             elif V22_STRATEGIES[strategy_choice]["code"] == "強勢突破":
-                progress.progress(40, text="短線強勢爆發：檢查漲幅、成交量與紅 K 條件...")
+                progress.progress(40, text="強勢突破：檢查 20 日新高、量能與 KD 黃金交叉...")
             else:
-                progress.progress(40, text="波段多頭排列：檢查成交量、漲幅區間與紅 K 條件...")
+                progress.progress(40, text="多頭趨勢波段：檢查均線排列、月線斜率與法人買超...")
             result = run_market_screener_v22(STOCK_DICT, strategy_choice)
             progress.progress(100, text="掃描完成")
             st.session_state["screener_res"] = result

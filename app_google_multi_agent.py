@@ -1764,7 +1764,7 @@ def plot_technical_indicator_charts(df_view):
 
     _base_layout(fig,dates,height=880,top_margin=82)
     fig.update_layout(hovermode="x unified",
-                      legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0,font=dict(size=9),itemwidth=30),
+                      showlegend=False,
                       hoverlabel=dict(font_size=10,bgcolor="#1B2130",bordercolor="#3A4258",align="left",namelength=-1),
                       margin=dict(l=38,r=10,t=82,b=34))
     fig.update_xaxes(showspikes=True,spikemode="across",spikesnap="cursor",spikethickness=1,spikedash="dot",spikecolor="#9AA4B5")
@@ -2786,8 +2786,53 @@ def plot_intraday_wave(df):
     fig.add_trace(go.Scatter(x=x,y=close,mode="markers",marker=dict(size=30,opacity=0),showlegend=False,hovertext=hover,hovertemplate="%{hovertext}<extra></extra>"),row=1,col=1)
     colors=[C_UP if close.iloc[i]>=(close.iloc[i-1] if i else ref) else C_DOWN for i in range(len(d))]; fig.add_trace(go.Bar(x=x,y=vol,marker_color=colors,showlegend=False,hovertext=hover,hovertemplate="%{hovertext}<extra></extra>"),row=2,col=1)
     fig.add_hline(y=ref,line_dash="dot",line_color="#90A4AE",row=1,col=1); fig.update_yaxes(range=[pmin-pad,pmax+pad],tickformat=".2f",row=1,col=1); fig.update_yaxes(rangemode="tozero",row=2,col=1)
-    fig.add_annotation(x=0,y=1.04,xref="paper",yref="paper",showarrow=False,xanchor="left",text=f"開 {op:,.2f}　高 {hi:,.2f}　低 {lo:,.2f}　最新 <b style='color:{color}'>{latest:,.2f}</b>",font=dict(size=12,color=C_TEXT))
-    fig.update_layout(template="plotly_dark",height=470,margin=dict(l=48,r=12,t=70,b=34),paper_bgcolor=C_BG,plot_bgcolor=C_BG,hovermode="closest",legend=dict(orientation="h",y=1.07,x=0),hoverlabel=dict(font=dict(color="#FFF",size=10),bgcolor="#1B2130"),dragmode=False); fig.update_xaxes(tickformat="%H:%M",fixedrange=True); fig.update_yaxes(fixedrange=True,gridcolor=C_GRID); return fig
+    fig.update_layout(template="plotly_dark",height=470,margin=dict(l=48,r=18,t=36,b=34),paper_bgcolor=C_BG,plot_bgcolor=C_BG,hovermode="closest",legend=dict(orientation="h",y=1.07,x=0),hoverlabel=dict(font=dict(color="#FFF",size=10),bgcolor="#1B2130"),dragmode=False); fig.update_xaxes(tickformat="%H:%M",fixedrange=True); fig.update_yaxes(fixedrange=True,gridcolor=C_GRID); return fig
+
+
+def render_intraday_price_cards(intraday_df):
+    if intraday_df is None or intraday_df.empty:
+        return
+    d=intraday_df.sort_values("DateTime").reset_index(drop=True)
+    close=pd.to_numeric(d["Close"],errors="coerce")
+    op=float(pd.to_numeric(d["Open"],errors="coerce").dropna().iloc[0])
+    hi=float(pd.to_numeric(d["High"],errors="coerce").max())
+    lo=float(pd.to_numeric(d["Low"],errors="coerce").min())
+    latest=float(close.iloc[-1])
+    ref=float(d.attrs.get("previous_close") or op)
+    chg=latest-ref; pct=chg/ref*100 if ref else 0
+    color=C_UP if chg>=0 else C_DOWN
+    values=[("昨收",ref,""),("開盤",op,""),("最高",hi,""),("最低",lo,""),("最新",latest,f"{chg:+.2f} ({pct:+.2f}%)")]
+    cards=''.join(
+        f"<div class='iw-card'><div class='iw-label'>{label}</div>"
+        f"<div class='iw-value' style='color:{color if label=='最新' else C_TEXT}'>{value:,.2f}</div>"
+        f"<div class='iw-change' style='color:{color}'>{change}</div></div>"
+        for label,value,change in values)
+    st.markdown(f"""
+<style>
+.iw-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:4px 0 10px}}
+.iw-card{{background:#151922;border:1px solid #343b4b;border-radius:8px;padding:8px 10px;min-width:0}}
+.iw-label{{color:#9AA4B5;font-size:11px}}
+.iw-value{{font-size:17px;font-weight:700;white-space:nowrap}}
+.iw-change{{font-size:10px;white-space:nowrap;min-height:14px}}
+@media(max-width:640px){{.iw-grid{{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}}.iw-card{{padding:7px}}.iw-value{{font-size:15px}}}}
+</style><div class='iw-grid'>{cards}</div>""",unsafe_allow_html=True)
+
+
+def render_indicator_legend_cards():
+    st.markdown("""
+<style>
+.ind-lg-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:5px 0 10px}
+.ind-lg{background:#151922;border:1px solid #343b4b;border-radius:8px;padding:8px 10px;color:#E6E9F0;font-size:11px;line-height:1.65}
+.ind-lg b{font-size:12px}.sw{display:inline-block;width:19px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}.dot{border-top:2px dotted currentColor;height:0}
+@media(max-width:640px){.ind-lg-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.ind-lg{padding:7px;font-size:10px}}
+</style>
+<div class="ind-lg-grid">
+ <div class="ind-lg"><b>RSI</b><br><span class="sw" style="background:#FFD54F"></span>RSI6<br><span class="sw" style="background:#42A5F5"></span>RSI12<br><span style="color:#FF5252">··· 70 偏熱</span>　<span style="color:#00E676">··· 30 偏弱</span></div>
+ <div class="ind-lg"><b>MACD</b><br><span class="sw" style="background:#42A5F5"></span>DIF<br><span class="sw" style="background:#FFB74D"></span>訊號線<br><span style="color:#FF5252">■ 正柱</span>　<span style="color:#00E676">■ 負柱</span></div>
+ <div class="ind-lg"><b>KD</b><br><span class="sw" style="background:#EC407A"></span>K 值<br><span class="sw" style="background:#26C6DA"></span>D 值<br><span style="color:#FF5252">··· 80 高檔</span>　<span style="color:#00E676">··· 20 低檔</span></div>
+ <div class="ind-lg"><b>OBV</b><br><span class="sw" style="background:#AB47BC"></span>OBV<br><span class="sw" style="background:#66BB6A"></span>20日均線<br><span style="color:#FF5252">↑ 上升</span>　<span style="color:#00E676">↓ 下降</span></div>
+</div>
+""",unsafe_allow_html=True)
 
 
 def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
@@ -2909,13 +2954,15 @@ def render_diagnosis_section(stock_id, stock_name, start_date, end_date, token):
     if price_df.attrs.get("intraday_provisional"):
         st.warning(f"今日尚未收盤，K線與技術指標已納入盤中最新資料；數值仍會變動。更新：{price_df.attrs.get('intraday_updated_at','--')}｜來源：{price_df.attrs.get('intraday_source','--')}")
     if not intraday_df.empty:
-        chart_title(f"〽️ {stock_id} {stock_name} 當日股價走勢（江波圖）")
+        chart_title(f"〽️ {stock_id} {stock_name} 當日股價走勢（1分線）")
+        render_intraday_price_cards(intraday_df)
         show_chart(plot_intraday_wave(intraday_df))
     chart_title(f"📈 {stock_id} {stock_name} 股價 K 線與布林通道")
     show_chart(plot_main_kline_chart(df_view, show_bb=show_bb))
 
     chart_title("🎯 RSI、MACD、KD 與 OBV 技術指標")
-    st.caption("RSI6 與 RSI12 可觀察黃金交叉／死亡交叉，70／30 線用來觀察偏熱或偏弱；MACD 顯示趨勢動能；KD 觀察短線轉折；OBV 比較價格與成交量是否同步。")
+    st.caption("下方彩色圖例與圖中的線條、柱體顏色完全一致。")
+    render_indicator_legend_cards()
     show_chart(plot_technical_indicator_charts(df_view))
 
     chart_title("🏛️ 三大法人每日淨買賣超 (張 · 紅買綠賣)")
